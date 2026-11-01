@@ -193,16 +193,19 @@ func (s *CarfaxTranslatorService) translateVisibleTextNodesOnly(rawHtml string) 
 		bodyStart = 0
 	}
 
-	// Do not touch <script id="carfix-official-pdf"...> at the end
+	// Do not duplicate <script id="carfix-official-pdf"...> into translated_html_ar (saves ~2 MB per report!)
 	pdfScriptIdx := strings.Index(rawHtml, `<script id="carfix-official-pdf"`)
 	endLimit := len(rawHtml)
+	suffix := ""
 	if pdfScriptIdx != -1 && pdfScriptIdx > bodyStart {
 		endLimit = pdfScriptIdx
+		if closeScriptIdx := strings.Index(rawHtml[pdfScriptIdx:], "</script>"); closeScriptIdx != -1 {
+			suffix = rawHtml[pdfScriptIdx+closeScriptIdx+len("</script>"):]
+		}
 	}
 
 	prefix := rawHtml[:bodyStart]
 	bodySegment := rawHtml[bodyStart:endLimit]
-	suffix := rawHtml[endLimit:]
 
 	var out strings.Builder
 	out.Grow(len(rawHtml) + 2048)
@@ -303,31 +306,73 @@ func (s *CarfaxTranslatorService) extractTitle(html, vin string) string {
 	return fmt.Sprintf("CARFAX Report (%s)", vin)
 }
 
+func (s *CarfaxTranslatorService) ExtractSummaryJson(html, vin string) string {
+	return s.extractSummaryJson(html, vin)
+}
+
+var (
+	tagStripRe   = regexp.MustCompile(`(?s)<[^>]*>`)
+	styleBlockRe = regexp.MustCompile(`(?is)<style[^>]*>.*?</style>`)
+	scriptBlkRe  = regexp.MustCompile(`(?is)<script[^>]*>.*?</script>`)
+	svgBlkRe     = regexp.MustCompile(`(?is)<svg[^>]*>.*?</svg>`)
+	tableBlkRe   = regexp.MustCompile(`(?is)<table[^>]*>(.*?)</table>`)
+	trBlkRe      = regexp.MustCompile(`(?is)<tr[^>]*>(.*?)</tr>`)
+	thCellRe     = regexp.MustCompile(`(?is)<th[^>]*>(.*?)</th>`)
+	tdCellRe     = regexp.MustCompile(`(?is)<td[^>]*>(.*?)</td>`)
+	wsCollapseRe = regexp.MustCompile(`\s+`)
+	dateRowRe    = regexp.MustCompile(`^(\d{1,2}/\d{1,2}/\d{2,4}|Not Reported)$`)
+)
+
+func cleanHtmlText(fragment string) string {
+	t := tagStripRe.ReplaceAllString(fragment, " ")
+	t = strings.ReplaceAll(t, "&nbsp;", " ")
+	t = strings.ReplaceAll(t, "&amp;", "&")
+	t = strings.ReplaceAll(t, "&#39;", "'")
+	t = strings.ReplaceAll(t, "&quot;", `"`)
+	return strings.TrimSpace(wsCollapseRe.ReplaceAllString(t, " "))
+}
+
 func (s *CarfaxTranslatorService) extractSummaryJson(html, vin string) string {
-	lower := strings.ToLower(html)
+	hasOfficialPdf := strings.Contains(html, `id="carfix-official-pdf"`)
+
+	// Strip heavy <style>, <script>, and <svg> blocks before regex extraction so parsing takes <2ms
+	lightHtml := scriptBlkRe.ReplaceAllString(html, "")
+	lightHtml = styleBlockRe.ReplaceAllString(lightHtml, "")
+	lightHtml = svgBlkRe.ReplaceAllString(lightHtml, "")
+	lower := strings.ToLower(lightHtml)
+	plainText := cleanHtmlText(lightHtml)
+
+	title := s.extractTitle(lightHtml, vin)
 
 	// 1. Extract real odometer reading (e.g. <span><strong>1,483</strong> mi</span>)
 	odometer := "غير مسجل"
 	odoRe := regexp.MustCompile(`(?i)<strong>([\d,]+)</strong>\s*(?:mi|km|miles)`)
-	if m := odoRe.FindStringSubmatch(html); len(m) > 1 {
+	if m := odoRe.FindStringSubmatch(lightHtml); len(m) > 1 {
 		odometer = m[1] + " mi"
 	} else {
 		odoFallbackRe := regexp.MustCompile(`\b(\d{1,3}(?:,\d{3})+)\s*mi\b`)
-		if m2 := odoFallbackRe.FindStringSubmatch(html); len(m2) > 1 {
+		if m2 := odoFallbackRe.FindStringSubmatch(plainText); len(m2) > 1 {
 			odometer = m2[1] + " mi"
 		}
 	}
 
-	// 2. Extract real owners count
+	// 2. Extract Carfax Value
+	carfaxValue := ""
+	valRe := regexp.MustCompile(`(?i)(?:CARFAX\s*VALUE|Retail\s*Value|History-Based\s*Value)[^\$\d]{0,40}(\$[0-9,]+)`)
+	if m := valRe.FindStringSubmatch(plainText); len(m) > 1 {
+		carfaxValue = strings.TrimSpace(m[1])
+	}
+
+	// 3. Extract real owners count
 	owners := 1
 	ownerRe := regexp.MustCompile(`(?i)CARFAX\s+(\d+)-Owner`)
-	if m := ownerRe.FindStringSubmatch(html); len(m) > 1 {
+	if m := ownerRe.FindStringSubmatch(plainText); len(m) > 1 {
 		if v, err := strconv.Atoi(m[1]); err == nil && v > 0 {
 			owners = v
 		}
 	} else {
-		ownerColRe := regexp.MustCompile(`(?i)>Owner\s+(\d+)<`)
-		allMatches := ownerColRe.FindAllStringSubmatch(html, -1)
+		ownerColRe := regexp.MustCompile(`(?i)\bOwner\s+(\d+)\b`)
+		allMatches := ownerColRe.FindAllStringSubmatch(plainText, -1)
 		maxOwner := 0
 		for _, om := range allMatches {
 			if len(om) > 1 {
@@ -341,31 +386,162 @@ func (s *CarfaxTranslatorService) extractSummaryJson(html, vin string) string {
 		}
 	}
 
-	// 3. Extract real accident status
+	// 4. Extract real accident status & summary
 	accidents := 0
+	accidentSummary := "No accidents or damage reported to CARFAX"
+	damageSeverity := "None"
 	if !strings.Contains(lower, "no accidents or damage reported") {
-		if strings.Contains(lower, "accident reported") ||
-			strings.Contains(lower, "severe damage") ||
-			strings.Contains(lower, "moderate damage") ||
-			strings.Contains(lower, "minor damage") ||
-			strings.Contains(lower, ">accident<") {
+		switch {
+		case strings.Contains(lower, "severe damage"):
 			accidents = 1
+			accidentSummary = "Severe Damage Reported"
+			damageSeverity = "Severe"
+		case strings.Contains(lower, "vandalism damage"):
+			accidents = 1
+			accidentSummary = "Vandalism Damage Reported"
+			damageSeverity = "Moderate"
+		case strings.Contains(lower, "moderate damage"):
+			accidents = 1
+			accidentSummary = "Moderate Damage Reported"
+			damageSeverity = "Moderate"
+		case strings.Contains(lower, "minor damage"):
+			accidents = 1
+			accidentSummary = "Minor Damage Reported"
+			damageSeverity = "Minor"
+		case strings.Contains(lower, "accident reported") || strings.Contains(lower, "damage reported"):
+			accidents = 1
+			accidentSummary = "Accident / Damage Reported"
+			damageSeverity = "Reported"
 		}
 	}
 
-	// 4. Clean title check
+	// 5. Extract Service Records, Vehicle Use, Last Location, Detailed Count
+	serviceRecordsText := ""
+	if m := regexp.MustCompile(`(?i)(\d+\s+Service\s+History\s+Records?)`).FindStringSubmatch(plainText); len(m) > 1 {
+		serviceRecordsText = m[1]
+	}
+	vehicleUse := "Personal Vehicle"
+	if m := regexp.MustCompile(`(?i)(Personal\s+Vehicle|Rental\s+Vehicle|Commercial\s+Vehicle|Personal\s+Lease|Fleet\s+Vehicle)`).FindStringSubmatch(plainText); len(m) > 1 {
+		vehicleUse = m[1]
+	}
+	lastLocation := ""
+	if m := regexp.MustCompile(`(?i)Last\s+Owned\s+in\s+([A-Za-z]+(?:\s+[A-Za-z]+)?)`).FindStringSubmatch(plainText); len(m) > 1 {
+		lastLocation = "Last Owned in " + strings.TrimSpace(m[1])
+	}
+	detailedCountText := ""
+	if m := regexp.MustCompile(`(?i)(\d+\s+Detailed\s+Records?\s+Available)`).FindStringSubmatch(plainText); len(m) > 1 {
+		detailedCountText = m[1]
+	}
+
+	// 6. Clean title check
 	cleanTitle := true
 	if strings.Contains(lower, "salvage title") || strings.Contains(lower, "rebuilt title") || strings.Contains(lower, "total loss reported") {
 		cleanTitle = false
 	}
 
+	// 7. Extract all structured <table> blocks & chronological Detailed History records
+	var tables []map[string]interface{}
+	var detailedRecords []map[string]string
+
+	tblMatches := tableBlkRe.FindAllStringSubmatch(lightHtml, -1)
+	for tIdx, tm := range tblMatches {
+		if len(tm) < 2 {
+			continue
+		}
+		tblInner := tm[1]
+		var headers []string
+		var rows [][]string
+
+		trMatches := trBlkRe.FindAllStringSubmatch(tblInner, -1)
+		for _, trm := range trMatches {
+			if len(trm) < 2 {
+				continue
+			}
+			trInner := trm[1]
+			thMatches := thCellRe.FindAllStringSubmatch(trInner, -1)
+			if len(thMatches) > 0 && len(rows) == 0 && len(headers) == 0 {
+				for _, thm := range thMatches {
+					if h := cleanHtmlText(thm[1]); h != "" {
+						headers = append(headers, h)
+					}
+				}
+				continue
+			}
+
+			tdMatches := tdCellRe.FindAllStringSubmatch(trInner, -1)
+			if len(tdMatches) == 0 {
+				continue
+			}
+			var cells []string
+			nonEmpty := false
+			for _, tdm := range tdMatches {
+				c := cleanHtmlText(tdm[1])
+				if c != "" {
+					nonEmpty = true
+				}
+				cells = append(cells, c)
+			}
+			if !nonEmpty {
+				continue
+			}
+
+			firstCell := cells[0]
+			if len(cells) >= 3 && dateRowRe.MatchString(firstCell) {
+				rec := map[string]string{
+					"date": firstCell,
+				}
+				if len(cells) >= 4 {
+					rec["mileage"] = cells[1]
+					rec["source"] = cells[2]
+					rec["comments"] = strings.Join(cells[3:], " | ")
+				} else {
+					rec["mileage"] = ""
+					rec["source"] = cells[1]
+					rec["comments"] = cells[2]
+				}
+				detailedRecords = append(detailedRecords, rec)
+			} else {
+				rows = append(rows, cells)
+			}
+		}
+
+		if len(rows) > 0 {
+			secTitle := fmt.Sprintf("Section %d", tIdx+1)
+			if len(headers) > 0 && headers[0] != "" {
+				secTitle = headers[0]
+			}
+			tables = append(tables, map[string]interface{}{
+				"title":   secTitle,
+				"headers": headers,
+				"rows":    rows,
+			})
+		}
+	}
+
+	score := 95
+	if accidents > 0 {
+		score = 82
+	}
+
 	summary := map[string]interface{}{
 		"vin":                    vin,
-		"carfax_score":           94,
+		"vehicle_title":          title,
+		"carfax_score":           score,
+		"carfax_value":           carfaxValue,
 		"total_owners":           owners,
 		"accidents_reported":     accidents,
+		"accident_summary":       accidentSummary,
+		"damage_severity":        damageSeverity,
 		"clean_title":            cleanTitle,
 		"last_reported_odometer": odometer,
+		"service_records_count":  serviceRecordsText,
+		"vehicle_use":            vehicleUse,
+		"last_owned_location":    lastLocation,
+		"detailed_records_count": detailedCountText,
+		"tables":                 tables,
+		"detailed_records":       detailedRecords,
+		"has_official_pdf":       hasOfficialPdf,
+		"has_full_html":          len(html) > 500,
 		"analyzed_at":            time.Now().Format(time.RFC3339),
 	}
 

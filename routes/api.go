@@ -41,6 +41,8 @@ func RegisterAPIRoutes(app *fiber.App) {
 	v1.Post("/search", middleware.AuthMiddleware(), middleware.QuotaCheckMiddleware(), vinSearchController.Search)
 
 	api.Get("/reports/:vin", middleware.AuthMiddleware(), vinSearchController.GetCachedReport)
+	api.Get("/reports/:vin/html", middleware.AuthMiddleware(), vinSearchController.GetReportHtml)
+	api.Get("/reports/:vin/pdf", vinSearchController.GetReportPdf)
 	api.Get("/user/searches", middleware.AuthMiddleware(), vinSearchController.GetUserSearchHistory)
 
 	// 3. Admin & Command Center Protected Routes

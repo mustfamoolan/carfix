@@ -1,6 +1,9 @@
 package controllers
 
 import (
+	"context"
+	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
@@ -86,10 +89,8 @@ func (ctrl *VinSearchController) Search(c *fiber.Ctx) error {
 		})
 	}
 
-	// 4. Step B: 2-Tier Cache Inspection (Tier 1: report_caches table)
-	var cachedReport models.ReportCache
-	err = bootstrap.DB.Where("vin = ?", cleanVin).First(&cachedReport).Error
-	if err == nil && cachedReport.VIN != "" {
+	// 4. Step B: 2-Tier Cache Inspection (Tier 1: Redis RAM + PostgreSQL report_caches)
+	if fastReport, err := ctrl.getOrBuildFastReport(cleanVin); err == nil && fastReport != nil {
 		// ==================== CACHE HIT ====================
 		if err := ctrl.quotaManager.ConsumeQuota(userID); err != nil {
 			return c.Status(403).JSON(fiber.Map{
@@ -98,11 +99,12 @@ func (ctrl *VinSearchController) Search(c *fiber.Ctx) error {
 		}
 
 		duration := time.Since(startTime).Milliseconds()
+		vehicleTitle, _ := fastReport["vehicle_title"].(string)
 
 		logEntry := models.SearchLog{
 			UserID:       userID,
 			VIN:          cleanVin,
-			VehicleTitle: cachedReport.VehicleTitle,
+			VehicleTitle: vehicleTitle,
 			ResultStatus: "success",
 			FetchSource:  "cache",
 			DurationMs:   duration,
@@ -112,17 +114,10 @@ func (ctrl *VinSearchController) Search(c *fiber.Ctx) error {
 		}
 		bootstrap.DB.Create(&logEntry)
 
-		return c.JSON(fiber.Map{
-			"status":             "success",
-			"vin":                cachedReport.VIN,
-			"vehicle_title":      cachedReport.VehicleTitle,
-			"fetch_source":       "cache",
-			"duration_ms":        duration,
-			"summary_json":       cachedReport.SummaryJson,
-			"translated_html_ar": cachedReport.TranslatedHtmlAr,
-			"raw_html_en":        cachedReport.RawHtmlEn,
-			"fetched_at":         cachedReport.FetchedAt,
-		})
+		fastReport["status"] = "success"
+		fastReport["fetch_source"] = "cache"
+		fastReport["duration_ms"] = duration
+		return c.JSON(fastReport)
 	}
 
 	// ==================== CACHE MISS (Canada Node Integration) ====================
@@ -149,13 +144,19 @@ func (ctrl *VinSearchController) Search(c *fiber.Ctx) error {
 		})
 	}
 
-	// Translate English HTML and extract metadata & JSON summary
-	translatedHtmlAr, extractedTitle, summaryJson := ctrl.translator.TranslateAndExtract(rawHtmlEn, cleanVin)
-	if extractedTitle != "" && !strings.HasPrefix(extractedTitle, "مركبة شاصي") && vehicleTitle == "" {
-		vehicleTitle = extractedTitle
+	// Translate English HTML (if Stage 1 includes HTML or Mock) and extract metadata & JSON summary
+	var translatedHtmlAr, extractedTitle, summaryJson string
+	if rawHtmlEn != "" {
+		translatedHtmlAr, extractedTitle, summaryJson = ctrl.translator.TranslateAndExtract(rawHtmlEn, cleanVin)
+		if extractedTitle != "" && !strings.HasPrefix(extractedTitle, "مركبة شاصي") && vehicleTitle == "" {
+			vehicleTitle = extractedTitle
+		}
 	}
 	if fastSummaryJson != "" {
 		summaryJson = fastSummaryJson
+	}
+	if vehicleTitle == "" {
+		vehicleTitle = "CARFAX Vehicle Report - " + cleanVin
 	}
 
 	// Save to report_caches table for fast future queries
@@ -168,6 +169,24 @@ func (ctrl *VinSearchController) Search(c *fiber.Ctx) error {
 		FetchedAt:        time.Now(),
 	}
 	bootstrap.DB.Create(&newReport)
+
+	hasFullHtml := len(rawHtmlEn) > 500
+	hasOfficialPdf := strings.Contains(rawHtmlEn, "carfix-official-pdf")
+
+	fastPayload := fiber.Map{
+		"vin":              newReport.VIN,
+		"vehicle_title":    newReport.VehicleTitle,
+		"summary_json":     newReport.SummaryJson,
+		"has_full_html":    hasFullHtml,
+		"has_official_pdf": hasOfficialPdf,
+		"fetched_at":       newReport.FetchedAt,
+	}
+
+	if bootstrap.Redis != nil && !strings.Contains(summaryJson, `"background_pending":true`) {
+		if b, mErr := json.Marshal(fastPayload); mErr == nil {
+			bootstrap.Redis.Set(context.Background(), "report:fast:"+cleanVin, string(b), 24*time.Hour)
+		}
+	}
 
 	// Deduct user quota
 	if err := ctrl.quotaManager.ConsumeQuota(userID); err != nil {
@@ -193,16 +212,88 @@ func (ctrl *VinSearchController) Search(c *fiber.Ctx) error {
 	bootstrap.DB.Create(&logEntry)
 
 	return c.JSON(fiber.Map{
-		"status":             "success",
-		"vin":                newReport.VIN,
-		"vehicle_title":      newReport.VehicleTitle,
-		"fetch_source":       "canada_node",
-		"duration_ms":        duration,
-		"summary_json":       newReport.SummaryJson,
-		"translated_html_ar": newReport.TranslatedHtmlAr,
-		"raw_html_en":        newReport.RawHtmlEn,
-		"fetched_at":         newReport.FetchedAt,
+		"status":           "success",
+		"vin":              newReport.VIN,
+		"vehicle_title":    newReport.VehicleTitle,
+		"fetch_source":     "canada_node",
+		"duration_ms":      duration,
+		"summary_json":     newReport.SummaryJson,
+		"has_full_html":    hasFullHtml,
+		"has_official_pdf": hasOfficialPdf,
+		"fetched_at":       newReport.FetchedAt,
 	})
+}
+
+// getOrBuildFastReport returns a lightweight (~12 KB) report object from Redis RAM or PostgreSQL without loading 10MB HTML columns
+func (ctrl *VinSearchController) getOrBuildFastReport(cleanVin string) (fiber.Map, error) {
+	ctx := context.Background()
+	redisKey := "report:fast:" + cleanVin
+
+	// 1. Check Redis RAM Cache first (<1ms)
+	if bootstrap.Redis != nil {
+		if cachedStr, err := bootstrap.Redis.Get(ctx, redisKey).Result(); err == nil && cachedStr != "" {
+			var cachedMap fiber.Map
+			if json.Unmarshal([]byte(cachedStr), &cachedMap) == nil {
+				if sj, ok := cachedMap["summary_json"].(string); ok && strings.Contains(sj, `"tables"`) && !strings.Contains(sj, `"background_pending":true`) {
+					return cachedMap, nil
+				}
+			}
+		}
+	}
+
+	// 2. Query only lightweight metadata columns from PostgreSQL (skipping 8MB raw_html_en & translated_html_ar)
+	type lightReportRow struct {
+		VIN            string    `gorm:"column:vin"`
+		VehicleTitle   string    `gorm:"column:vehicle_title"`
+		SummaryJson    string    `gorm:"column:summary_json"`
+		FetchedAt      time.Time `gorm:"column:fetched_at"`
+		HasFullHtml    bool      `gorm:"column:has_full_html"`
+		HasOfficialPdf bool      `gorm:"column:has_official_pdf"`
+	}
+
+	var row lightReportRow
+	err := bootstrap.DB.Model(&models.ReportCache{}).
+		Select("vin, vehicle_title, summary_json, fetched_at, (length(raw_html_en) > 500) AS has_full_html, (position('carfix-official-pdf' in raw_html_en) > 0) AS has_official_pdf").
+		Where("vin = ?", cleanVin).
+		Scan(&row).Error
+
+	if err != nil || row.VIN == "" {
+		return nil, fmt.Errorf("not found")
+	}
+
+	// 3. Auto-upgrade legacy cached reports that lack structured "tables" in summary_json (runs once per old VIN)
+	if !strings.Contains(row.SummaryJson, `"tables"`) && row.HasFullHtml {
+		var rawHtml string
+		bootstrap.DB.Model(&models.ReportCache{}).
+			Select("raw_html_en").
+			Where("vin = ?", cleanVin).
+			Scan(&rawHtml)
+		if rawHtml != "" {
+			upgradedSummary := ctrl.translator.ExtractSummaryJson(rawHtml, cleanVin)
+			if upgradedSummary != "" {
+				row.SummaryJson = upgradedSummary
+				bootstrap.DB.Model(&models.ReportCache{}).Where("vin = ?", cleanVin).Update("summary_json", upgradedSummary)
+			}
+		}
+	}
+
+	fastMap := fiber.Map{
+		"vin":              row.VIN,
+		"vehicle_title":    row.VehicleTitle,
+		"summary_json":     row.SummaryJson,
+		"has_full_html":    row.HasFullHtml,
+		"has_official_pdf": row.HasOfficialPdf,
+		"fetched_at":       row.FetchedAt,
+	}
+
+	// 4. Cache in Redis RAM for 24h if background enrichment is already complete
+	if bootstrap.Redis != nil && !strings.Contains(row.SummaryJson, `"background_pending":true`) {
+		if b, mErr := json.Marshal(fastMap); mErr == nil {
+			bootstrap.Redis.Set(ctx, redisKey, string(b), 24*time.Hour)
+		}
+	}
+
+	return fastMap, nil
 }
 
 // GetUserSearchHistory returns the authenticated user's own search history
@@ -220,16 +311,88 @@ func (ctrl *VinSearchController) GetUserSearchHistory(c *fiber.Ctx) error {
 	return c.JSON(fiber.Map{"logs": logs})
 }
 
-// GetCachedReport allows retrieving an already purchased report by VIN
+// GetCachedReport returns the fast lightweight report (~12 KB) in <5ms instead of transferring 10MB of HTML/PDF
 func (ctrl *VinSearchController) GetCachedReport(c *fiber.Ctx) error {
 	vin := strings.ToUpper(strings.TrimSpace(c.Params("vin")))
 
-	var report models.ReportCache
-	if err := bootstrap.DB.Where("vin = ?", vin).First(&report).Error; err != nil {
+	fastReport, err := ctrl.getOrBuildFastReport(vin)
+	if err != nil || fastReport == nil {
 		return c.Status(404).JSON(fiber.Map{"message": "التقرير غير موجود في السجل"})
 	}
 
-	return c.JSON(fiber.Map{"report": report})
+	return c.JSON(fiber.Map{"report": fastReport})
+}
+
+// GetReportHtml serves the full Carfax HTML on-demand ONLY when the user clicks "Original Carfax Page"
+func (ctrl *VinSearchController) GetReportHtml(c *fiber.Ctx) error {
+	vin := strings.ToUpper(strings.TrimSpace(c.Params("vin")))
+	lang := strings.ToLower(strings.TrimSpace(c.Query("lang", "en")))
+
+	type htmlRow struct {
+		RawHtmlEn        string `gorm:"column:raw_html_en"`
+		TranslatedHtmlAr string `gorm:"column:translated_html_ar"`
+	}
+	var row htmlRow
+	if err := bootstrap.DB.Model(&models.ReportCache{}).
+		Select("raw_html_en, translated_html_ar").
+		Where("vin = ?", vin).
+		Scan(&row).Error; err != nil || (row.RawHtmlEn == "" && row.TranslatedHtmlAr == "") {
+		return c.Status(404).JSON(fiber.Map{"message": "نسخة الصفحة الكاملة غير جاهزة بعد"})
+	}
+
+	html := row.RawHtmlEn
+	if lang == "ar" && row.TranslatedHtmlAr != "" {
+		html = row.TranslatedHtmlAr
+	}
+
+	// Strip embedded Base64 PDF script tag before sending HTML to browser (saves ~2.5 MB of transfer)
+	const pdfStartMarker = `<script id="carfix-official-pdf" type="application/pdf-base64">`
+	if startIdx := strings.Index(html, pdfStartMarker); startIdx != -1 {
+		if endIdx := strings.Index(html[startIdx:], "</script>"); endIdx != -1 {
+			html = html[:startIdx] + html[startIdx+endIdx+len("</script>"):]
+		}
+	}
+
+	return c.JSON(fiber.Map{
+		"vin":  vin,
+		"lang": lang,
+		"html": html,
+	})
+}
+
+// GetReportPdf streams the official 4-Section Chrome PrintToPDF directly as binary application/pdf
+func (ctrl *VinSearchController) GetReportPdf(c *fiber.Ctx) error {
+	vin := strings.ToUpper(strings.TrimSpace(c.Params("vin")))
+
+	var rawHtml string
+	if err := bootstrap.DB.Model(&models.ReportCache{}).
+		Select("raw_html_en").
+		Where("vin = ?", vin).
+		Scan(&rawHtml).Error; err != nil || rawHtml == "" {
+		return c.Status(404).JSON(fiber.Map{"message": "التقرير غير موجود"})
+	}
+
+	const markerStart = `<script id="carfix-official-pdf" type="application/pdf-base64">`
+	startIdx := strings.Index(rawHtml, markerStart)
+	if startIdx == -1 {
+		return c.Status(404).JSON(fiber.Map{"message": "ملف الطباعة الرسمي PDF غير متوفر لهذا التقرير"})
+	}
+	contentStart := startIdx + len(markerStart)
+	endIdx := strings.Index(rawHtml[contentStart:], "</script>")
+	if endIdx == -1 {
+		return c.Status(404).JSON(fiber.Map{"message": "بيانات PDF غير مكتملة"})
+	}
+
+	b64Data := strings.TrimSpace(rawHtml[contentStart : contentStart+endIdx])
+	pdfBytes, err := base64.StdEncoding.DecodeString(b64Data)
+	if err != nil {
+		return c.Status(500).JSON(fiber.Map{"message": "تعذر فك تشفير ملف PDF"})
+	}
+
+	c.Set("Content-Type", "application/pdf")
+	c.Set("Content-Disposition", fmt.Sprintf(`inline; filename="CARFAX_%s.pdf"`, vin))
+	c.Set("Cache-Control", "public, max-age=86400")
+	return c.Send(pdfBytes)
 }
 
 // fetchFromCanadaNode communicates with the remote Canada Node or falls back to simulation if permitted

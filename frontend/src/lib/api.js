@@ -62,6 +62,7 @@ export const api = {
 // User / Search APIs
 export const searchVin = (vin) => api.post('/search', { vin })
 export const getReport = (vin) => api.get(`/reports/${vin}`)
+export const getReportHtml = (vin, lang = 'en') => api.get(`/reports/${vin}/html?lang=${lang}`)
 export const getUserSearches = () => api.get('/user/searches')
 
 // Admin APIs

@@ -5,7 +5,7 @@ import ReportToolbar from '@/components/report/ReportToolbar'
 import ReportSummaryCards from '@/components/report/ReportSummaryCards'
 import ReportNativeView from '@/components/report/ReportNativeView'
 import ReportFrame from '@/components/report/ReportFrame'
-import { getReport } from '@/lib/api'
+import { getReport, getReportHtml } from '@/lib/api'
 import { Loader2 } from 'lucide-react'
 import { toast } from 'sonner'
 
@@ -18,11 +18,16 @@ export default function ReportView() {
   const [loading, setLoading] = useState(!report)
   const [viewMode, setViewMode] = useState('smart') // 'smart' (Fast Native Design) | 'original' (Full Carfax Page)
   const [lang, setLang] = useState('ar') // Instant Arabic/English toggle
+  const [htmlCache, setHtmlCache] = useState({})
+  const [htmlLoading, setHtmlLoading] = useState(false)
   const iframeRef = useRef(null)
 
   useEffect(() => {
-    if (!report && vin) {
-      loadReport(vin)
+    if (vin) {
+      // Always fetch or refresh lightweight report metadata (~12 KB) if not already loaded for this VIN
+      if (!report || (report.vin && report.vin.toUpperCase() !== vin.toUpperCase())) {
+        loadReport(vin)
+      }
     }
   }, [vin])
 
@@ -53,22 +58,16 @@ export default function ReportView() {
     return null
   }, [report?.summary_json])
 
-  // Extract embedded Official Native Chrome PDF if present inside raw_html_en
-  const officialPdfBase64 = useMemo(() => {
-    const raw = report?.raw_html_en || ''
-    const markerStart = '<script id="carfix-official-pdf" type="application/pdf-base64">'
-    const startIdx = raw.indexOf(markerStart)
-    if (startIdx === -1) return null
-    const contentStart = startIdx + markerStart.length
-    const endIdx = raw.indexOf('</script>', contentStart)
-    if (endIdx === -1) return null
-    return raw.substring(contentStart, endIdx).trim()
-  }, [report?.raw_html_en])
-
-  const isBackgroundPending = Boolean(summary?.background_pending && !officialPdfBase64)
+  const hasOfficialPdf = Boolean(
+    report?.has_official_pdf || summary?.has_official_pdf
+  )
+  const hasFullOriginal = Boolean(
+    report?.has_full_html || summary?.has_full_html || hasOfficialPdf || report?.raw_html_en
+  )
+  const isBackgroundPending = Boolean(summary?.background_pending && !hasOfficialPdf)
 
   // Silent Background Polling: while Stage 2 (Full Carfax Page + 4-Section Print PDF) is finishing in Canada,
-  // poll silently every 2.5 seconds until the full assets & PDF arrive.
+  // poll lightweight metadata every 2.5 seconds until has_official_pdf / background_ready becomes true.
   useEffect(() => {
     const targetVin = report?.vin || vin
     if (!targetVin || !isBackgroundPending) return
@@ -76,14 +75,29 @@ export default function ReportView() {
     let attempts = 0
     const timer = setInterval(async () => {
       attempts++
-      if (attempts > 15) {
+      if (attempts > 18) {
         clearInterval(timer)
         return
       }
       try {
         const res = await getReport(targetVin)
         const updated = res?.report || res?.data?.report || res
-        if (updated && updated.raw_html_en && updated.raw_html_en.includes('carfix-official-pdf')) {
+        let updatedSummary = null
+        try {
+          updatedSummary =
+            typeof updated?.summary_json === 'string'
+              ? JSON.parse(updated.summary_json)
+              : updated?.summary_json
+        } catch {
+          updatedSummary = null
+        }
+
+        if (
+          updated &&
+          (updated.has_official_pdf ||
+            updated.has_full_html ||
+            updatedSummary?.background_ready)
+        ) {
           setReport((prev) => ({
             ...prev,
             ...updated,
@@ -99,43 +113,67 @@ export default function ReportView() {
     return () => clearInterval(timer)
   }, [report?.vin, vin, isBackgroundPending])
 
+  // Lazy-load full Carfax HTML on-demand ONLY when user switches to 'original' mode
+  useEffect(() => {
+    const targetVin = report?.vin || vin
+    if (viewMode !== 'original' || !targetVin) return
+    if (htmlCache[lang]) return
+
+    let cancelled = false
+    const fetchOnDemandHtml = async () => {
+      setHtmlLoading(true)
+      try {
+        const res = await getReportHtml(targetVin, lang)
+        const htmlStr = res?.html || res?.data?.html || ''
+        if (!cancelled && htmlStr) {
+          setHtmlCache((prev) => ({ ...prev, [lang]: htmlStr }))
+        }
+      } catch {
+        if (!cancelled) {
+          toast.error('نسخة صفحة كارفاكس الكاملة قيد التجهيز أو غير متوفرة')
+        }
+      } finally {
+        if (!cancelled) setHtmlLoading(false)
+      }
+    }
+
+    fetchOnDemandHtml()
+    return () => {
+      cancelled = true
+    }
+  }, [viewMode, lang, report?.vin, vin, htmlCache])
+
   const handleDownloadOfficialPdf = () => {
-    if (!officialPdfBase64) {
+    const targetVin = report?.vin || vin
+    if (!hasOfficialPdf || !targetVin) {
       handlePrint()
       return
     }
-    try {
-      const byteCharacters = atob(officialPdfBase64)
-      const byteNumbers = new Array(byteCharacters.length)
-      for (let i = 0; i < byteCharacters.length; i++) {
-        byteNumbers[i] = byteCharacters.charCodeAt(i)
-      }
-      const byteArray = new Uint8Array(byteNumbers)
-      const blob = new Blob([byteArray], { type: 'application/pdf' })
-      const blobUrl = URL.createObjectURL(blob)
-
-      // Open in new tab for native PDF viewing & printing + trigger download
-      window.open(blobUrl, '_blank')
-      const link = document.createElement('a')
-      link.href = blobUrl
-      link.download = `CARFAX_${report?.vin || vin || 'Report'}.pdf`
-      document.body.appendChild(link)
-      link.click()
-      document.body.removeChild(link)
-      toast.success('تم فتح وتحميل ملف الطباعة الرسمي PDF من حاسبة كندا')
-    } catch (e) {
-      console.error(e)
-      handlePrint()
-    }
+    window.open(`/api/reports/${targetVin}/pdf`, '_blank')
+    toast.success('تم فتح ملف الطباعة الرسمي PDF المباشر')
   }
 
-  const activeHtml =
-    lang === 'ar'
-      ? report?.translated_html_ar || report?.raw_html_en
-      : report?.raw_html_en || report?.translated_html_ar
+  const handleOpenOriginalNewTab = async () => {
+    const targetVin = report?.vin || vin
+    if (!targetVin) return
 
-  const handleOpenOriginalNewTab = () => {
-    const htmlToOpen = report?.raw_html_en || activeHtml
+    let htmlToOpen = htmlCache.en || htmlCache[lang] || report?.raw_html_en
+    if (!htmlToOpen) {
+      const loadingToast = toast.loading('جاري فتح صفحة كارفاكس الأصلية...')
+      try {
+        const res = await getReportHtml(targetVin, 'en')
+        htmlToOpen = res?.html || res?.data?.html || ''
+        if (htmlToOpen) {
+          setHtmlCache((prev) => ({ ...prev, en: htmlToOpen }))
+        }
+        toast.dismiss(loadingToast)
+      } catch {
+        toast.dismiss(loadingToast)
+        toast.error('محتوى الصفحة الأصلية غير متوفر بعد')
+        return
+      }
+    }
+
     if (!htmlToOpen) {
       toast.error('محتوى الصفحة غير متوفر بعد')
       return
@@ -154,6 +192,8 @@ export default function ReportView() {
     window.print()
   }
 
+  const activeHtml = htmlCache[lang] || report?.raw_html_en || ''
+
   return (
     <AuthenticatedLayout
       title={`تقرير تاريخ المركبة: ${vin || ''}`}
@@ -161,12 +201,12 @@ export default function ReportView() {
     >
       <div className="space-y-4 text-right w-full" dir="rtl">
         {loading ? (
-          <div className="flex flex-col items-center justify-center py-24 text-slate-400 gap-3">
-            <Loader2 className="h-8 w-8 animate-spin text-[#003478]" />
-            <span className="text-sm font-semibold">جاري جلب تفاصيل تقرير كارفاكس...</span>
+          <div className="flex flex-col items-center justify-center py-20 text-muted-foreground gap-2.5">
+            <Loader2 className="h-6 w-6 animate-spin text-primary" />
+            <span className="text-xs font-medium">جاري فتح التقرير...</span>
           </div>
         ) : !report ? (
-          <div className="text-center py-16 text-slate-400 text-sm">
+          <div className="text-center py-16 text-muted-foreground text-sm">
             لم يتم العثور على التقرير المطلوب برقم الشاصي {vin}.
           </div>
         ) : (
@@ -180,7 +220,7 @@ export default function ReportView() {
               onOpenOriginalNewTab={handleOpenOriginalNewTab}
               onBack={() => navigate('/dashboard')}
               onPrint={handlePrint}
-              hasOfficialPdf={Boolean(officialPdfBase64)}
+              hasOfficialPdf={hasOfficialPdf}
               isBackgroundLoading={isBackgroundPending}
               onDownloadOfficialPdf={handleDownloadOfficialPdf}
             />
@@ -192,14 +232,19 @@ export default function ReportView() {
                 report={report}
                 summary={summary}
                 lang={lang}
-                hasFullOriginal={Boolean(officialPdfBase64)}
+                hasFullOriginal={hasFullOriginal}
                 onSwitchToOriginal={() => setViewMode('original')}
               />
+            ) : htmlLoading && !activeHtml ? (
+              <div className="flex flex-col items-center justify-center py-20 bg-card border rounded-xl text-muted-foreground gap-2.5">
+                <Loader2 className="h-6 w-6 animate-spin text-primary" />
+                <span className="text-xs font-medium">جاري تحميل نسخة صفحة كارفاكس الأصلية...</span>
+              </div>
             ) : (
               <ReportFrame
                 htmlContent={activeHtml}
                 iframeRef={iframeRef}
-                onPrintRequest={officialPdfBase64 ? handleDownloadOfficialPdf : handlePrint}
+                onPrintRequest={hasOfficialPdf ? handleDownloadOfficialPdf : handlePrint}
               />
             )}
           </>

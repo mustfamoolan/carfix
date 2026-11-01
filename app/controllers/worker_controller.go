@@ -1,6 +1,7 @@
 package controllers
 
 import (
+	"context"
 	"encoding/json"
 	"strings"
 	"time"
@@ -145,11 +146,15 @@ func (ctrl *WorkerController) Complete(c *fiber.Ctx) error {
 			}
 		}
 
+		hasOfficialPdf := strings.Contains(payload.RawHtmlEn, "carfix-official-pdf")
+
 		// Mark background_pending = false and background_ready = true inside summary_json
 		var summaryMap map[string]interface{}
 		if json.Unmarshal([]byte(summaryJson), &summaryMap) == nil && summaryMap != nil {
 			summaryMap["background_pending"] = false
 			summaryMap["background_ready"] = true
+			summaryMap["has_official_pdf"] = hasOfficialPdf
+			summaryMap["has_full_html"] = true
 			if updatedBytes, mErr := json.Marshal(summaryMap); mErr == nil {
 				summaryJson = string(updatedBytes)
 			}
@@ -162,6 +167,10 @@ func (ctrl *WorkerController) Complete(c *fiber.Ctx) error {
 			"summary_json":       summaryJson,
 			"updated_at":         time.Now(),
 		})
+
+		if bootstrap.Redis != nil {
+			bootstrap.Redis.Del(context.Background(), "report:fast:"+cleanVin)
+		}
 
 		return c.JSON(fiber.Map{
 			"status":  "enriched",
