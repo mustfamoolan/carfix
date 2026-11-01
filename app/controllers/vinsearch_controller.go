@@ -126,7 +126,7 @@ func (ctrl *VinSearchController) Search(c *fiber.Ctx) error {
 	}
 
 	// ==================== CACHE MISS (Canada Node Integration) ====================
-	rawHtmlEn, vehicleTitle, err := ctrl.fetchFromCanadaNode(cleanVin)
+	rawHtmlEn, vehicleTitle, fastSummaryJson, err := ctrl.fetchFromCanadaNode(cleanVin)
 	if err != nil {
 		duration := time.Since(startTime).Milliseconds()
 
@@ -151,8 +151,11 @@ func (ctrl *VinSearchController) Search(c *fiber.Ctx) error {
 
 	// Translate English HTML and extract metadata & JSON summary
 	translatedHtmlAr, extractedTitle, summaryJson := ctrl.translator.TranslateAndExtract(rawHtmlEn, cleanVin)
-	if extractedTitle != "" && !strings.HasPrefix(extractedTitle, "مركبة شاصي") {
+	if extractedTitle != "" && !strings.HasPrefix(extractedTitle, "مركبة شاصي") && vehicleTitle == "" {
 		vehicleTitle = extractedTitle
+	}
+	if fastSummaryJson != "" {
+		summaryJson = fastSummaryJson
 	}
 
 	// Save to report_caches table for fast future queries
@@ -230,40 +233,41 @@ func (ctrl *VinSearchController) GetCachedReport(c *fiber.Ctx) error {
 }
 
 // fetchFromCanadaNode communicates with the remote Canada Node or falls back to simulation if permitted
-func (ctrl *VinSearchController) fetchFromCanadaNode(vin string) (string, string, error) {
+func (ctrl *VinSearchController) fetchFromCanadaNode(vin string) (string, string, string, error) {
 	// 1. Always respect Circuit Breaker first
 	if active, reason := ctrl.workerGuard.IsCircuitBreakerActive(); active {
-		return "", "", fmt.Errorf("قاطع الحماية مفعل لحاسبة كندا: %s", reason)
+		return "", "", "", fmt.Errorf("قاطع الحماية مفعل لحاسبة كندا: %s", reason)
 	}
 
 	// 2. If Canada Worker is online, dispatch strictly to Canada Worker
 	if ctrl.workerGuard.IsConnected() {
 		if err := ctrl.workerGuard.EnqueueSearchTask(vin); err != nil {
-			return "", "", fmt.Errorf("تعذر إدراج الشاصي في طابور كندا: %v", err)
+			return "", "", "", fmt.Errorf("تعذر إدراج الشاصي في طابور كندا: %v", err)
 		}
 
 		res, err := ctrl.workerGuard.WaitForReport(vin, 65*time.Second)
 		if err != nil {
-			return "", "", fmt.Errorf("انتهت مهلة انتظار استجابة حاسبة كندا (%v)", err)
+			return "", "", "", fmt.Errorf("انتهت مهلة انتظار استجابة حاسبة كندا (%v)", err)
 		}
 
 		if res != nil && res.ErrorCode != "" {
-			return "", "", fmt.Errorf("[%s] %s", res.ErrorCode, res.ErrorMessage)
+			return "", "", "", fmt.Errorf("[%s] %s", res.ErrorCode, res.ErrorMessage)
 		}
 
-		if res != nil && res.RawHtmlEn != "" {
-			return res.RawHtmlEn, res.VehicleTitle, nil
+		if res != nil && (res.RawHtmlEn != "" || res.FastSummaryJson != "") {
+			return res.RawHtmlEn, res.VehicleTitle, res.FastSummaryJson, nil
 		}
 
-		return "", "", fmt.Errorf("لم ترسل حاسبة كندا محتوى صالحاً للتقرير")
+		return "", "", "", fmt.Errorf("لم ترسل حاسبة كندا محتوى صالحاً للتقرير")
 	}
 
 	// 3. Canada Worker is offline: check if Mock Simulation Fallback is permitted
 	if !ctrl.workerGuard.IsMockFallbackEnabled() {
-		return "", "", fmt.Errorf("حاسبة كندا غير متصلة حالياً (يرجى تشغيل برنامج كندا أو تفعيل وضع المحاكاة الاختباري)")
+		return "", "", "", fmt.Errorf("حاسبة كندا غير متصلة حالياً (يرجى تشغيل برنامج كندا أو تفعيل وضع المحاكاة الاختباري)")
 	}
 
-	return ctrl.fetchFromMock(vin)
+	html, title, err := ctrl.fetchFromMock(vin)
+	return html, title, "", err
 }
 
 // fetchFromMock generates a 100% faithful 6-Block Official CARFAX Vehicle History Report™

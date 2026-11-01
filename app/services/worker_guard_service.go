@@ -65,13 +65,15 @@ type WorkerStatus struct {
 }
 
 type WorkerTaskResult struct {
-	VIN              string    `json:"vin"`
-	VehicleTitle     string    `json:"vehicle_title"`
-	RawHtmlEn        string    `json:"raw_html_en"`
-	ErrorCode        string    `json:"error_code,omitempty"`
-	ErrorMessage     string    `json:"error_message,omitempty"`
-	ScreenshotBase64 string    `json:"screenshot_base64,omitempty"`
-	CompletedAt      time.Time `json:"completed_at"`
+	VIN                string    `json:"vin"`
+	VehicleTitle       string    `json:"vehicle_title"`
+	RawHtmlEn          string    `json:"raw_html_en"`
+	FastSummaryJson    string    `json:"fast_summary_json,omitempty"`
+	IsBackgroundEnrich bool      `json:"is_background_enrich,omitempty"`
+	ErrorCode          string    `json:"error_code,omitempty"`
+	ErrorMessage       string    `json:"error_message,omitempty"`
+	ScreenshotBase64   string    `json:"screenshot_base64,omitempty"`
+	CompletedAt        time.Time `json:"completed_at"`
 }
 
 type WorkerGuardService struct {

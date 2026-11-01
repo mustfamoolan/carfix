@@ -29,13 +29,15 @@ type PollResponse struct {
 }
 
 type CompleteRequest struct {
-	VIN              string    `json:"vin"`
-	VehicleTitle     string    `json:"vehicle_title"`
-	RawHtmlEn        string    `json:"raw_html_en"`
-	ErrorCode        string    `json:"error_code,omitempty"`
-	ErrorMessage     string    `json:"error_message,omitempty"`
-	ScreenshotBase64 string    `json:"screenshot_base64,omitempty"`
-	CompletedAt      time.Time `json:"completed_at"`
+	VIN                string    `json:"vin"`
+	VehicleTitle       string    `json:"vehicle_title"`
+	RawHtmlEn          string    `json:"raw_html_en"`
+	FastSummaryJson    string    `json:"fast_summary_json,omitempty"`
+	IsBackgroundEnrich bool      `json:"is_background_enrich,omitempty"`
+	ErrorCode          string    `json:"error_code,omitempty"`
+	ErrorMessage       string    `json:"error_message,omitempty"`
+	ScreenshotBase64   string    `json:"screenshot_base64,omitempty"`
+	CompletedAt        time.Time `json:"completed_at"`
 }
 
 type ProgressUpdate struct {
@@ -158,28 +160,54 @@ func (w *CanadaWorker) pollAndExecute(ctx context.Context) {
 		return
 	}
 
-	// 5. Task received: Execute strict One-Shot Harvest
+	// 5. Task received: Execute strict One-Shot Harvest with Two-Stage Progressive Delivery
 	vin := pollRes.VIN
 	log.Printf("🚀 [TASK RECEIVED] Starting One-Shot Carfax pull for VIN: %s", vin)
 
-	harvestRes := w.stealth.HarvestReport(ctx, w.cdpWsURL, vin, func(step, stepAr, screenshot string) {
-		log.Printf("   -> [%s] %s", step, stepAr)
-		_ = w.sendProgress(&ProgressUpdate{
-			VIN:              vin,
-			Step:             step,
-			StepAr:           stepAr,
-			ScreenshotBase64: screenshot,
-		})
-	})
+	fastDelivered := false
+	harvestRes := w.stealth.HarvestReport(
+		ctx,
+		w.cdpWsURL,
+		vin,
+		func(step, stepAr, screenshot string) {
+			log.Printf("   -> [%s] %s", step, stepAr)
+			_ = w.sendProgress(&ProgressUpdate{
+				VIN:              vin,
+				Step:             step,
+				StepAr:           stepAr,
+				ScreenshotBase64: screenshot,
+			})
+		},
+		func(fastRes *HarvestResult) {
+			fastReq := CompleteRequest{
+				VIN:              vin,
+				VehicleTitle:     fastRes.VehicleTitle,
+				RawHtmlEn:        fastRes.RawHtmlEn,
+				FastSummaryJson:  fastRes.FastSummaryJson,
+				ScreenshotBase64: fastRes.ScreenshotBase64,
+				CompletedAt:      time.Now(),
+			}
+			if err := w.sendComplete(&fastReq); err != nil {
+				log.Printf("⚠️ [STAGE 1 FAST DELIVERY FAILED] %v", err)
+			} else {
+				fastDelivered = true
+				log.Printf("⚡ [STAGE 1 DELIVERED] Fast structured report for %s displayed immediately to user!", vin)
+				log.Printf("🔇 [STAGE 2 SILENT] Continuing background Print (Select All) + PDF + Full HTML bundling...")
+			}
+		},
+	)
 
+	// If Stage 1 already unblocked the user, send Stage 2 as a silent background enrichment update
 	completeReq := CompleteRequest{
-		VIN:              vin,
-		VehicleTitle:     harvestRes.VehicleTitle,
-		RawHtmlEn:        harvestRes.RawHtmlEn,
-		ErrorCode:        harvestRes.ErrorCode,
-		ErrorMessage:     harvestRes.ErrorMessage,
-		ScreenshotBase64: harvestRes.ScreenshotBase64,
-		CompletedAt:      time.Now(),
+		VIN:                vin,
+		VehicleTitle:       harvestRes.VehicleTitle,
+		RawHtmlEn:          harvestRes.RawHtmlEn,
+		FastSummaryJson:    harvestRes.FastSummaryJson,
+		IsBackgroundEnrich: fastDelivered && harvestRes.Success,
+		ErrorCode:          harvestRes.ErrorCode,
+		ErrorMessage:       harvestRes.ErrorMessage,
+		ScreenshotBase64:   harvestRes.ScreenshotBase64,
+		CompletedAt:        time.Now(),
 	}
 
 	if err := w.sendComplete(&completeReq); err != nil {
@@ -187,6 +215,8 @@ func (w *CanadaWorker) pollAndExecute(ctx context.Context) {
 	} else {
 		if !harvestRes.Success {
 			log.Printf("🛑 [ONE-SHOT FREEZE] Safety stop [%s]: %s", harvestRes.ErrorCode, harvestRes.ErrorMessage)
+		} else if fastDelivered {
+			log.Printf("✅ [STAGE 2 SILENT COMPLETED] Full Carfax page + Official PDF for %s uploaded (%d KB)", vin, len(harvestRes.RawHtmlEn)/1024)
 		} else {
 			log.Printf("✅ [TASK COMPLETED] Report for %s delivered (%d bytes)", vin, len(harvestRes.RawHtmlEn))
 		}

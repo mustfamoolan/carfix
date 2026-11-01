@@ -8,6 +8,8 @@ import (
 	"io"
 	"math/rand"
 	"net/http"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
@@ -50,6 +52,7 @@ type HarvestResult struct {
 	Success          bool
 	VehicleTitle     string
 	RawHtmlEn        string
+	FastSummaryJson  string
 	ErrorCode        string
 	ErrorMessage     string
 	ScreenshotBase64 string
@@ -144,7 +147,17 @@ func (sh *StealthHarvester) FindCarfaxSearchTab(cdpEndpoint string) (*CDPTab, bo
 		return nil, false, nil
 	}
 
-	// 1. Prefer a tab on carfaxonline.com that is NOT an already-opened report popup
+	// 1. Prefer a tab on carfaxonline.com that is NOT an already-opened report popup (/vhr/ or /cfm/)
+	for i := range tabs {
+		t := tabs[i]
+		u := strings.ToLower(t.URL)
+		if (strings.Contains(u, "carfaxonline.com") || strings.Contains(u, "carfax.ca") || strings.Contains(u, "carfax.com")) &&
+			!strings.Contains(u, "/vhr/") && !strings.Contains(u, "/cfm/") {
+			return &t, true, nil
+		}
+	}
+
+	// 1b. Fallback to any carfax tab if only a report tab is open
 	for i := range tabs {
 		t := tabs[i]
 		u := strings.ToLower(t.URL)
@@ -385,11 +398,15 @@ func (sh *StealthHarvester) InspectBrowserState(parentCtx context.Context, cdpEn
 }
 
 // HarvestReport executes the strict One-Shot Or Freeze protocol on carfaxonline.com
+// using Two-Stage Progressive Delivery:
+//   - Stage 1 (Fast): Immediately extracts structured report data + lightweight HTML (~2s) and triggers onFastData so the user views the report right away in our design.
+//   - Stage 2 (Silent Background): Opens Printing Options -> Select All -> PrintToPDF (saves to C:\CarfaxReports\CARFAX_<VIN>.pdf) + inlines all CSS/Images and returns the full bundle.
 func (sh *StealthHarvester) HarvestReport(
 	parentCtx context.Context,
 	cdpEndpoint string,
 	vin string,
 	onProgress func(step, stepAr string, screenshot string),
+	onFastData func(fastRes *HarvestResult),
 ) *HarvestResult {
 	// 1. Pre-Flight Silent Inspection
 	if onProgress != nil {
@@ -453,13 +470,6 @@ func (sh *StealthHarvester) HarvestReport(
 		}
 	}
 
-	// Record existing open tabs before clicking search so we can detect if a new tab pops up
-	tabsBefore, _ := sh.ListOpenTabs(cdpEndpoint)
-	knownTabIDs := make(map[string]bool)
-	for _, t := range tabsBefore {
-		knownTabIDs[t.ID] = true
-	}
-
 	// Connect to the search tab without closing it on disconnect
 	searchTab, _, err := sh.FindCarfaxSearchTab(cdpEndpoint)
 	if err != nil || searchTab == nil {
@@ -469,6 +479,19 @@ func (sh *StealthHarvester) HarvestReport(
 			ErrorMessage:     "فقد الاتصال بتبويب البحث قبل البدء مباشرة.",
 			ScreenshotBase64: state.ScreenshotBase64,
 		}
+	}
+
+	// Clean up any leftover /vhr/ popup tabs from previous searches (except the main search tab)
+	// so there is zero chance of reading an older VIN's popup tab
+	tabsBefore, _ := sh.ListOpenTabs(cdpEndpoint)
+	knownTabIDs := make(map[string]bool)
+	upperTargetVin := strings.ToUpper(strings.TrimSpace(vin))
+	for _, t := range tabsBefore {
+		if t.ID != searchTab.ID && strings.Contains(strings.ToLower(t.URL), "/vhr/") && !strings.Contains(strings.ToUpper(t.URL), upperTargetVin) {
+			sh.CloseTabByID(cdpEndpoint, t.ID)
+			continue
+		}
+		knownTabIDs[t.ID] = true
 	}
 
 	tabCtx, cleanupSearchTab, attachErr := sh.attachExistingTab(parentCtx, cdpEndpoint, searchTab.ID)
@@ -535,8 +558,8 @@ func (sh *StealthHarvester) HarvestReport(
 		_ = chromedp.Run(tabCtx, chromedp.KeyEvent("\r"))
 	}
 
-	// Wait 3.5 to 5 seconds for either a new report tab to open OR current tab to load report
-	sh.randomDelay(3500, 5000)
+	// Wait 3.2 to 4.2 seconds for the report tab to open
+	sh.randomDelay(3200, 4200)
 
 	// Check if a new tab was opened for the report (standard on carfaxonline.com)
 	tabsAfter, _ := sh.ListOpenTabs(cdpEndpoint)
@@ -550,6 +573,17 @@ func (sh *StealthHarvester) HarvestReport(
 			break
 		}
 	}
+	// If no brand-new tab opened, check if an existing tab holds this exact VIN's report (/vhr/<VIN>)
+	if reportTab == nil {
+		for i := range tabsAfter {
+			t := tabsAfter[i]
+			if t.ID != searchTab.ID && (strings.Contains(strings.ToUpper(t.URL), upperTargetVin) || strings.Contains(strings.ToUpper(t.Title), upperTargetVin)) {
+				reportTab = &t
+				openedNewTab = true
+				break
+			}
+		}
+	}
 
 	// If no new tab opened, the report is in the current searchTab
 	activeReportCtx := tabCtx
@@ -557,30 +591,68 @@ func (sh *StealthHarvester) HarvestReport(
 		if rTabCtx, cleanupReportTab, rErr := sh.attachExistingTab(parentCtx, cdpEndpoint, reportTab.ID); rErr == nil {
 			defer cleanupReportTab()
 			activeReportCtx = rTabCtx
-			// Give the new tab 2.5 more seconds to finish rendering styles & records
-			sh.randomDelay(2200, 3400)
+			// Wait 1.6s to 2.2s for the report DOM text & tables to render
+			sh.randomDelay(1600, 2200)
 		}
 	}
 
-	// 4. Natural Human Reading & Extraction
+	// =========================================================================
+	// ⚡ STAGE 1 (FAST INSTANT DELIVERY): Extract Structured Data & Light HTML
+	// =========================================================================
 	if onProgress != nil {
-		onProgress("extracting_report", "4/4 تم فتح التقرير، جاري القراءة البشرية وسحب المحتوى...", "")
+		onProgress("extracting_fast", "4/4 تم فتح التقرير! جاري إرسال بيانات الفحص الفورية لتصميمنا وإكمال الطباعة بصمت...", "")
 	}
 
-	// Gentle scroll like a human dealer reading the report
+	reportScreenshot := sh.captureCompressedJPEG(activeReportCtx)
+	fastSummaryJson, lightHtml, fastTitle, isFastErr, fastErrMsg, fastErr := sh.extractFastReportData(activeReportCtx, vin)
+
+	if fastErr == nil && isFastErr {
+		if openedNewTab && reportTab != nil {
+			sh.CloseTabByID(cdpEndpoint, reportTab.ID)
+		}
+		return &HarvestResult{
+			Success:          false,
+			ErrorCode:        "VIN_NOT_FOUND_ON_CARFAX",
+			ErrorMessage:     fastErrMsg,
+			ScreenshotBase64: reportScreenshot,
+		}
+	}
+
+	if fastErr == nil && fastSummaryJson != "" && onFastData != nil {
+		onFastData(&HarvestResult{
+			Success:          true,
+			VehicleTitle:     fastTitle,
+			RawHtmlEn:        lightHtml,
+			FastSummaryJson:  fastSummaryJson,
+			ScreenshotBase64: reportScreenshot,
+		})
+	}
+
+	// =========================================================================
+	// 🔇 STAGE 2 (SILENT BACKGROUND): Gentle Scroll + Printing Options (Select All)
+	//                                + Official PDF + Full Self-Contained HTML
+	// =========================================================================
 	sh.simulateGentleScroll(activeReportCtx)
 
-	// Capture screenshot of the opened report
-	reportScreenshot := sh.captureCompressedJPEG(activeReportCtx)
+	finalReportCtx, cleanupPrintTab, printPopupTabID := sh.prepareOfficialPrintModal(parentCtx, cdpEndpoint, activeReportCtx)
+	if cleanupPrintTab != nil {
+		defer cleanupPrintTab()
+	}
 
-	// Non-destructive clone & extraction (never alters the live DOM!)
-	html, title, isErrorPage, errPageMsg, err := sh.extractClonedReportHTML(activeReportCtx, vin)
+	html, title, isErrorPage, errPageMsg, err := sh.extractClonedReportHTML(finalReportCtx, vin)
+	if title == "" && fastTitle != "" {
+		title = fastTitle
+	}
+
+	// Clean up any extra print popup tab if Carfax opened one
+	if printPopupTabID != "" && (reportTab == nil || printPopupTabID != reportTab.ID) && printPopupTabID != searchTab.ID {
+		sh.CloseTabByID(cdpEndpoint, printPopupTabID)
+	}
 
 	// Clean up: if a popup tab was opened for the report, close ONLY the popup tab so the main search tab stays clean
 	if openedNewTab && reportTab != nil {
 		sh.CloseTabByID(cdpEndpoint, reportTab.ID)
 	} else {
-		// If it navigated in the same tab, go back to the search screen if URL changed away from the main search form
 		var stillHasVinInput bool
 		_ = chromedp.Run(activeReportCtx, chromedp.Evaluate(fmt.Sprintf(`Boolean(document.querySelector(%q))`, state.VinInputSelector), &stillHasVinInput))
 		if !stillHasVinInput {
@@ -610,8 +682,438 @@ func (sh *StealthHarvester) HarvestReport(
 		Success:          true,
 		VehicleTitle:     title,
 		RawHtmlEn:        html,
+		FastSummaryJson:  fastSummaryJson,
 		ScreenshotBase64: reportScreenshot,
 	}
+}
+
+// extractFastReportData runs in <25ms on the newly opened Carfax report tab to extract all structured
+// vehicle specs, Carfax Value, highlights, ownership history, title guarantee, technical checks,
+// accident events, and chronological service records so the user sees the report immediately in our UI.
+func (sh *StealthHarvester) extractFastReportData(tabCtx context.Context, vin string) (string, string, string, bool, string, error) {
+	fastJS := fmt.Sprintf(`
+(() => {
+    const reqVin = %q.toUpperCase().trim();
+    const url = (window.location.href || '');
+    const bodyText = (document.body ? document.body.innerText : '');
+    const lowerText = bodyText.toLowerCase();
+
+    if (lowerText.includes('invalid vin') || lowerText.includes('not a valid vin') || lowerText.includes('no records found for this vin')) {
+        return {
+            isError: true,
+            errorMsg: 'أفاد موقع كارفاكس أن رقم الشاصي هذا غير صحيح أو لا توجد له سجلات في قاعدة بيانات كارفاكس.'
+        };
+    }
+
+    // Check if we are still stuck on the search home page without a report
+    if (!url.toLowerCase().includes('/vhr/') && !lowerText.includes('vehicle history report') && !lowerText.includes('ownership history')) {
+        return {
+            isError: true,
+            errorMsg: 'لم يفتح موقع كارفاكس صفحة تقرير لهذا الشاصي (يرجى التأكد من صحة الرقم أو عدم وجود تنبيه في صفحة البحث).'
+        };
+    }
+
+    // 1. Extract Title (Year Make Model)
+    let title = '';
+    const titleSelectors = [
+        '.vehicle-information-year-make-model',
+        '.header-vehicle-name',
+        '[class*="year-make-model" i]',
+        'h1',
+        'h2.vehicle-title'
+    ];
+    for (const sel of titleSelectors) {
+        const el = document.querySelector(sel);
+        if (el && el.innerText && el.innerText.trim().length > 3) {
+            title = el.innerText.trim().replace(/\s+/g, ' ');
+            break;
+        }
+    }
+    if (!title) {
+        title = (document.title || '').replace('CARFAX Vehicle History Report for this ', '').split(':')[0].trim() || ('CARFAX Report ' + reqVin);
+    }
+
+    // 2. Odometer
+    let odometer = 'غير مسجل';
+    const odoMatch = bodyText.match(/(\d{1,3}(?:,\d{3})+|\d+)\s*(?:mi|miles|km)\b/i);
+    if (odoMatch) {
+        odometer = odoMatch[0].trim();
+    }
+
+    // 3. Carfax Value / Retail Value
+    let carfaxValue = '';
+    const valMatch = bodyText.match(/(?:CARFAX\s*VALUE|Retail\s*Value|History-Based\s*Value)[^\$\n]{0,40}(\$[0-9,]+)/i) || bodyText.match(/(\$[0-9]{1,3}(?:,[0-9]{3})+)/);
+    if (valMatch && valMatch[1]) {
+        carfaxValue = valMatch[1].trim();
+    }
+
+    // 4. Vehicle Specifications (Body, Engine, Fuel, Drivetrain)
+    const specs = [];
+    const specLines = bodyText.split('\n').map(s => s.trim()).filter(Boolean);
+    for (const line of specLines) {
+        if (/^(Sedan|SUV|Coupe|Convertible|Hatchback|Pickup|Wagon|Van|Minivan|Truck|\d\.\dL\s|Gasoline|Diesel|Hybrid|Electric|Front wheel drive|Rear wheel drive|All wheel drive|4WD|AWD|FWD|RWD)/i.test(line) && line.length < 65) {
+            if (!specs.includes(line)) specs.push(line);
+        }
+    }
+
+    // 5. Owners Count
+    let owners = 1;
+    const ownerBanner = bodyText.match(/CARFAX\s+(\d+)-Owner/i);
+    if (ownerBanner && ownerBanner[1]) {
+        owners = parseInt(ownerBanner[1], 10) || 1;
+    } else {
+        const ownerCols = bodyText.match(/Owner\s+(\d+)/gi) || [];
+        for (const oc of ownerCols) {
+            const num = parseInt(oc.replace(/\D+/g, ''), 10);
+            if (num > owners) owners = num;
+        }
+    }
+
+    // 6. Accident / Damage Status
+    let accidentsReported = 0;
+    let accidentSummary = 'No accidents or damage reported to CARFAX';
+    let damageSeverity = 'None';
+    if (!lowerText.includes('no accidents or damage reported')) {
+        if (lowerText.includes('severe damage')) {
+            accidentsReported = 1;
+            accidentSummary = 'Severe Damage Reported';
+            damageSeverity = 'Severe';
+        } else if (lowerText.includes('moderate damage')) {
+            accidentsReported = 1;
+            accidentSummary = 'Moderate Damage Reported';
+            damageSeverity = 'Moderate';
+        } else if (lowerText.includes('minor damage')) {
+            accidentsReported = 1;
+            accidentSummary = 'Minor Damage Reported';
+            damageSeverity = 'Minor';
+        } else if (lowerText.includes('vandalism damage')) {
+            accidentsReported = 1;
+            accidentSummary = 'Vandalism Damage Reported';
+            damageSeverity = 'Moderate';
+        } else if (lowerText.includes('accident reported') || lowerText.includes('damage reported')) {
+            accidentsReported = 1;
+            accidentSummary = 'Accident / Damage Reported';
+            damageSeverity = 'Reported';
+        }
+    }
+
+    // 7. Service Records, Vehicle Use, Last Location, Detailed Records Count
+    let serviceRecordsText = '';
+    const srvMatch = bodyText.match(/(\d+\s+Service\s+History\s+Records?)/i);
+    if (srvMatch) serviceRecordsText = srvMatch[1].trim();
+
+    let vehicleUse = 'Personal Vehicle';
+    const useMatch = bodyText.match(/(Personal\s+Vehicle|Rental\s+Vehicle|Commercial\s+Vehicle|Personal\s+Lease|Fleet\s+Vehicle|Lease\s+Vehicle)/i);
+    if (useMatch) vehicleUse = useMatch[1].trim();
+
+    let lastLocation = '';
+    const locMatch = bodyText.match(/Last\s+Owned\s+in\s+([A-Za-z\s]+?)(?:\n|$|\r)/i);
+    if (locMatch) lastLocation = 'Last Owned in ' + locMatch[1].trim();
+
+    let detailedCountText = '';
+    const detMatch = bodyText.match(/(\d+\s+Detailed\s+Records?\s+Available)/i);
+    if (detMatch) detailedCountText = detMatch[1].trim();
+
+    // 8. Extract Structured Tables (Ownership, Title, Additional History, and Detailed History Timeline)
+    const tables = [];
+    const detailedRecords = [];
+    const allTables = Array.from(document.querySelectorAll('table'));
+
+    for (const tbl of allTables) {
+        const headers = Array.from(tbl.querySelectorAll('thead th, thead td, tr:first-child th')).map(th => (th.innerText || '').trim().replace(/\s+/g, ' ')).filter(Boolean);
+        const rows = [];
+        const trs = Array.from(tbl.querySelectorAll('tbody tr, tr'));
+        for (const tr of trs) {
+            if (tr.querySelector('th') && rows.length === 0) continue;
+            const cells = Array.from(tr.querySelectorAll('td')).map(td => (td.innerText || '').trim().replace(/\s+/g, ' '));
+            if (cells.length === 0 || cells.every(c => !c)) continue;
+
+            // Check if this row is a chronological Detailed History row (Date | Mileage | Source | Comments)
+            const firstCell = cells[0] || '';
+            if (cells.length >= 3 && (/^\d{2}\/\d{2}\/\d{4}$/.test(firstCell) || /^\d{1,2}\/\d{1,2}\/\d{2,4}$/.test(firstCell) || /^Not Reported$/i.test(firstCell))) {
+                detailedRecords.push({
+                    date: cells[0] || '',
+                    mileage: cells.length >= 4 ? (cells[1] || '') : '',
+                    source: cells.length >= 4 ? (cells[2] || '') : (cells[1] || ''),
+                    comments: cells.length >= 4 ? cells.slice(3).join(' | ') : (cells[2] || '')
+                });
+            } else {
+                rows.push(cells);
+            }
+        }
+        if (rows.length > 0) {
+            let sectionTitle = '';
+            const prev = tbl.previousElementSibling;
+            if (prev && prev.innerText) {
+                sectionTitle = prev.innerText.trim().split('\n')[0];
+            }
+            tables.push({
+                title: sectionTitle || headers[0] || 'CARFAX Section',
+                headers: headers,
+                rows: rows
+            });
+        }
+    }
+
+    // Also capture div-based Detailed History rows if Carfax uses div/flex rows for timeline
+    if (detailedRecords.length === 0) {
+        const recordRows = Array.from(document.querySelectorAll('[class*="detailed-history-row" i], [class*="record-row" i], .detailed-history tr'));
+        for (const r of recordRows) {
+            const txt = (r.innerText || '').trim();
+            const dateMatch = txt.match(/^(\d{2}\/\d{2}\/\d{4})/);
+            if (dateMatch) {
+                const parts = txt.split('\t').map(p => p.trim()).filter(Boolean);
+                detailedRecords.push({
+                    date: dateMatch[1],
+                    mileage: parts[1] || '',
+                    source: parts[2] || '',
+                    comments: parts.slice(3).join(' - ') || txt.substring(dateMatch[1].length).trim()
+                });
+            }
+        }
+    }
+
+    // 9. Extract Accident / Damage Events if present
+    const accidentEvents = [];
+    const eventEls = Array.from(document.querySelectorAll('[class*="accident" i] [class*="event" i], [class*="damage-event" i]'));
+    for (const ev of eventEls) {
+        const t = (ev.innerText || '').trim().replace(/\s+/g, ' ');
+        if (t.length > 10 && accidentEvents.length < 10 && !accidentEvents.includes(t)) {
+            accidentEvents.push(t);
+        }
+    }
+
+    const cleanTitle = !(lowerText.includes('salvage title') || lowerText.includes('rebuilt title') || lowerText.includes('total loss reported'));
+
+    const summaryObj = {
+        vin: reqVin,
+        vehicle_title: title,
+        carfax_score: accidentsReported > 0 ? 82 : 95,
+        carfax_value: carfaxValue,
+        total_owners: owners,
+        accidents_reported: accidentsReported,
+        accident_summary: accidentSummary,
+        damage_severity: damageSeverity,
+        clean_title: cleanTitle,
+        last_reported_odometer: odometer,
+        service_records_count: serviceRecordsText,
+        vehicle_use: vehicleUse,
+        last_owned_location: lastLocation,
+        detailed_records_count: detailedCountText,
+        specs: specs,
+        tables: tables,
+        detailed_records: detailedRecords,
+        accident_events: accidentEvents,
+        background_pending: true,
+        analyzed_at: new Date().toISOString()
+    };
+
+    // Create a lightweight clean HTML snapshot (no heavy scripts/SVGs) for immediate storage
+    const clone = document.documentElement.cloneNode(true);
+    clone.querySelectorAll('script, noscript, iframe, svg').forEach(el => el.remove());
+
+    return {
+        isError: false,
+        errorMsg: '',
+        title: title,
+        summaryJson: JSON.stringify(summaryObj),
+        lightHtml: '<!DOCTYPE html>\n' + clone.outerHTML
+    };
+})();
+`, vin)
+
+	var out struct {
+		IsError     bool   `json:"isError"`
+		ErrorMsg    string `json:"errorMsg"`
+		Title       string `json:"title"`
+		SummaryJson string `json:"summaryJson"`
+		LightHtml   string `json:"lightHtml"`
+	}
+
+	if err := chromedp.Run(tabCtx, chromedp.Evaluate(fastJS, &out)); err != nil {
+		return "", "", "", false, "", err
+	}
+
+	if out.IsError {
+		return "", "", "", true, out.ErrorMsg, nil
+	}
+
+	return out.SummaryJson, out.LightHtml, out.Title, false, "", nil
+}
+
+// prepareOfficialPrintModal safely clicks the top "Print" button on the Carfax report page,
+// selects all 4 report sections inside the "Printing Options" modal (CARFAX Report, History-Based Value,
+// Warranty Check, Buyback Guarantee), clicks the modal's "Print" button while intercepting window.print()
+// so no native OS print dialog blocks Chrome, and hides the modal overlay once the full sections render.
+func (sh *StealthHarvester) prepareOfficialPrintModal(
+	parentCtx context.Context,
+	cdpEndpoint string,
+	activeReportCtx context.Context,
+) (context.Context, context.CancelFunc, string) {
+	// Record tabs before clicking Print in case Carfax opens a separate print tab
+	tabsBeforePrint, _ := sh.ListOpenTabs(cdpEndpoint)
+	knownBeforePrint := make(map[string]bool)
+	for _, t := range tabsBeforePrint {
+		knownBeforePrint[t.ID] = true
+	}
+
+	// 1. Intercept window.print() on current document and any future document in this tab
+	overridePrintJS := `
+(() => {
+    window.__carfaxPrintTriggered = false;
+    window.print = function() {
+        window.__carfaxPrintTriggered = true;
+    };
+})();
+`
+	_ = chromedp.Run(activeReportCtx,
+		chromedp.ActionFunc(func(ctx context.Context) error {
+			_, _ = page.AddScriptToEvaluateOnNewDocument(overridePrintJS).Do(ctx)
+			return nil
+		}),
+		chromedp.Evaluate(overridePrintJS, nil),
+	)
+
+	// 2. Click the top-right "Print" button on the Carfax report page to open "Printing Options"
+	clickTopPrintJS := `
+(() => {
+    const els = Array.from(document.querySelectorAll('button, a, [role="button"]'));
+    for (const el of els) {
+        if (el.offsetParent === null) continue;
+        const txt = (el.innerText || el.textContent || '').trim();
+        const id = (el.id || '').toLowerCase();
+        const cls = (typeof el.className === 'string' ? el.className : '').toLowerCase();
+        if (txt === 'Print' || txt.includes('Print') || id.includes('print') || cls.includes('print-btn') || cls.includes('print-button')) {
+            el.click();
+            return true;
+        }
+    }
+    return false;
+})();
+`
+	var clickedTopPrint bool
+	if err := chromedp.Run(activeReportCtx, chromedp.Evaluate(clickTopPrintJS, &clickedTopPrint)); err != nil || !clickedTopPrint {
+		return activeReportCtx, nil, ""
+	}
+
+	// Wait 1.3s to 1.9s like a human for the "Printing Options" modal to appear
+	sh.randomDelay(1300, 1900)
+
+	// 3. In "Printing Options" modal: click "Select All" AND ensure every checkbox is checked
+	selectAllOptionsJS := `
+(() => {
+    const allContainers = Array.from(document.querySelectorAll('[role="dialog"], [class*="modal" i], [class*="dialog" i], div'));
+    let modal = null;
+    for (const d of allContainers) {
+        if (d.offsetParent === null) continue;
+        const t = (d.innerText || '');
+        if ((t.includes('Printing Options') || t.includes('Print Selected Reports')) && t.includes('Cancel')) {
+            modal = d;
+        }
+    }
+    const root = modal || document;
+
+    // Click "Select All" if present and visible
+    const links = Array.from(root.querySelectorAll('a, button, span, [role="button"]'));
+    for (const l of links) {
+        const txt = (l.innerText || l.textContent || '').trim().toLowerCase();
+        if (txt === 'select all' && l.offsetParent !== null) {
+            l.click();
+            break;
+        }
+    }
+
+    // Ensure all checkboxes inside the modal (CARFAX Report, History-Based Value, Warranty Check, Buyback Guarantee) are checked
+    const checkboxes = Array.from(root.querySelectorAll('input[type="checkbox"]'));
+    let checkedCount = 0;
+    for (const cb of checkboxes) {
+        const labelText = ((cb.closest('label') ? cb.closest('label').innerText : '') || (cb.parentElement ? cb.parentElement.innerText : '') || '').toLowerCase();
+        if (labelText.includes('display carfax in online listings')) {
+            continue;
+        }
+        if (!cb.checked) {
+            cb.click();
+        }
+        if (cb.checked) {
+            checkedCount++;
+        }
+    }
+    return checkedCount;
+})();
+`
+	var checkedCount int
+	_ = chromedp.Run(activeReportCtx, chromedp.Evaluate(selectAllOptionsJS, &checkedCount))
+	sh.randomDelay(500, 850)
+
+	// 4. Click the blue "Print" button inside the "Printing Options" modal
+	clickModalPrintJS := `
+(() => {
+    const allContainers = Array.from(document.querySelectorAll('[role="dialog"], [class*="modal" i], [class*="dialog" i], div'));
+    let modal = null;
+    for (const d of allContainers) {
+        if (d.offsetParent === null) continue;
+        const t = (d.innerText || '');
+        if ((t.includes('Printing Options') || t.includes('Print Selected Reports')) && t.includes('Cancel')) {
+            modal = d;
+        }
+    }
+    const root = modal || document;
+    const buttons = Array.from(root.querySelectorAll('button, input[type="button"], input[type="submit"], a[ role="button" ]'));
+    let targetBtn = null;
+    for (const b of buttons) {
+        if (b.offsetParent === null) continue;
+        const txt = (b.innerText || b.value || b.textContent || '').trim();
+        if (txt === 'Print') {
+            targetBtn = b;
+        }
+    }
+    if (targetBtn) {
+        targetBtn.click();
+        return true;
+    }
+    return false;
+})();
+`
+	var clickedModalPrint bool
+	_ = chromedp.Run(activeReportCtx, chromedp.Evaluate(clickModalPrintJS, &clickedModalPrint))
+
+	// Wait 2.6s to 3.6s for Carfax to assemble & render all 4 selected sections (or open a print tab)
+	sh.randomDelay(2600, 3600)
+
+	// 5. Check if clicking Print in the modal opened a brand-new print tab
+	tabsAfterPrint, _ := sh.ListOpenTabs(cdpEndpoint)
+	for i := range tabsAfterPrint {
+		t := tabsAfterPrint[i]
+		if !knownBeforePrint[t.ID] && t.URL != "about:blank" {
+			if pCtx, pCleanup, pErr := sh.attachExistingTab(parentCtx, cdpEndpoint, t.ID); pErr == nil {
+				_ = chromedp.Run(pCtx, chromedp.Evaluate(overridePrintJS, nil))
+				sh.randomDelay(1500, 2200)
+				return pCtx, pCleanup, t.ID
+			}
+		}
+	}
+
+	// 6. Hide any remaining "Printing Options" modal dialog / backdrop so the report & PDF are 100% unobstructed
+	hideModalJS := `
+(() => {
+    const allContainers = Array.from(document.querySelectorAll('[role="dialog"], [class*="modal" i], [class*="dialog" i], [class*="backdrop" i], [class*="overlay" i]'));
+    for (const el of allContainers) {
+        const t = (el.innerText || '');
+        const cls = (typeof el.className === 'string' ? el.className : '').toLowerCase();
+        if (t.includes('Printing Options') || t.includes('Print Selected Reports') || cls.includes('backdrop') || cls.includes('modal-overlay') || el.getAttribute('role') === 'dialog') {
+            el.style.setProperty('display', 'none', 'important');
+            el.style.setProperty('visibility', 'hidden', 'important');
+        }
+    }
+    if (document.body) {
+        document.body.style.overflow = 'visible';
+    }
+})();
+`
+	_ = chromedp.Run(activeReportCtx, chromedp.Evaluate(hideModalJS, nil))
+	sh.randomDelay(300, 500)
+
+	return activeReportCtx, nil, ""
 }
 
 // typeVinHumanly focuses the VIN input, clears it, types the 17 characters with human rhythm, and verifies the value
@@ -806,15 +1308,16 @@ func (sh *StealthHarvester) extractClonedReportHTML(tabCtx context.Context, vin 
 	}
 
 	// Inline all CSS stylesheets and images from Chrome's C++ cache + attach official PrintToPDF
-	out.HTML = sh.bundleSelfContainedReportAndPDF(tabCtx, out.HTML)
+	out.HTML = sh.bundleSelfContainedReportAndPDF(tabCtx, out.HTML, vin)
 
 	return out.HTML, out.Title, false, "", nil
 }
 
 // bundleSelfContainedReportAndPDF reads all cached CSS stylesheets and images directly from
 // Chrome's C++ memory cache via CDP (Page.getResourceTree / Page.getResourceContent) with zero
-// extra network requests, inlines them into the HTML, and appends Chrome's native PrintToPDF.
-func (sh *StealthHarvester) bundleSelfContainedReportAndPDF(tabCtx context.Context, rawHTML string) string {
+// extra network requests, inlines them into the HTML, saves the official multi-page PDF locally
+// on the Canada PC (C:\CarfaxReports\CARFAX_<VIN>.pdf), and appends it to the HTML payload.
+func (sh *StealthHarvester) bundleSelfContainedReportAndPDF(tabCtx context.Context, rawHTML string, vin string) string {
 	var inlinedCSSBuilder strings.Builder
 	imageDataURIs := make(map[string]string)
 	var pdfBase64 string
@@ -871,13 +1374,24 @@ func (sh *StealthHarvester) bundleSelfContainedReportAndPDF(tabCtx context.Conte
 			}
 		}
 
-		// 3. Generate Official Native Chrome PrintToPDF
+		// 3. Generate Official Native Chrome PrintToPDF & save locally to C:\CarfaxReports\CARFAX_<VIN>.pdf
 		pdfBuf, _, pdfErr := page.PrintToPDF().
 			WithPrintBackground(true).
 			WithPreferCSSPageSize(true).
 			Do(ctx)
 		if pdfErr == nil && len(pdfBuf) > 0 {
 			pdfBase64 = base64.StdEncoding.EncodeToString(pdfBuf)
+			saveDir := `C:\CarfaxReports`
+			if mkErr := os.MkdirAll(saveDir, 0755); mkErr == nil {
+				cleanVin := strings.ToUpper(strings.TrimSpace(vin))
+				if cleanVin == "" {
+					cleanVin = "REPORT"
+				}
+				pdfPath := filepath.Join(saveDir, fmt.Sprintf("CARFAX_%s.pdf", cleanVin))
+				if wErr := os.WriteFile(pdfPath, pdfBuf, 0644); wErr == nil {
+					fmt.Printf("[💾] Saved Official PDF (%d KB) to %s\n", len(pdfBuf)/1024, pdfPath)
+				}
+			}
 		}
 
 		return nil

@@ -1,17 +1,25 @@
 package controllers
 
 import (
+	"encoding/json"
+	"strings"
+	"time"
+
+	"carfix/app/models"
 	"carfix/app/services"
+	"carfix/bootstrap"
 	"github.com/gofiber/fiber/v2"
 )
 
 type WorkerController struct {
-	guard *services.WorkerGuardService
+	guard      *services.WorkerGuardService
+	translator *services.CarfaxTranslatorService
 }
 
 func NewWorkerController() *WorkerController {
 	return &WorkerController{
-		guard: services.NewWorkerGuardService(),
+		guard:      services.NewWorkerGuardService(),
+		translator: services.NewCarfaxTranslatorService(),
 	}
 }
 
@@ -116,6 +124,49 @@ func (ctrl *WorkerController) Complete(c *fiber.Ctx) error {
 
 	if payload.VIN == "" {
 		return c.Status(400).JSON(fiber.Map{"error": "رقم الشاصي مطلوب"})
+	}
+
+	// Stage 2 Silent Background Enrichment: Update existing ReportCache with full Carfax HTML + Official PDF
+	if payload.IsBackgroundEnrich && payload.ErrorCode == "" && payload.RawHtmlEn != "" {
+		cleanVin := strings.ToUpper(strings.TrimSpace(payload.VIN))
+		translatedHtmlAr, extractedTitle, fallbackSummary := ctrl.translator.TranslateAndExtract(payload.RawHtmlEn, cleanVin)
+		title := payload.VehicleTitle
+		if title == "" {
+			title = extractedTitle
+		}
+
+		summaryJson := payload.FastSummaryJson
+		if summaryJson == "" {
+			var existing models.ReportCache
+			if err := bootstrap.DB.Where("vin = ?", cleanVin).First(&existing).Error; err == nil && existing.SummaryJson != "" {
+				summaryJson = existing.SummaryJson
+			} else {
+				summaryJson = fallbackSummary
+			}
+		}
+
+		// Mark background_pending = false and background_ready = true inside summary_json
+		var summaryMap map[string]interface{}
+		if json.Unmarshal([]byte(summaryJson), &summaryMap) == nil && summaryMap != nil {
+			summaryMap["background_pending"] = false
+			summaryMap["background_ready"] = true
+			if updatedBytes, mErr := json.Marshal(summaryMap); mErr == nil {
+				summaryJson = string(updatedBytes)
+			}
+		}
+
+		bootstrap.DB.Model(&models.ReportCache{}).Where("vin = ?", cleanVin).Updates(map[string]interface{}{
+			"vehicle_title":      title,
+			"raw_html_en":        payload.RawHtmlEn,
+			"translated_html_ar": translatedHtmlAr,
+			"summary_json":       summaryJson,
+			"updated_at":         time.Now(),
+		})
+
+		return c.JSON(fiber.Map{
+			"status":  "enriched",
+			"message": "تم تحديث التقرير بالنسخة الكاملة وملف الطباعة الرسمي بصمت",
+		})
 	}
 
 	if err := ctrl.guard.CompleteTask(&payload); err != nil {

@@ -3,6 +3,7 @@ import { useParams, useNavigate, useLocation } from 'react-router-dom'
 import AuthenticatedLayout from '@/components/layout/AuthenticatedLayout'
 import ReportToolbar from '@/components/report/ReportToolbar'
 import ReportSummaryCards from '@/components/report/ReportSummaryCards'
+import ReportNativeView from '@/components/report/ReportNativeView'
 import ReportFrame from '@/components/report/ReportFrame'
 import { getReport } from '@/lib/api'
 import { Loader2 } from 'lucide-react'
@@ -15,7 +16,8 @@ export default function ReportView() {
 
   const [report, setReport] = useState(location.state?.report || null)
   const [loading, setLoading] = useState(!report)
-  const [lang, setLang] = useState('en') // Default to Original English 1:1 first, user can switch to Arabic anytime
+  const [viewMode, setViewMode] = useState('smart') // 'smart' (Fast Native Design) | 'original' (Full Carfax Page)
+  const [lang, setLang] = useState('ar') // Instant Arabic/English toggle
   const iframeRef = useRef(null)
 
   useEffect(() => {
@@ -37,6 +39,20 @@ export default function ReportView() {
     }
   }
 
+  // Parse summary JSON
+  const summary = useMemo(() => {
+    try {
+      if (typeof report?.summary_json === 'string') {
+        return JSON.parse(report.summary_json)
+      } else if (report?.summary_json) {
+        return report.summary_json
+      }
+    } catch {
+      return null
+    }
+    return null
+  }, [report?.summary_json])
+
   // Extract embedded Official Native Chrome PDF if present inside raw_html_en
   const officialPdfBase64 = useMemo(() => {
     const raw = report?.raw_html_en || ''
@@ -48,6 +64,40 @@ export default function ReportView() {
     if (endIdx === -1) return null
     return raw.substring(contentStart, endIdx).trim()
   }, [report?.raw_html_en])
+
+  const isBackgroundPending = Boolean(summary?.background_pending && !officialPdfBase64)
+
+  // Silent Background Polling: while Stage 2 (Full Carfax Page + 4-Section Print PDF) is finishing in Canada,
+  // poll silently every 2.5 seconds until the full assets & PDF arrive.
+  useEffect(() => {
+    const targetVin = report?.vin || vin
+    if (!targetVin || !isBackgroundPending) return
+
+    let attempts = 0
+    const timer = setInterval(async () => {
+      attempts++
+      if (attempts > 15) {
+        clearInterval(timer)
+        return
+      }
+      try {
+        const res = await getReport(targetVin)
+        const updated = res?.report || res?.data?.report || res
+        if (updated && updated.raw_html_en && updated.raw_html_en.includes('carfix-official-pdf')) {
+          setReport((prev) => ({
+            ...prev,
+            ...updated,
+          }))
+          clearInterval(timer)
+          toast.success('اكتمل تجهيز صفحة كارفاكس الأصلية وملف الطباعة الرسمي PDF في الخلفية!')
+        }
+      } catch {
+        // Ignore silent background poll errors
+      }
+    }, 2500)
+
+    return () => clearInterval(timer)
+  }, [report?.vin, vin, isBackgroundPending])
 
   const handleDownloadOfficialPdf = () => {
     if (!officialPdfBase64) {
@@ -72,36 +122,37 @@ export default function ReportView() {
       document.body.appendChild(link)
       link.click()
       document.body.removeChild(link)
-      toast.success('تم فتح وتحميل ملف PDF الرسمي الأصلي من حاسبة كندا')
+      toast.success('تم فتح وتحميل ملف الطباعة الرسمي PDF من حاسبة كندا')
     } catch (e) {
       console.error(e)
       handlePrint()
     }
   }
 
-  const handlePrint = () => {
-    if (iframeRef.current && iframeRef.current.contentWindow) {
-      iframeRef.current.contentWindow.focus()
-      iframeRef.current.contentWindow.print()
-    }
-  }
-
-  // Parse summary JSON
-  let summary = null
-  try {
-    if (typeof report?.summary_json === 'string') {
-      summary = JSON.parse(report.summary_json)
-    } else if (report?.summary_json) {
-      summary = report.summary_json
-    }
-  } catch {
-    summary = null
-  }
-
   const activeHtml =
     lang === 'ar'
       ? report?.translated_html_ar || report?.raw_html_en
       : report?.raw_html_en || report?.translated_html_ar
+
+  const handleOpenOriginalNewTab = () => {
+    const htmlToOpen = report?.raw_html_en || activeHtml
+    if (!htmlToOpen) {
+      toast.error('محتوى الصفحة غير متوفر بعد')
+      return
+    }
+    const blob = new Blob([htmlToOpen], { type: 'text/html;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    window.open(url, '_blank')
+  }
+
+  const handlePrint = () => {
+    if (viewMode === 'original' && iframeRef.current && iframeRef.current.contentWindow) {
+      iframeRef.current.contentWindow.focus()
+      iframeRef.current.contentWindow.print()
+      return
+    }
+    window.print()
+  }
 
   return (
     <AuthenticatedLayout
@@ -124,19 +175,33 @@ export default function ReportView() {
               report={report}
               lang={lang}
               onLangChange={setLang}
+              viewMode={viewMode}
+              onViewModeChange={setViewMode}
+              onOpenOriginalNewTab={handleOpenOriginalNewTab}
               onBack={() => navigate('/dashboard')}
               onPrint={handlePrint}
               hasOfficialPdf={Boolean(officialPdfBase64)}
+              isBackgroundLoading={isBackgroundPending}
               onDownloadOfficialPdf={handleDownloadOfficialPdf}
             />
 
             <ReportSummaryCards summary={summary} />
 
-            <ReportFrame
-              htmlContent={activeHtml}
-              iframeRef={iframeRef}
-              onPrintRequest={officialPdfBase64 && lang === 'en' ? handleDownloadOfficialPdf : handlePrint}
-            />
+            {viewMode === 'smart' ? (
+              <ReportNativeView
+                report={report}
+                summary={summary}
+                lang={lang}
+                hasFullOriginal={Boolean(officialPdfBase64)}
+                onSwitchToOriginal={() => setViewMode('original')}
+              />
+            ) : (
+              <ReportFrame
+                htmlContent={activeHtml}
+                iframeRef={iframeRef}
+                onPrintRequest={officialPdfBase64 ? handleDownloadOfficialPdf : handlePrint}
+              />
+            )}
           </>
         )}
       </div>
