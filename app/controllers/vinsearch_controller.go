@@ -234,7 +234,7 @@ func (ctrl *VinSearchController) getOrBuildFastReport(cleanVin string) (fiber.Ma
 		if cachedStr, err := bootstrap.Redis.Get(ctx, redisKey).Result(); err == nil && cachedStr != "" {
 			var cachedMap fiber.Map
 			if json.Unmarshal([]byte(cachedStr), &cachedMap) == nil {
-				if sj, ok := cachedMap["summary_json"].(string); ok && strings.Contains(sj, `"tables"`) && !strings.Contains(sj, `"background_pending":true`) {
+				if sj, ok := cachedMap["summary_json"].(string); ok && strings.Contains(sj, `"specs"`) && !strings.Contains(sj, `"background_pending":true`) {
 					return cachedMap, nil
 				}
 			}
@@ -261,8 +261,8 @@ func (ctrl *VinSearchController) getOrBuildFastReport(cleanVin string) (fiber.Ma
 		return nil, fmt.Errorf("not found")
 	}
 
-	// 3. Auto-upgrade legacy cached reports that lack structured "tables" in summary_json (runs once per old VIN)
-	if !strings.Contains(row.SummaryJson, `"tables"`) && row.HasFullHtml {
+	// 3. Auto-upgrade legacy cached reports that lack structured v2 "specs" & "tables" in summary_json (runs once per old VIN)
+	if !strings.Contains(row.SummaryJson, `"specs"`) && row.HasFullHtml {
 		var rawHtml string
 		bootstrap.DB.Model(&models.ReportCache{}).
 			Select("raw_html_en").

@@ -1,11 +1,9 @@
-import React, { useState, useEffect, useRef, useMemo } from 'react'
+import React, { useState, useEffect, useMemo } from 'react'
 import { useParams, useNavigate, useLocation } from 'react-router-dom'
 import AuthenticatedLayout from '@/components/layout/AuthenticatedLayout'
 import ReportToolbar from '@/components/report/ReportToolbar'
-import ReportSummaryCards from '@/components/report/ReportSummaryCards'
 import ReportNativeView from '@/components/report/ReportNativeView'
-import ReportFrame from '@/components/report/ReportFrame'
-import { getReport, getReportHtml } from '@/lib/api'
+import { getReport } from '@/lib/api'
 import { Loader2 } from 'lucide-react'
 import { toast } from 'sonner'
 
@@ -16,16 +14,14 @@ export default function ReportView() {
 
   const [report, setReport] = useState(location.state?.report || null)
   const [loading, setLoading] = useState(!report)
-  const [viewMode, setViewMode] = useState('smart') // 'smart' (Fast Native Design) | 'original' (Full Carfax Page)
-  const [lang, setLang] = useState('ar') // Instant Arabic/English toggle
-  const [htmlCache, setHtmlCache] = useState({})
-  const [htmlLoading, setHtmlLoading] = useState(false)
-  const iframeRef = useRef(null)
+  const [lang, setLang] = useState('en') // Official English layout by default, 1-click Arabic toggle
 
   useEffect(() => {
     if (vin) {
-      // Always fetch or refresh lightweight report metadata (~12 KB) if not already loaded for this VIN
-      if (!report || (report.vin && report.vin.toUpperCase() !== vin.toUpperCase())) {
+      if (
+        !report ||
+        (report.vin && report.vin.toUpperCase() !== vin.toUpperCase())
+      ) {
         loadReport(vin)
       }
     }
@@ -44,7 +40,7 @@ export default function ReportView() {
     }
   }
 
-  // Parse summary JSON
+  // Parse summary JSON (~5 KB structured data)
   const summary = useMemo(() => {
     try {
       if (typeof report?.summary_json === 'string') {
@@ -61,13 +57,11 @@ export default function ReportView() {
   const hasOfficialPdf = Boolean(
     report?.has_official_pdf || summary?.has_official_pdf
   )
-  const hasFullOriginal = Boolean(
-    report?.has_full_html || summary?.has_full_html || hasOfficialPdf || report?.raw_html_en
+  const isBackgroundPending = Boolean(
+    summary?.background_pending && !hasOfficialPdf
   )
-  const isBackgroundPending = Boolean(summary?.background_pending && !hasOfficialPdf)
 
-  // Silent Background Polling: while Stage 2 (Full Carfax Page + 4-Section Print PDF) is finishing in Canada,
-  // poll lightweight metadata every 2.5 seconds until has_official_pdf / background_ready becomes true.
+  // Silent Background Polling while Stage 2 (4-Section Print PDF) finishes in Canada
   useEffect(() => {
     const targetVin = report?.vin || vin
     if (!targetVin || !isBackgroundPending) return
@@ -94,16 +88,14 @@ export default function ReportView() {
 
         if (
           updated &&
-          (updated.has_official_pdf ||
-            updated.has_full_html ||
-            updatedSummary?.background_ready)
+          (updated.has_official_pdf || updatedSummary?.background_ready)
         ) {
           setReport((prev) => ({
             ...prev,
             ...updated,
           }))
           clearInterval(timer)
-          toast.success('اكتمل تجهيز صفحة كارفاكس الأصلية وملف الطباعة الرسمي PDF في الخلفية!')
+          toast.success('اكتمل تجهيز ملف الطباعة الرسمي PDF في الخلفية!')
         }
       } catch {
         // Ignore silent background poll errors
@@ -113,93 +105,29 @@ export default function ReportView() {
     return () => clearInterval(timer)
   }, [report?.vin, vin, isBackgroundPending])
 
-  // Lazy-load full Carfax HTML on-demand ONLY when user switches to 'original' mode
-  useEffect(() => {
-    const targetVin = report?.vin || vin
-    if (viewMode !== 'original' || !targetVin) return
-    if (htmlCache[lang]) return
-
-    let cancelled = false
-    const fetchOnDemandHtml = async () => {
-      setHtmlLoading(true)
-      try {
-        const res = await getReportHtml(targetVin, lang)
-        const htmlStr = res?.html || res?.data?.html || ''
-        if (!cancelled && htmlStr) {
-          setHtmlCache((prev) => ({ ...prev, [lang]: htmlStr }))
-        }
-      } catch {
-        if (!cancelled) {
-          toast.error('نسخة صفحة كارفاكس الكاملة قيد التجهيز أو غير متوفرة')
-        }
-      } finally {
-        if (!cancelled) setHtmlLoading(false)
-      }
-    }
-
-    fetchOnDemandHtml()
-    return () => {
-      cancelled = true
-    }
-  }, [viewMode, lang, report?.vin, vin, htmlCache])
-
   const handleDownloadOfficialPdf = () => {
     const targetVin = report?.vin || vin
     if (!hasOfficialPdf || !targetVin) {
-      handlePrint()
+      window.print()
       return
     }
     window.open(`/api/reports/${targetVin}/pdf`, '_blank')
-    toast.success('تم فتح ملف الطباعة الرسمي PDF المباشر')
-  }
-
-  const handleOpenOriginalNewTab = async () => {
-    const targetVin = report?.vin || vin
-    if (!targetVin) return
-
-    let htmlToOpen = htmlCache.en || htmlCache[lang] || report?.raw_html_en
-    if (!htmlToOpen) {
-      const loadingToast = toast.loading('جاري فتح صفحة كارفاكس الأصلية...')
-      try {
-        const res = await getReportHtml(targetVin, 'en')
-        htmlToOpen = res?.html || res?.data?.html || ''
-        if (htmlToOpen) {
-          setHtmlCache((prev) => ({ ...prev, en: htmlToOpen }))
-        }
-        toast.dismiss(loadingToast)
-      } catch {
-        toast.dismiss(loadingToast)
-        toast.error('محتوى الصفحة الأصلية غير متوفر بعد')
-        return
-      }
-    }
-
-    if (!htmlToOpen) {
-      toast.error('محتوى الصفحة غير متوفر بعد')
-      return
-    }
-    const blob = new Blob([htmlToOpen], { type: 'text/html;charset=utf-8' })
-    const url = URL.createObjectURL(blob)
-    window.open(url, '_blank')
   }
 
   const handlePrint = () => {
-    if (viewMode === 'original' && iframeRef.current && iframeRef.current.contentWindow) {
-      iframeRef.current.contentWindow.focus()
-      iframeRef.current.contentWindow.print()
+    if (hasOfficialPdf) {
+      handleDownloadOfficialPdf()
       return
     }
     window.print()
   }
 
-  const activeHtml = htmlCache[lang] || report?.raw_html_en || ''
-
   return (
     <AuthenticatedLayout
-      title={`تقرير تاريخ المركبة: ${vin || ''}`}
-      subtitle="CARFAX Official Vehicle History Report™"
+      title={`تقرير كارفاكس: ${vin || ''}`}
+      subtitle="CARFAX Vehicle History Report™"
     >
-      <div className="space-y-4 text-right w-full" dir="rtl">
+      <div className="space-y-3 text-right w-full" dir="rtl">
         {loading ? (
           <div className="flex flex-col items-center justify-center py-20 text-muted-foreground gap-2.5">
             <Loader2 className="h-6 w-6 animate-spin text-primary" />
@@ -215,9 +143,6 @@ export default function ReportView() {
               report={report}
               lang={lang}
               onLangChange={setLang}
-              viewMode={viewMode}
-              onViewModeChange={setViewMode}
-              onOpenOriginalNewTab={handleOpenOriginalNewTab}
               onBack={() => navigate('/dashboard')}
               onPrint={handlePrint}
               hasOfficialPdf={hasOfficialPdf}
@@ -225,28 +150,13 @@ export default function ReportView() {
               onDownloadOfficialPdf={handleDownloadOfficialPdf}
             />
 
-            <ReportSummaryCards summary={summary} />
-
-            {viewMode === 'smart' ? (
-              <ReportNativeView
-                report={report}
-                summary={summary}
-                lang={lang}
-                hasFullOriginal={hasFullOriginal}
-                onSwitchToOriginal={() => setViewMode('original')}
-              />
-            ) : htmlLoading && !activeHtml ? (
-              <div className="flex flex-col items-center justify-center py-20 bg-card border rounded-xl text-muted-foreground gap-2.5">
-                <Loader2 className="h-6 w-6 animate-spin text-primary" />
-                <span className="text-xs font-medium">جاري تحميل نسخة صفحة كارفاكس الأصلية...</span>
-              </div>
-            ) : (
-              <ReportFrame
-                htmlContent={activeHtml}
-                iframeRef={iframeRef}
-                onPrintRequest={hasOfficialPdf ? handleDownloadOfficialPdf : handlePrint}
-              />
-            )}
+            <ReportNativeView
+              report={report}
+              summary={summary}
+              lang={lang}
+              onLangChange={setLang}
+              onPrint={handlePrint}
+            />
           </>
         )}
       </div>

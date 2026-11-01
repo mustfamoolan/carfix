@@ -136,14 +136,9 @@ func (ctrl *WorkerController) Complete(c *fiber.Ctx) error {
 			title = extractedTitle
 		}
 
-		summaryJson := payload.FastSummaryJson
+		summaryJson := fallbackSummary
 		if summaryJson == "" {
-			var existing models.ReportCache
-			if err := bootstrap.DB.Where("vin = ?", cleanVin).First(&existing).Error; err == nil && existing.SummaryJson != "" {
-				summaryJson = existing.SummaryJson
-			} else {
-				summaryJson = fallbackSummary
-			}
+			summaryJson = payload.FastSummaryJson
 		}
 
 		hasOfficialPdf := strings.Contains(payload.RawHtmlEn, "carfix-official-pdf")

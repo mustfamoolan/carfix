@@ -814,73 +814,84 @@ func (sh *StealthHarvester) extractFastReportData(tabCtx context.Context, vin st
     const detMatch = bodyText.match(/(\d+\s+Detailed\s+Records?\s+Available)/i);
     if (detMatch) detailedCountText = detMatch[1].trim();
 
+    // Helper to extract clean text from a cell without screen-reader duplicate spans
+    const cleanCellText = (el, multiline = false) => {
+        if (!el) return '';
+        const c = el.cloneNode(true);
+        c.querySelectorAll('.visually-hidden, .narrow-record-odometer-reading, caption, svg, script, style').forEach(n => n.remove());
+        if (multiline) {
+            c.querySelectorAll('p, li, div, strong, h1, h2, h3, h4, br').forEach(n => {
+                if (n.tagName === 'BR') n.replaceWith('\n');
+                else n.append('\n');
+            });
+            return (c.innerText || c.textContent || '')
+                .split('\n')
+                .map(s => s.replace(/\s+/g, ' ').trim())
+                .filter(Boolean)
+                .join('\n');
+        }
+        return (c.innerText || c.textContent || '').replace(/\s+/g, ' ').trim();
+    };
+
     // 8. Extract Structured Tables (Ownership, Title, Additional History, and Detailed History Timeline)
     const tables = [];
     const detailedRecords = [];
     const allTables = Array.from(document.querySelectorAll('table'));
 
     for (const tbl of allTables) {
-        const headers = Array.from(tbl.querySelectorAll('thead th, thead td, tr:first-child th')).map(th => (th.innerText || '').trim().replace(/\s+/g, ' ')).filter(Boolean);
+        const headers = Array.from(tbl.querySelectorAll('thead th, thead td')).map(th => cleanCellText(th, false)).filter(Boolean);
+        if (headers.length > 0 && headers[0].toLowerCase().includes('service & comments')) continue;
         const rows = [];
-        const trs = Array.from(tbl.querySelectorAll('tbody tr, tr'));
+        const trs = Array.from(tbl.querySelectorAll('tbody tr'));
         for (const tr of trs) {
-            if (tr.querySelector('th') && rows.length === 0) continue;
-            const cells = Array.from(tr.querySelectorAll('td')).map(td => (td.innerText || '').trim().replace(/\s+/g, ' '));
+            if (tr.classList.contains('detailed-history-row-supplementary')) continue;
+            const rawCells = Array.from(tr.querySelectorAll('th, td'));
+            const cells = rawCells.map(cell => cleanCellText(cell, false));
+            const multiCells = rawCells.map(cell => cleanCellText(cell, true));
             if (cells.length === 0 || cells.every(c => !c)) continue;
 
-            // Check if this row is a chronological Detailed History row (Date | Mileage | Source | Comments)
+            // Check if this row is a chronological Detailed History row (Date | Mileage | Source | Icon | Comments)
             const firstCell = cells[0] || '';
-            if (cells.length >= 3 && (/^\d{2}\/\d{2}\/\d{4}$/.test(firstCell) || /^\d{1,2}\/\d{1,2}\/\d{2,4}$/.test(firstCell) || /^Not Reported$/i.test(firstCell))) {
-                detailedRecords.push({
-                    date: cells[0] || '',
-                    mileage: cells.length >= 4 ? (cells[1] || '') : '',
-                    source: cells.length >= 4 ? (cells[2] || '') : (cells[1] || ''),
-                    comments: cells.length >= 4 ? cells.slice(3).join(' | ') : (cells[2] || '')
-                });
+            if (cells.length >= 3 && (/^\d{1,2}\/\d{1,2}\/\d{2,4}$/.test(firstCell) || /^Not Reported$/i.test(firstCell))) {
+                if (cells.length >= 5) {
+                    detailedRecords.push({
+                        date: cells[0] || '',
+                        mileage: cells[1] || '',
+                        source: multiCells[2] || '',
+                        comments: multiCells[4] || ''
+                    });
+                } else {
+                    detailedRecords.push({
+                        date: cells[0] || '',
+                        mileage: cells.length >= 4 ? (cells[1] || '') : '',
+                        source: cells.length >= 4 ? (multiCells[2] || '') : (multiCells[1] || ''),
+                        comments: cells.length >= 4 ? multiCells.slice(3).join('\n') : (multiCells[2] || '')
+                    });
+                }
             } else {
-                rows.push(cells);
+                rows.push(multiCells);
             }
         }
         if (rows.length > 0) {
-            let sectionTitle = '';
-            const prev = tbl.previousElementSibling;
-            if (prev && prev.innerText) {
-                sectionTitle = prev.innerText.trim().split('\n')[0];
-            }
             tables.push({
-                title: sectionTitle || headers[0] || 'CARFAX Section',
+                title: headers[0] || 'CARFAX Section',
                 headers: headers,
                 rows: rows
             });
         }
     }
 
-    // Also capture div-based Detailed History rows if Carfax uses div/flex rows for timeline
-    if (detailedRecords.length === 0) {
-        const recordRows = Array.from(document.querySelectorAll('[class*="detailed-history-row" i], [class*="record-row" i], .detailed-history tr'));
-        for (const r of recordRows) {
-            const txt = (r.innerText || '').trim();
-            const dateMatch = txt.match(/^(\d{2}\/\d{2}\/\d{4})/);
-            if (dateMatch) {
-                const parts = txt.split('\t').map(p => p.trim()).filter(Boolean);
-                detailedRecords.push({
-                    date: dateMatch[1],
-                    mileage: parts[1] || '',
-                    source: parts[2] || '',
-                    comments: parts.slice(3).join(' - ') || txt.substring(dateMatch[1].length).trim()
-                });
-            }
-        }
-    }
-
     // 9. Extract Accident / Damage Events if present
     const accidentEvents = [];
-    const eventEls = Array.from(document.querySelectorAll('[class*="accident" i] [class*="event" i], [class*="damage-event" i]'));
-    for (const ev of eventEls) {
-        const t = (ev.innerText || '').trim().replace(/\s+/g, ' ');
-        if (t.length > 10 && accidentEvents.length < 10 && !accidentEvents.includes(t)) {
-            accidentEvents.push(t);
-        }
+    const accSec = document.getElementById('accident-damage-section');
+    if (accSec) {
+        const evRecords = Array.from(accSec.querySelectorAll('.accident-damage-record'));
+        evRecords.forEach((ev, idx) => {
+            accidentEvents.push({
+                title: 'Event ' + (idx + 1),
+                details: cleanCellText(ev, true)
+            });
+        });
     }
 
     const cleanTitle = !(lowerText.includes('salvage title') || lowerText.includes('rebuilt title') || lowerText.includes('total loss reported'));

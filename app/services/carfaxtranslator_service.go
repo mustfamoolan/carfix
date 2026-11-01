@@ -311,25 +311,61 @@ func (s *CarfaxTranslatorService) ExtractSummaryJson(html, vin string) string {
 }
 
 var (
-	tagStripRe   = regexp.MustCompile(`(?s)<[^>]*>`)
-	styleBlockRe = regexp.MustCompile(`(?is)<style[^>]*>.*?</style>`)
-	scriptBlkRe  = regexp.MustCompile(`(?is)<script[^>]*>.*?</script>`)
-	svgBlkRe     = regexp.MustCompile(`(?is)<svg[^>]*>.*?</svg>`)
-	tableBlkRe   = regexp.MustCompile(`(?is)<table[^>]*>(.*?)</table>`)
-	trBlkRe      = regexp.MustCompile(`(?is)<tr[^>]*>(.*?)</tr>`)
-	thCellRe     = regexp.MustCompile(`(?is)<th[^>]*>(.*?)</th>`)
-	tdCellRe     = regexp.MustCompile(`(?is)<td[^>]*>(.*?)</td>`)
-	wsCollapseRe = regexp.MustCompile(`\s+`)
-	dateRowRe    = regexp.MustCompile(`^(\d{1,2}/\d{1,2}/\d{2,4}|Not Reported)$`)
+	tagStripRe       = regexp.MustCompile(`(?s)<[^>]*>`)
+	styleBlockRe     = regexp.MustCompile(`(?is)<style[^>]*>.*?</style>`)
+	scriptBlkRe      = regexp.MustCompile(`(?is)<script[^>]*>.*?</script>`)
+	svgBlkRe         = regexp.MustCompile(`(?is)<svg[^>]*>.*?</svg>`)
+	captionBlkRe     = regexp.MustCompile(`(?is)<caption[^>]*>.*?</caption>`)
+	visHiddenSpanRe  = regexp.MustCompile(`(?is)<span[^>]*class=["'][^"']*visually-hidden[^"']*["'][^>]*>.*?</span>`)
+	visHiddenDivRe   = regexp.MustCompile(`(?is)<div[^>]*class=["'][^"']*visually-hidden[^"']*["'][^>]*>.*?</div>`)
+	narrowOdoSpanRe  = regexp.MustCompile(`(?is)<span[^>]*class=["'][^"']*narrow-record-odometer-reading[^"']*["'][^>]*>.*?</span>`)
+	tableBlkRe       = regexp.MustCompile(`(?is)<table[^>]*>(.*?)</table>`)
+	theadBlkRe       = regexp.MustCompile(`(?is)<thead[^>]*>(.*?)</thead>`)
+	tbodyBlkRe       = regexp.MustCompile(`(?is)<tbody[^>]*>(.*?)</tbody>`)
+	trBlkRe          = regexp.MustCompile(`(?is)<tr[^>]*>(.*?)</tr>`)
+	cellAnyRe        = regexp.MustCompile(`(?is)<t[hd][^>]*>(.*?)</t[hd]>`)
+	liItemRe         = regexp.MustCompile(`(?is)<li[^>]*>(.*?)</li>`)
+	pLineRe          = regexp.MustCompile(`(?is)<p[^>]*>(.*?)</p>`)
+	wsCollapseRe     = regexp.MustCompile(`\s+`)
+	dateRowRe        = regexp.MustCompile(`^(\d{1,2}/\d{1,2}/\d{2,4}|Not Reported)$`)
 )
 
+func stripScreenReaderDuplicates(fragment string) string {
+	s := captionBlkRe.ReplaceAllString(fragment, "")
+	s = narrowOdoSpanRe.ReplaceAllString(s, "")
+	s = visHiddenSpanRe.ReplaceAllString(s, "")
+	s = visHiddenDivRe.ReplaceAllString(s, "")
+	return s
+}
+
 func cleanHtmlText(fragment string) string {
-	t := tagStripRe.ReplaceAllString(fragment, " ")
+	t := stripScreenReaderDuplicates(fragment)
+	t = tagStripRe.ReplaceAllString(t, " ")
 	t = strings.ReplaceAll(t, "&nbsp;", " ")
 	t = strings.ReplaceAll(t, "&amp;", "&")
 	t = strings.ReplaceAll(t, "&#39;", "'")
 	t = strings.ReplaceAll(t, "&quot;", `"`)
 	return strings.TrimSpace(wsCollapseRe.ReplaceAllString(t, " "))
+}
+
+func cleanMultilineCell(fragment string) string {
+	t := stripScreenReaderDuplicates(fragment)
+	// Turn </p>, </li>, </div>, <br> into newlines so structured multi-line cells stay readable
+	t = regexp.MustCompile(`(?i)</(?:p|li|div|strong|h\d)>|<br\s*/?>`).ReplaceAllString(t, "\n")
+	t = tagStripRe.ReplaceAllString(t, " ")
+	t = strings.ReplaceAll(t, "&nbsp;", " ")
+	t = strings.ReplaceAll(t, "&amp;", "&")
+	t = strings.ReplaceAll(t, "&#39;", "'")
+	t = strings.ReplaceAll(t, "&quot;", `"`)
+	lines := strings.Split(t, "\n")
+	var out []string
+	for _, ln := range lines {
+		c := strings.TrimSpace(wsCollapseRe.ReplaceAllString(ln, " "))
+		if c != "" {
+			out = append(out, c)
+		}
+	}
+	return strings.Join(out, "\n")
 }
 
 func (s *CarfaxTranslatorService) extractSummaryJson(html, vin string) string {
@@ -439,6 +475,40 @@ func (s *CarfaxTranslatorService) extractSummaryJson(html, vin string) string {
 		cleanTitle = false
 	}
 
+	// 6b. Extract vehicle specs (e.g. ["4 Door Wagon/Sport Utility", "6.2L V8 F OHV 16V", "Gasoline", "Rear wheel drive"])
+	var specs []string
+	specBlockRe := regexp.MustCompile(`(?is)class=["'][^"']*vehicle-information-vehicle-details[^"']*["'][^>]*>(.*?)</div>`)
+	if sm := specBlockRe.FindStringSubmatch(lightHtml); len(sm) > 1 {
+		for _, lim := range liItemRe.FindAllStringSubmatch(sm[1], -1) {
+			if len(lim) > 1 {
+				if sp := cleanHtmlText(lim[1]); sp != "" {
+					specs = append(specs, sp)
+				}
+			}
+		}
+	}
+
+	// 6c. Extract Accident / Damage Events from #accident-damage-section
+	var accidentEvents []map[string]string
+	accSecRe := regexp.MustCompile(`(?is)<section[^>]*id=["']accident-damage-section["'][^>]*>(.*?)</section>`)
+	if am := accSecRe.FindStringSubmatch(lightHtml); len(am) > 1 {
+		recRe := regexp.MustCompile(`(?is)<div[^>]*class=["'][^"']*accident-damage-record\b[^"']*["'][^>]*>(.*?)</div>\s*</div>\s*</div>`)
+		recMatches := recRe.FindAllStringSubmatch(am[1], -1)
+		if len(recMatches) == 0 {
+			accidentEvents = append(accidentEvents, map[string]string{
+				"title":   "Event 1",
+				"details": cleanMultilineCell(am[1]),
+			})
+		} else {
+			for idx, rm := range recMatches {
+				accidentEvents = append(accidentEvents, map[string]string{
+					"title":   fmt.Sprintf("Event %d", idx+1),
+					"details": cleanMultilineCell(rm[1]),
+				})
+			}
+		}
+	}
+
 	// 7. Extract all structured <table> blocks & chronological Detailed History records
 	var tables []map[string]interface{}
 	var detailedRecords []map[string]string
@@ -448,38 +518,52 @@ func (s *CarfaxTranslatorService) extractSummaryJson(html, vin string) string {
 		if len(tm) < 2 {
 			continue
 		}
-		tblInner := tm[1]
+		tblInner := stripScreenReaderDuplicates(tm[1])
 		var headers []string
 		var rows [][]string
 
-		trMatches := trBlkRe.FindAllStringSubmatch(tblInner, -1)
+		// Extract headers from <thead> if present
+		if thm := theadBlkRe.FindStringSubmatch(tblInner); len(thm) > 1 {
+			for _, cm := range cellAnyRe.FindAllStringSubmatch(thm[1], -1) {
+				if h := cleanHtmlText(cm[1]); h != "" {
+					headers = append(headers, h)
+				}
+			}
+		}
+
+		// Determine body section (<tbody> or whole table if no <thead>)
+		bodyPart := tblInner
+		if tbm := tbodyBlkRe.FindStringSubmatch(tblInner); len(tbm) > 1 {
+			bodyPart = tbm[1]
+		}
+
+		trMatches := trBlkRe.FindAllStringSubmatch(bodyPart, -1)
 		for _, trm := range trMatches {
 			if len(trm) < 2 {
 				continue
 			}
 			trInner := trm[1]
-			thMatches := thCellRe.FindAllStringSubmatch(trInner, -1)
-			if len(thMatches) > 0 && len(rows) == 0 && len(headers) == 0 {
-				for _, thm := range thMatches {
-					if h := cleanHtmlText(thm[1]); h != "" {
-						headers = append(headers, h)
-					}
-				}
+			// Skip supplementary Car Fox callout rows in detailed history
+			if strings.Contains(trInner, "detailed-history-row-supplementary") {
 				continue
 			}
 
-			tdMatches := tdCellRe.FindAllStringSubmatch(trInner, -1)
-			if len(tdMatches) == 0 {
+			cellMatches := cellAnyRe.FindAllStringSubmatch(trInner, -1)
+			if len(cellMatches) == 0 {
 				continue
 			}
+
 			var cells []string
+			var multiCells []string
 			nonEmpty := false
-			for _, tdm := range tdMatches {
-				c := cleanHtmlText(tdm[1])
+			for _, cm := range cellMatches {
+				c := cleanHtmlText(cm[1])
+				mc := cleanMultilineCell(cm[1])
 				if c != "" {
 					nonEmpty = true
 				}
 				cells = append(cells, c)
+				multiCells = append(multiCells, mc)
 			}
 			if !nonEmpty {
 				continue
@@ -490,19 +574,29 @@ func (s *CarfaxTranslatorService) extractSummaryJson(html, vin string) string {
 				rec := map[string]string{
 					"date": firstCell,
 				}
-				if len(cells) >= 4 {
+				if len(cells) >= 5 {
+					// Official Carfax 5-column Detailed History: Date | Mileage | Source | Icon | Comments
 					rec["mileage"] = cells[1]
-					rec["source"] = cells[2]
-					rec["comments"] = strings.Join(cells[3:], " | ")
+					rec["source"] = multiCells[2]
+					rec["comments"] = multiCells[4]
+				} else if len(cells) == 4 {
+					rec["mileage"] = cells[1]
+					rec["source"] = multiCells[2]
+					rec["comments"] = multiCells[3]
 				} else {
 					rec["mileage"] = ""
-					rec["source"] = cells[1]
-					rec["comments"] = cells[2]
+					rec["source"] = multiCells[1]
+					rec["comments"] = multiCells[2]
 				}
 				detailedRecords = append(detailedRecords, rec)
 			} else {
-				rows = append(rows, cells)
+				rows = append(rows, multiCells)
 			}
+		}
+
+		// Skip Recent Service Highlights table if it has duplicate responsive columns
+		if len(headers) > 0 && strings.Contains(strings.ToLower(headers[0]), "service & comments") {
+			continue
 		}
 
 		if len(rows) > 0 {
@@ -526,12 +620,14 @@ func (s *CarfaxTranslatorService) extractSummaryJson(html, vin string) string {
 	summary := map[string]interface{}{
 		"vin":                    vin,
 		"vehicle_title":          title,
+		"specs":                  specs,
 		"carfax_score":           score,
 		"carfax_value":           carfaxValue,
 		"total_owners":           owners,
 		"accidents_reported":     accidents,
 		"accident_summary":       accidentSummary,
 		"damage_severity":        damageSeverity,
+		"accident_events":        accidentEvents,
 		"clean_title":            cleanTitle,
 		"last_reported_odometer": odometer,
 		"service_records_count":  serviceRecordsText,
