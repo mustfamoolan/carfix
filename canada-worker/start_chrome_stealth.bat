@@ -1,4 +1,6 @@
 @echo off
+cd /d "%~dp0"
+chcp 65001 >nul
 title CarFix Canada Stealth Chrome Host (CARFAXOnline)
 color 0A
 
@@ -24,13 +26,22 @@ if %CHROME_PATH%=="" (
     exit /b 1
 )
 
+echo [*] Closing any open Chrome windows temporarily to unlock Cookies and Session...
+taskkill /F /IM chrome.exe /T >nul 2>&1
+timeout /t 2 /nobreak >nul
+
+echo [*] Syncing latest Cookies, Login Session, and Profile from your main Chrome...
+robocopy "%LOCALAPPDATA%\Google\Chrome\User Data" "C:\CarfaxDealerProfile" /E /IS /IT /R:1 /W:1 /XD "Cache" "Code Cache" "GPUCache" "ShaderCache" "GrShaderCache" "DawnCache" "Crashpad" "SwReporter" "Safe Browsing" "OptimizationGuidePredictionModels" "BrowserMetrics" "ComponentCRXCache" /XF "*.tmp" "lockfile" "Singleton*" >nul 2>&1
+echo [OK] Cookies and Active Login Session copied successfully!
+echo.
+
 echo [*] Launching Real Chrome with Stealth Flags on Port 9222...
 echo [*] Profile Directory: C:\CarfaxDealerProfile
 echo [*] Target Portal    : https://www.carfaxonline.com
 echo.
 echo [IMPORTANT INSTRUCTIONS]
-echo 1. Login to your official CARFAXOnline Dealer account manually in this browser window.
-echo 2. Stay on the main VIN search screen.
+echo 1. Chrome is now open with your synced login session from main Chrome.
+echo 2. Stay on the main CARFAXOnline VIN search screen.
 echo 3. Keep this Chrome window OPEN. Do not close it.
 echo.
 

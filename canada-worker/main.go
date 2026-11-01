@@ -60,7 +60,7 @@ func main() {
 
 	serverURL := strings.TrimRight(strings.TrimSpace(os.Getenv("SERVER_BASE_URL")), "/")
 	if serverURL == "" {
-		serverURL = "http://127.0.0.1:8080"
+		serverURL = "https://vinreport.tech"
 	}
 
 	secretKey := os.Getenv("WORKER_SECRET_KEY")

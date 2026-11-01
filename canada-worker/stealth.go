@@ -8,10 +8,13 @@ import (
 	"io"
 	"math/rand"
 	"net/http"
+	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/chromedp/cdproto/page"
+	"github.com/chromedp/cdproto/target"
 	"github.com/chromedp/chromedp"
 )
 
@@ -55,6 +58,7 @@ type HarvestResult struct {
 type StealthHarvester struct {
 	rnd        *rand.Rand
 	httpClient *http.Client
+	assetCache sync.Map
 }
 
 func NewStealthHarvester() *StealthHarvester {
@@ -129,7 +133,8 @@ func (sh *StealthHarvester) CloseTabByID(cdpEndpoint, tabID string) {
 	}
 }
 
-// FindCarfaxSearchTab finds the open carfaxonline.com tab, or falls back to the first visible page tab
+// FindCarfaxSearchTab finds the open carfaxonline.com tab, or falls back to the first visible page tab.
+// Never closes any user tabs.
 func (sh *StealthHarvester) FindCarfaxSearchTab(cdpEndpoint string) (*CDPTab, bool, error) {
 	tabs, err := sh.ListOpenTabs(cdpEndpoint)
 	if err != nil {
@@ -140,15 +145,63 @@ func (sh *StealthHarvester) FindCarfaxSearchTab(cdpEndpoint string) (*CDPTab, bo
 	}
 
 	// 1. Prefer a tab on carfaxonline.com that is NOT an already-opened report popup
-	for _, t := range tabs {
+	for i := range tabs {
+		t := tabs[i]
 		u := strings.ToLower(t.URL)
 		if strings.Contains(u, "carfaxonline.com") || strings.Contains(u, "carfax.ca") || strings.Contains(u, "carfax.com") {
 			return &t, true, nil
 		}
 	}
 
-	// 2. If no carfax tab is open, return the first tab so we can still screenshot what Chrome is showing
+	// 2. Prefer any non-blank tab
+	for i := range tabs {
+		t := tabs[i]
+		u := strings.TrimSpace(strings.ToLower(t.URL))
+		if u != "about:blank" && u != "" {
+			return &t, false, nil
+		}
+	}
+
+	// 3. Fallback to first tab
 	return &tabs[0], false, nil
+}
+
+// attachExistingTab attaches to an existing Chrome tab by ID and immediately clears
+// c.Target.TargetID in chromedp's internal struct so that when the context ends,
+// chromedp only detaches the debugger session (Target.detachFromTarget) and NEVER
+// sends Target.closeTarget to close the user's open tab!
+func (sh *StealthHarvester) attachExistingTab(
+	parentCtx context.Context,
+	cdpEndpoint string,
+	tabID string,
+) (context.Context, context.CancelFunc, error) {
+	allocCtx, cancelAlloc := chromedp.NewRemoteAllocator(parentCtx, normalizeCDPHttpBase(cdpEndpoint))
+	tabCtx, cancelTab := chromedp.NewContext(allocCtx, chromedp.WithTargetID(target.ID(tabID)))
+
+	err := chromedp.Run(tabCtx, chromedp.ActionFunc(func(ctx context.Context) error {
+		if c := chromedp.FromContext(ctx); c != nil && c.Target != nil {
+			c.Target.TargetID = ""
+		}
+		return nil
+	}))
+	if err != nil {
+		if c := chromedp.FromContext(tabCtx); c != nil && c.Target != nil {
+			c.Target.TargetID = ""
+		}
+		cancelTab()
+		cancelAlloc()
+		return nil, nil, err
+	}
+
+	cleanup := func() {
+		if c := chromedp.FromContext(tabCtx); c != nil && c.Target != nil {
+			c.Target.TargetID = ""
+		}
+		cancelTab()
+		cancelAlloc()
+	}
+
+	return tabCtx, cleanup, nil
 }
 
 // captureCompressedJPEG captures the current visible viewport as a 60% quality JPEG (40KB-70KB)
@@ -194,15 +247,12 @@ func (sh *StealthHarvester) InspectBrowserState(parentCtx context.Context, cdpEn
 	res.CurrentURL = tab.URL
 	res.PageTitle = tab.Title
 
-	// Connect directly to the tab's WebSocket without closing the tab on disconnect
-	allocCtx, cancelAlloc := chromedp.NewRemoteAllocator(parentCtx, tab.WebSocketDebuggerURL, chromedp.NoModifyURL)
-	defer cancelAlloc()
-
-	evalCtx, cancelEval := context.WithTimeout(allocCtx, 12*time.Second)
-	defer cancelEval()
-
-	// Note: We do NOT call cancelTab() before cancelAlloc() so chromedp never sends Target.closeTarget
-	tabCtx, _ := chromedp.NewContext(evalCtx)
+	// Attach to the existing tab safely without EVER sending Target.closeTarget on disconnect
+	tabCtx, cleanupTab, attachErr := sh.attachExistingTab(parentCtx, cdpEndpoint, tab.ID)
+	if attachErr != nil {
+		return res
+	}
+	defer cleanupTab()
 
 	// Read-only DOM inspection script tailored for carfaxonline.com
 	inspectJS := `
@@ -234,8 +284,13 @@ func (sh *StealthHarvester) InspectBrowserState(parentCtx context.Context, cdpEn
         'input[name*="vin" i]',
         'input[placeholder*="VIN" i]',
         'input[aria-label*="VIN" i]',
+        'input[data-testid*="vin" i]',
+        'input[class*="vin" i]',
         'input[maxlength="17"]',
-        'input[type="text"]'
+        'input[type="text"]',
+        'input[type="search"]',
+        'input:not([type])',
+        'input:not([type="hidden"]):not([type="password"]):not([type="checkbox"]):not([type="radio"]):not([type="submit"]):not([type="button"])'
     ];
 
     let matchedVinSelector = '';
@@ -256,7 +311,8 @@ func (sh *StealthHarvester) InspectBrowserState(parentCtx context.Context, cdpEn
         'button[id*="vhr" i]',
         'button[class*="search" i]',
         'button[class*="submit" i]',
-        'a[id*="run" i]'
+        'a[id*="run" i]',
+        'button'
     ];
     let submitFound = false;
     for (const sel of btnCandidates) {
@@ -289,7 +345,7 @@ func (sh *StealthHarvester) InspectBrowserState(parentCtx context.Context, cdpEn
 	}
 
 	if err := chromedp.Run(tabCtx, chromedp.Evaluate(inspectJS, &domState)); err == nil {
-		if domState.URL != "" {
+		if domState.URL != "" && domState.URL != "about:blank" {
 			res.CurrentURL = domState.URL
 		}
 		if domState.Title != "" {
@@ -359,6 +415,26 @@ func (sh *StealthHarvester) HarvestReport(
 		}
 	}
 
+	if state.IsLoginPage {
+		return &HarvestResult{
+			Success:          false,
+			ErrorCode:        "SESSION_EXPIRED",
+			ErrorMessage:     state.StatusMessage,
+			ScreenshotBase64: state.ScreenshotBase64,
+		}
+	}
+
+	// If Chrome is open (and not on a login/captcha page) but not currently showing the VIN input box
+	// (e.g. user left it on a sub-page or New Tab), navigate once automatically to https://www.carfaxonline.com/
+	if !state.VinInputFound && state.TabID != "" {
+		if navTabCtx, cleanupNav, err := sh.attachExistingTab(parentCtx, cdpEndpoint, state.TabID); err == nil {
+			_ = chromedp.Run(navTabCtx, chromedp.Navigate("https://www.carfaxonline.com/"))
+			cleanupNav()
+			sh.randomDelay(2500, 3500)
+			state = sh.InspectBrowserState(parentCtx, cdpEndpoint, true)
+		}
+	}
+
 	if !state.CarfaxTabFound || state.IsLoginPage {
 		return &HarvestResult{
 			Success:          false,
@@ -384,7 +460,7 @@ func (sh *StealthHarvester) HarvestReport(
 		knownTabIDs[t.ID] = true
 	}
 
-	// Connect to the search tab
+	// Connect to the search tab without closing it on disconnect
 	searchTab, _, err := sh.FindCarfaxSearchTab(cdpEndpoint)
 	if err != nil || searchTab == nil {
 		return &HarvestResult{
@@ -395,13 +471,16 @@ func (sh *StealthHarvester) HarvestReport(
 		}
 	}
 
-	allocCtx, cancelAlloc := chromedp.NewRemoteAllocator(parentCtx, searchTab.WebSocketDebuggerURL, chromedp.NoModifyURL)
-	defer cancelAlloc()
-
-	taskCtx, cancelTask := context.WithTimeout(allocCtx, 55*time.Second)
-	defer cancelTask()
-
-	tabCtx, _ := chromedp.NewContext(taskCtx)
+	tabCtx, cleanupSearchTab, attachErr := sh.attachExistingTab(parentCtx, cdpEndpoint, searchTab.ID)
+	if attachErr != nil {
+		return &HarvestResult{
+			Success:          false,
+			ErrorCode:        "TAB_LOST",
+			ErrorMessage:     fmt.Sprintf("تعذر الارتباط بتبويب البحث: %v", attachErr),
+			ScreenshotBase64: state.ScreenshotBase64,
+		}
+	}
+	defer cleanupSearchTab()
 
 	// 2. Human VIN Typing
 	if onProgress != nil {
@@ -465,7 +544,7 @@ func (sh *StealthHarvester) HarvestReport(
 	openedNewTab := false
 	for i := range tabsAfter {
 		t := tabsAfter[i]
-		if !knownTabIDs[t.ID] {
+		if !knownTabIDs[t.ID] && t.URL != "about:blank" {
 			reportTab = &t
 			openedNewTab = true
 			break
@@ -474,19 +553,13 @@ func (sh *StealthHarvester) HarvestReport(
 
 	// If no new tab opened, the report is in the current searchTab
 	activeReportCtx := tabCtx
-	var cancelReportAlloc context.CancelFunc
 	if openedNewTab && reportTab != nil {
-		rAllocCtx, rCancel := chromedp.NewRemoteAllocator(parentCtx, reportTab.WebSocketDebuggerURL, chromedp.NoModifyURL)
-		cancelReportAlloc = rCancel
-		defer cancelReportAlloc()
-
-		rTaskCtx, rTaskCancel := context.WithTimeout(rAllocCtx, 35*time.Second)
-		defer rTaskCancel()
-
-		rTabCtx, _ := chromedp.NewContext(rTaskCtx)
-		activeReportCtx = rTabCtx
-		// Give the new tab 2.5 more seconds to finish rendering styles & records
-		sh.randomDelay(2200, 3400)
+		if rTabCtx, cleanupReportTab, rErr := sh.attachExistingTab(parentCtx, cdpEndpoint, reportTab.ID); rErr == nil {
+			defer cleanupReportTab()
+			activeReportCtx = rTabCtx
+			// Give the new tab 2.5 more seconds to finish rendering styles & records
+			sh.randomDelay(2200, 3400)
+		}
 	}
 
 	// 4. Natural Human Reading & Extraction
@@ -610,7 +683,8 @@ func (sh *StealthHarvester) simulateGentleScroll(tabCtx context.Context) {
 }
 
 // extractClonedReportHTML clones the document in memory without modifying the live page,
-// resolves relative links/images to absolute URLs, and extracts the full HTML.
+// inlines all loaded CSS stylesheets and images from Chrome's memory cache (bypassing geo-blocks),
+// and embeds the official native Chrome PrintToPDF output.
 func (sh *StealthHarvester) extractClonedReportHTML(tabCtx context.Context, vin string) (string, string, bool, string, error) {
 	extractJS := `
 (() => {
@@ -630,17 +704,28 @@ func (sh *StealthHarvester) extractClonedReportHTML(tabCtx context.Context, vin 
     // Clone the entire document in memory so the live page is NEVER touched
     const clone = document.documentElement.cloneNode(true);
 
-    // 1. Remove scripts and noscript tags from the clone
-    clone.querySelectorAll('script, noscript, iframe').forEach(el => el.remove());
+    // 1. Remove scripts, noscript, iframes, and <picture><source> tags from the clone
+    clone.querySelectorAll('script, noscript, iframe, picture source').forEach(el => el.remove());
 
-    // 2. Convert all relative img src and link href attributes to absolute URLs
+    // 2. Sync every cloned <img> src to the exact currentSrc loaded by Chrome in the live DOM
+    const liveImgs = Array.from(document.querySelectorAll('img'));
+    const cloneImgs = Array.from(clone.querySelectorAll('img'));
     const origin = window.location.origin;
-    clone.querySelectorAll('img').forEach(img => {
-        const src = img.getAttribute('src');
-        if (src && src.startsWith('/')) {
-            img.setAttribute('src', origin + src);
+    for (let i = 0; i < cloneImgs.length; i++) {
+        const cImg = cloneImgs[i];
+        const lImg = liveImgs[i];
+        cImg.removeAttribute('srcset');
+        if (lImg && lImg.currentSrc) {
+            cImg.setAttribute('src', lImg.currentSrc);
+        } else {
+            const src = cImg.getAttribute('src');
+            if (src && src.startsWith('/')) {
+                cImg.setAttribute('src', origin + src);
+            }
         }
-    });
+    }
+
+    // 3. Also convert any relative stylesheet links to absolute URLs
     clone.querySelectorAll('link[rel="stylesheet"]').forEach(link => {
         const href = link.getAttribute('href');
         if (href && href.startsWith('/')) {
@@ -648,7 +733,30 @@ func (sh *StealthHarvester) extractClonedReportHTML(tabCtx context.Context, vin 
         }
     });
 
-    // 3. Extract vehicle title (Year Make Model)
+    // 4. Extract any accessible runtime CSSOM rules from document.styleSheets
+    try {
+        let cssomText = '';
+        for (const sheet of Array.from(document.styleSheets)) {
+            try {
+                if (sheet.ownerNode && sheet.ownerNode.tagName === 'STYLE' && sheet.ownerNode.textContent.trim().length > 0) {
+                    continue;
+                }
+                const rules = Array.from(sheet.cssRules || []);
+                if (rules.length > 0) {
+                    cssomText += rules.map(r => r.cssText).join('\n') + '\n';
+                }
+            } catch (e) {}
+        }
+        if (cssomText.length > 0) {
+            const st = document.createElement('style');
+            st.setAttribute('id', 'carfax-runtime-cssom');
+            st.textContent = cssomText;
+            const head = clone.querySelector('head');
+            if (head) head.appendChild(st);
+        }
+    } catch (e) {}
+
+    // 5. Extract vehicle title (Year Make Model)
     let title = document.title || '';
     const titleSelectors = [
         '.vehicle-information-year-make-model',
@@ -697,5 +805,209 @@ func (sh *StealthHarvester) extractClonedReportHTML(tabCtx context.Context, vin 
 		out.Title = fmt.Sprintf("CARFAX Vehicle History Report (%s)", vin)
 	}
 
+	// Inline all CSS stylesheets and images from Chrome's C++ cache + attach official PrintToPDF
+	out.HTML = sh.bundleSelfContainedReportAndPDF(tabCtx, out.HTML)
+
 	return out.HTML, out.Title, false, "", nil
+}
+
+// bundleSelfContainedReportAndPDF reads all cached CSS stylesheets and images directly from
+// Chrome's C++ memory cache via CDP (Page.getResourceTree / Page.getResourceContent) with zero
+// extra network requests, inlines them into the HTML, and appends Chrome's native PrintToPDF.
+func (sh *StealthHarvester) bundleSelfContainedReportAndPDF(tabCtx context.Context, rawHTML string) string {
+	var inlinedCSSBuilder strings.Builder
+	imageDataURIs := make(map[string]string)
+	var pdfBase64 string
+
+	_ = chromedp.Run(tabCtx, chromedp.ActionFunc(func(ctx context.Context) error {
+		_ = page.Enable().Do(ctx)
+
+		tree, err := page.GetResourceTree().Do(ctx)
+		if err == nil && tree != nil && tree.Frame != nil {
+			frameID := tree.Frame.ID
+			for _, res := range tree.Resources {
+				if res == nil || res.Failed || res.Canceled || res.URL == "" {
+					continue
+				}
+				lowerURL := strings.ToLower(res.URL)
+				lowerMime := strings.ToLower(res.MimeType)
+
+				// 1. Inline CSS Stylesheets (e.g. vhr.css)
+				if string(res.Type) == "Stylesheet" || strings.Contains(lowerMime, "css") || strings.Contains(lowerURL, ".css") {
+					contentBytes, cErr := page.GetResourceContent(frameID, res.URL).Do(ctx)
+					if cErr == nil && len(contentBytes) > 0 {
+						inlinedCSSBuilder.WriteString("\n/* Inlined from " + res.URL + " */\n")
+						inlinedCSSBuilder.Write(contentBytes)
+						inlinedCSSBuilder.WriteString("\n")
+					}
+					continue
+				}
+
+				// 2. Inline Images (SVG, PNG, GIF, WebP, AVIF)
+				if string(res.Type) == "Image" || strings.HasPrefix(lowerMime, "image/") ||
+					strings.HasSuffix(lowerURL, ".svg") || strings.HasSuffix(lowerURL, ".png") ||
+					strings.HasSuffix(lowerURL, ".gif") || strings.HasSuffix(lowerURL, ".webp") {
+					contentBytes, cErr := page.GetResourceContent(frameID, res.URL).Do(ctx)
+					if cErr == nil && len(contentBytes) > 0 {
+						mime := res.MimeType
+						if mime == "" {
+							switch {
+							case strings.Contains(lowerURL, ".svg"):
+								mime = "image/svg+xml"
+							case strings.Contains(lowerURL, ".gif"):
+								mime = "image/gif"
+							case strings.Contains(lowerURL, ".webp"):
+								mime = "image/webp"
+							case strings.Contains(lowerURL, ".avif"):
+								mime = "image/avif"
+							default:
+								mime = "image/png"
+							}
+						}
+						b64Data := base64.StdEncoding.EncodeToString(contentBytes)
+						imageDataURIs[res.URL] = "data:" + mime + ";base64," + b64Data
+					}
+				}
+			}
+		}
+
+		// 3. Generate Official Native Chrome PrintToPDF
+		pdfBuf, _, pdfErr := page.PrintToPDF().
+			WithPrintBackground(true).
+			WithPreferCSSPageSize(true).
+			Do(ctx)
+		if pdfErr == nil && len(pdfBuf) > 0 {
+			pdfBase64 = base64.StdEncoding.EncodeToString(pdfBuf)
+		}
+
+		return nil
+	}))
+
+	// Fallback: if any <link rel="stylesheet"> was not in GetResourceContent, fetch once on Canada PC and cache in RAM
+	linkRe := regexp.MustCompile(`(?i)<link[^>]+rel=["']stylesheet["'][^>]*href=["'](https?://[^"']+)["'][^>]*>|<link[^>]+href=["'](https?://[^"']+)["'][^>]*rel=["']stylesheet["'][^>]*>`)
+	linkMatches := linkRe.FindAllStringSubmatch(rawHTML, -1)
+	for _, m := range linkMatches {
+		cssURL := m[1]
+		if cssURL == "" {
+			cssURL = m[2]
+		}
+		cssURL = strings.ReplaceAll(cssURL, "&amp;", "&")
+		if cssURL == "" || strings.Contains(cssURL, "fonts.googleapis.com") {
+			continue
+		}
+		if !strings.Contains(inlinedCSSBuilder.String(), cssURL) {
+			if bodyBytes, _, err := sh.fetchAssetCached(cssURL); err == nil && len(bodyBytes) > 0 {
+				inlinedCSSBuilder.WriteString("\n/* Inlined fallback from " + cssURL + " */\n")
+				inlinedCSSBuilder.Write(bodyBytes)
+				inlinedCSSBuilder.WriteString("\n")
+			}
+		}
+	}
+
+	// Inject all captured CSS directly into <head> and remove external carfax <link> tags so browsers outside Canada don't hang waiting on blocked CDNs
+	if inlinedCSSBuilder.Len() > 0 {
+		carfaxLinkRe := regexp.MustCompile(`(?i)<link[^>]+href=["']https?://[^"']*carfax[^"']*["'][^>]*>`)
+		rawHTML = carfaxLinkRe.ReplaceAllString(rawHTML, "")
+		styleBlock := `<style id="carfax-cdp-inlined-css">` + inlinedCSSBuilder.String() + `</style>`
+		if strings.Contains(rawHTML, "</head>") {
+			rawHTML = strings.Replace(rawHTML, "</head>", styleBlock+"</head>", 1)
+		} else {
+			rawHTML = styleBlock + rawHTML
+		}
+	}
+
+	// Replace image URLs (both raw and HTML-entity encoded &amp;) with Base64 data URIs
+	for origURL, dataURI := range imageDataURIs {
+		rawHTML = strings.ReplaceAll(rawHTML, `"`+origURL+`"`, `"`+dataURI+`"`)
+		rawHTML = strings.ReplaceAll(rawHTML, `'`+origURL+`'`, `'`+dataURI+`'`)
+		escapedURL := strings.ReplaceAll(origURL, "&", "&amp;")
+		if escapedURL != origURL {
+			rawHTML = strings.ReplaceAll(rawHTML, `"`+escapedURL+`"`, `"`+dataURI+`"`)
+			rawHTML = strings.ReplaceAll(rawHTML, `'`+escapedURL+`'`, `'`+dataURI+`'`)
+		}
+	}
+
+	// Fallback for any remaining <img src="https://..."> not in GetResourceContent
+	imgRe := regexp.MustCompile(`(?i)<img[^>]+src=["'](https?://[^"']+)["']`)
+	imgMatches := imgRe.FindAllStringSubmatch(rawHTML, -1)
+	seenImgs := make(map[string]bool)
+	for _, m := range imgMatches {
+		rawImgURL := m[1]
+		cleanImgURL := strings.ReplaceAll(rawImgURL, "&amp;", "&")
+		if seenImgs[cleanImgURL] {
+			continue
+		}
+		seenImgs[cleanImgURL] = true
+		if bodyBytes, mime, err := sh.fetchAssetCached(cleanImgURL); err == nil && len(bodyBytes) > 0 {
+			dataURI := "data:" + mime + ";base64," + base64.StdEncoding.EncodeToString(bodyBytes)
+			rawHTML = strings.ReplaceAll(rawHTML, `"`+rawImgURL+`"`, `"`+dataURI+`"`)
+			rawHTML = strings.ReplaceAll(rawHTML, `'`+rawImgURL+`'`, `'`+dataURI+`'`)
+			rawHTML = strings.ReplaceAll(rawHTML, `"`+cleanImgURL+`"`, `"`+dataURI+`"`)
+		}
+	}
+
+	// Embed the official native PDF at the end of </body> so the platform can download/print it 1:1
+	if pdfBase64 != "" {
+		pdfTag := `<script id="carfix-official-pdf" type="application/pdf-base64">` + pdfBase64 + `</script>`
+		if strings.Contains(rawHTML, "</body>") {
+			rawHTML = strings.Replace(rawHTML, "</body>", pdfTag+"</body>", 1)
+		} else {
+			rawHTML = rawHTML + pdfTag
+		}
+	}
+
+	return rawHTML
+}
+
+type cachedAsset struct {
+	data []byte
+	mime string
+}
+
+func (sh *StealthHarvester) fetchAssetCached(assetURL string) ([]byte, string, error) {
+	if val, ok := sh.assetCache.Load(assetURL); ok {
+		ca := val.(cachedAsset)
+		return ca.data, ca.mime, nil
+	}
+	req, err := http.NewRequest("GET", assetURL, nil)
+	if err != nil {
+		return nil, "", err
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
+	req.Header.Set("Referer", "https://www.carfaxonline.com/")
+	resp, err := sh.httpClient.Do(req)
+	if err != nil {
+		return nil, "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return nil, "", fmt.Errorf("status %d", resp.StatusCode)
+	}
+	data, err := io.ReadAll(resp.Body)
+	if err != nil || len(data) == 0 {
+		return nil, "", fmt.Errorf("empty body")
+	}
+	mime := resp.Header.Get("Content-Type")
+	if idx := strings.Index(mime, ";"); idx != -1 {
+		mime = strings.TrimSpace(mime[:idx])
+	}
+	lowerURL := strings.ToLower(assetURL)
+	if mime == "" || mime == "application/octet-stream" {
+		switch {
+		case strings.Contains(lowerURL, ".svg"):
+			mime = "image/svg+xml"
+		case strings.Contains(lowerURL, ".gif"):
+			mime = "image/gif"
+		case strings.Contains(lowerURL, ".webp"):
+			mime = "image/webp"
+		case strings.Contains(lowerURL, ".avif"):
+			mime = "image/avif"
+		case strings.Contains(lowerURL, ".css"):
+			mime = "text/css"
+		default:
+			mime = "image/png"
+		}
+	}
+	sh.assetCache.Store(assetURL, cachedAsset{data: data, mime: mime})
+	return data, mime, nil
 }

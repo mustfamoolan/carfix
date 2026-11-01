@@ -2,7 +2,7 @@ import React from 'react'
 import { Card, CardContent } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
-import { ArrowRight, Globe, Printer, FileCheck } from 'lucide-react'
+import { ArrowRight, Globe, Printer, FileDown } from 'lucide-react'
 
 export default function ReportToolbar({
   report,
@@ -10,6 +10,8 @@ export default function ReportToolbar({
   onLangChange,
   onBack,
   onPrint,
+  hasOfficialPdf,
+  onDownloadOfficialPdf,
 }) {
   return (
     <Card className="border-slate-200 dark:border-slate-800 shadow-sm w-full bg-white dark:bg-slate-900 rounded-xl">
@@ -49,9 +51,20 @@ export default function ReportToolbar({
             </div>
           </div>
 
-          {/* Actions: Language Switch & Print */}
-          <div className="flex items-center gap-2">
+          {/* Actions: Language Switch & Print / Official PDF */}
+          <div className="flex flex-wrap items-center gap-2">
             <div className="flex items-center bg-slate-100 dark:bg-slate-800 p-1 rounded-lg border border-slate-200 dark:border-slate-700 text-xs">
+              <button
+                type="button"
+                onClick={() => onLangChange('en')}
+                className={`px-3 py-1 rounded-md transition-all font-bold ${
+                  lang === 'en'
+                    ? 'bg-[#003478] text-white shadow-xs'
+                    : 'text-slate-600 dark:text-slate-300 hover:text-slate-900'
+                }`}
+              >
+                English (Original)
+              </button>
               <button
                 type="button"
                 onClick={() => onLangChange('ar')}
@@ -64,25 +77,24 @@ export default function ReportToolbar({
                 <Globe className="h-3.5 w-3.5" />
                 العربية
               </button>
-              <button
-                type="button"
-                onClick={() => onLangChange('en')}
-                className={`px-3 py-1 rounded-md transition-all font-bold ${
-                  lang === 'en'
-                    ? 'bg-[#003478] text-white shadow-xs'
-                    : 'text-slate-600 dark:text-slate-300 hover:text-slate-900'
-                }`}
-              >
-                English (Original)
-              </button>
             </div>
+
+            {hasOfficialPdf && (
+              <Button
+                onClick={onDownloadOfficialPdf}
+                className="gap-1.5 text-xs font-bold h-9 bg-[#1C8237] hover:bg-[#15682b] text-white shadow-sm"
+              >
+                <FileDown className="h-4 w-4" />
+                <span>PDF كارفاكس الأصلي (كندا)</span>
+              </Button>
+            )}
 
             <Button
               onClick={onPrint}
               className="gap-1.5 text-xs font-bold h-9 bg-[#003478] hover:bg-[#002657] text-white shadow-sm"
             >
               <Printer className="h-4 w-4" />
-              <span>طباعة / حفظ PDF</span>
+              <span>طباعة التقرير ({lang === 'ar' ? 'عربي' : 'EN'})</span>
             </Button>
           </div>
         </div>
