@@ -1,7 +1,6 @@
 package controllers
 
 import (
-	"context"
 	"encoding/json"
 	"strings"
 	"time"
@@ -163,9 +162,7 @@ func (ctrl *WorkerController) Complete(c *fiber.Ctx) error {
 			"updated_at":         time.Now(),
 		})
 
-		if bootstrap.Redis != nil {
-			bootstrap.Redis.Del(context.Background(), "report:fast:"+cleanVin)
-		}
+		InvalidateFastReportCache(cleanVin)
 
 		return c.JSON(fiber.Map{
 			"status":  "enriched",

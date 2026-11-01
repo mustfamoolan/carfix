@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"carfix/app/models"
@@ -13,6 +14,16 @@ import (
 	"carfix/bootstrap"
 	"github.com/gofiber/fiber/v2"
 )
+
+var fastMemoryCache sync.Map
+
+func InvalidateFastReportCache(vin string) {
+	cleanVin := strings.ToUpper(strings.TrimSpace(vin))
+	fastMemoryCache.Delete(cleanVin)
+	if bootstrap.Redis != nil {
+		bootstrap.Redis.Del(context.Background(), "report:fast:"+cleanVin)
+	}
+}
 
 type VinSearchController struct {
 	vinValidator *services.VinValidatorService
@@ -224,36 +235,46 @@ func (ctrl *VinSearchController) Search(c *fiber.Ctx) error {
 	})
 }
 
-// getOrBuildFastReport returns a lightweight (~12 KB) report object from Redis RAM or PostgreSQL without loading 10MB HTML columns
+// getOrBuildFastReport returns a lightweight (~5 KB) report object from Go Memory, Redis RAM, or PostgreSQL without touching 5MB TOAST HTML columns
 func (ctrl *VinSearchController) getOrBuildFastReport(cleanVin string) (fiber.Map, error) {
 	ctx := context.Background()
 	redisKey := "report:fast:" + cleanVin
 
-	// 1. Check Redis RAM Cache first (<1ms)
+	// 0. Check In-Memory Go RAM Cache first (<0.01ms)
+	if val, ok := fastMemoryCache.Load(cleanVin); ok {
+		if m, ok := val.(fiber.Map); ok {
+			copyMap := make(fiber.Map, len(m)+3)
+			for k, v := range m {
+				copyMap[k] = v
+			}
+			return copyMap, nil
+		}
+	}
+
+	// 1. Check Redis RAM Cache (<1ms)
 	if bootstrap.Redis != nil {
 		if cachedStr, err := bootstrap.Redis.Get(ctx, redisKey).Result(); err == nil && cachedStr != "" {
 			var cachedMap fiber.Map
 			if json.Unmarshal([]byte(cachedStr), &cachedMap) == nil {
 				if sj, ok := cachedMap["summary_json"].(string); ok && strings.Contains(sj, `"specs"`) && !strings.Contains(sj, `"background_pending":true`) {
+					fastMemoryCache.Store(cleanVin, cachedMap)
 					return cachedMap, nil
 				}
 			}
 		}
 	}
 
-	// 2. Query only lightweight metadata columns from PostgreSQL (skipping 8MB raw_html_en & translated_html_ar)
+	// 2. Query ONLY lightweight metadata columns from PostgreSQL (never touching raw_html_en TOAST column!)
 	type lightReportRow struct {
-		VIN            string    `gorm:"column:vin"`
-		VehicleTitle   string    `gorm:"column:vehicle_title"`
-		SummaryJson    string    `gorm:"column:summary_json"`
-		FetchedAt      time.Time `gorm:"column:fetched_at"`
-		HasFullHtml    bool      `gorm:"column:has_full_html"`
-		HasOfficialPdf bool      `gorm:"column:has_official_pdf"`
+		VIN          string    `gorm:"column:vin"`
+		VehicleTitle string    `gorm:"column:vehicle_title"`
+		SummaryJson  string    `gorm:"column:summary_json"`
+		FetchedAt    time.Time `gorm:"column:fetched_at"`
 	}
 
 	var row lightReportRow
 	err := bootstrap.DB.Model(&models.ReportCache{}).
-		Select("vin, vehicle_title, summary_json, fetched_at, (length(raw_html_en) > 500) AS has_full_html, (position('carfix-official-pdf' in raw_html_en) > 0) AS has_official_pdf").
+		Select("vin, vehicle_title, summary_json, fetched_at").
 		Where("vin = ?", cleanVin).
 		Scan(&row).Error
 
@@ -261,14 +282,14 @@ func (ctrl *VinSearchController) getOrBuildFastReport(cleanVin string) (fiber.Ma
 		return nil, fmt.Errorf("not found")
 	}
 
-	// 3. Auto-upgrade legacy cached reports that lack structured v2 "specs" & "tables" in summary_json (runs once per old VIN)
-	if !strings.Contains(row.SummaryJson, `"specs"`) && row.HasFullHtml {
+	// 3. Auto-upgrade legacy or pending cached reports once (when "specs" or "has_official_pdf" is missing or background_pending is true)
+	if !strings.Contains(row.SummaryJson, `"specs"`) || !strings.Contains(row.SummaryJson, `"has_official_pdf"`) || strings.Contains(row.SummaryJson, `"background_pending":true`) {
 		var rawHtml string
 		bootstrap.DB.Model(&models.ReportCache{}).
 			Select("raw_html_en").
 			Where("vin = ?", cleanVin).
 			Scan(&rawHtml)
-		if rawHtml != "" {
+		if len(rawHtml) > 500 {
 			upgradedSummary := ctrl.translator.ExtractSummaryJson(rawHtml, cleanVin)
 			if upgradedSummary != "" {
 				row.SummaryJson = upgradedSummary
@@ -277,19 +298,25 @@ func (ctrl *VinSearchController) getOrBuildFastReport(cleanVin string) (fiber.Ma
 		}
 	}
 
+	hasOfficialPdf := strings.Contains(row.SummaryJson, `"has_official_pdf":true`)
+	hasFullHtml := strings.Contains(row.SummaryJson, `"has_full_html":true`)
+
 	fastMap := fiber.Map{
 		"vin":              row.VIN,
 		"vehicle_title":    row.VehicleTitle,
 		"summary_json":     row.SummaryJson,
-		"has_full_html":    row.HasFullHtml,
-		"has_official_pdf": row.HasOfficialPdf,
+		"has_full_html":    hasFullHtml,
+		"has_official_pdf": hasOfficialPdf,
 		"fetched_at":       row.FetchedAt,
 	}
 
-	// 4. Cache in Redis RAM for 24h if background enrichment is already complete
-	if bootstrap.Redis != nil && !strings.Contains(row.SummaryJson, `"background_pending":true`) {
-		if b, mErr := json.Marshal(fastMap); mErr == nil {
-			bootstrap.Redis.Set(ctx, redisKey, string(b), 24*time.Hour)
+	// 4. Cache in Go Memory + Redis RAM if background enrichment is complete
+	if !strings.Contains(row.SummaryJson, `"background_pending":true`) {
+		fastMemoryCache.Store(cleanVin, fastMap)
+		if bootstrap.Redis != nil {
+			if b, mErr := json.Marshal(fastMap); mErr == nil {
+				bootstrap.Redis.Set(ctx, redisKey, string(b), 24*time.Hour)
+			}
 		}
 	}
 
