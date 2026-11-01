@@ -341,6 +341,40 @@ func (s *WorkerGuardService) EnqueueSearchTask(vin string) error {
 	return bootstrap.Redis.RPush(ctx, "canada:tasks:queue", vin).Err()
 }
 
+// GetQueuePosition returns the 1-based position of a VIN in the waiting queue and estimated wait seconds
+func (s *WorkerGuardService) GetQueuePosition(vin string) (int, int) {
+	if bootstrap.Redis == nil {
+		return 0, 0
+	}
+	ctx := context.Background()
+
+	list, err := bootstrap.Redis.LRange(ctx, "canada:tasks:queue", 0, -1).Result()
+	if err != nil || len(list) == 0 {
+		return 0, 0
+	}
+
+	pos := -1
+	for idx, v := range list {
+		if v == vin {
+			pos = idx + 1
+			break
+		}
+	}
+
+	if pos == -1 {
+		return 0, 0
+	}
+
+	cooldown := s.GetCooldownRemainingSec()
+	// Average pull takes ~8 seconds + cooldown per item in front
+	estimatedSec := cooldown + ((pos - 1) * (s.minCooldownSec + 8))
+	if estimatedSec < 5 {
+		estimatedSec = 5
+	}
+
+	return pos, estimatedSec
+}
+
 // PollNextTask gives the remote Canada node the next VIN to fetch if safety gates pass
 func (s *WorkerGuardService) PollNextTask() (string, int, error) {
 	s.RecordHeartbeat()

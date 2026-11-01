@@ -39,6 +39,8 @@ func RegisterAPIRoutes(app *fiber.App) {
 
 	api.Post("/search", middleware.AuthMiddleware(), middleware.QuotaCheckMiddleware(), vinSearchController.Search)
 	v1.Post("/search", middleware.AuthMiddleware(), middleware.QuotaCheckMiddleware(), vinSearchController.Search)
+	api.Get("/search/queue-status/:vin", middleware.AuthMiddleware(), vinSearchController.GetQueueStatus)
+	v1.Get("/search/queue-status/:vin", middleware.AuthMiddleware(), vinSearchController.GetQueueStatus)
 
 	api.Get("/reports/:vin", middleware.AuthMiddleware(), vinSearchController.GetCachedReport)
 	api.Get("/reports/:vin/html", middleware.AuthMiddleware(), vinSearchController.GetReportHtml)

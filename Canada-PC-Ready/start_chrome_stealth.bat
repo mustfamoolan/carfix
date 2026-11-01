@@ -35,16 +35,17 @@ robocopy "%LOCALAPPDATA%\Google\Chrome\User Data" "C:\CarfaxDealerProfile" /E /I
 echo [OK] Cookies and Active Login Session copied successfully!
 echo.
 
-echo [*] Launching Real Chrome with Stealth Flags on Port 9222...
+echo [*] Launching Real Chrome with Off-Screen Stealth Flags on Port 9222...
 echo [*] Profile Directory: C:\CarfaxDealerProfile
 echo [*] Target Portal    : https://www.carfaxonline.com
+echo [*] Window Mode      : Off-Screen Stealth (-10000,-10000) [Full GPU & Render Enabled]
 echo.
 echo [IMPORTANT INSTRUCTIONS]
-echo 1. Chrome is now open with your synced login session from main Chrome.
-echo 2. Stay on the main CARFAXOnline VIN search screen.
-echo 3. Keep this Chrome window OPEN. Do not close it.
+echo 1. Chrome is now active with your synced login session in Off-Screen mode.
+echo 2. Chrome runs with full GPU and display pipeline without cluttering your physical screen.
+echo 3. Keep this host running.
 echo.
 
-%CHROME_PATH% --remote-debugging-port=9222 --remote-allow-origins=* --user-data-dir="C:\CarfaxDealerProfile" --disable-blink-features=AutomationControlled --no-first-run --no-default-browser-check https://www.carfaxonline.com
+%CHROME_PATH% --remote-debugging-port=9222 --remote-allow-origins=* --user-data-dir="C:\CarfaxDealerProfile" --window-position=-10000,-10000 --window-size=1920,1080 --disable-blink-features=AutomationControlled --no-first-run --no-default-browser-check https://www.carfaxonline.com
 
 pause

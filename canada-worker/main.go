@@ -160,11 +160,10 @@ func (w *CanadaWorker) pollAndExecute(ctx context.Context) {
 		return
 	}
 
-	// 5. Task received: Execute strict One-Shot Harvest with Two-Stage Progressive Delivery
+	// 5. Task received: Execute strict One-Shot Harvest with Single Fast Cycle
 	vin := pollRes.VIN
 	log.Printf("🚀 [TASK RECEIVED] Starting One-Shot Carfax pull for VIN: %s", vin)
 
-	fastDelivered := false
 	harvestRes := w.stealth.HarvestReport(
 		ctx,
 		w.cdpWsURL,
@@ -178,36 +177,18 @@ func (w *CanadaWorker) pollAndExecute(ctx context.Context) {
 				ScreenshotBase64: screenshot,
 			})
 		},
-		func(fastRes *HarvestResult) {
-			fastReq := CompleteRequest{
-				VIN:              vin,
-				VehicleTitle:     fastRes.VehicleTitle,
-				RawHtmlEn:        fastRes.RawHtmlEn,
-				FastSummaryJson:  fastRes.FastSummaryJson,
-				ScreenshotBase64: fastRes.ScreenshotBase64,
-				CompletedAt:      time.Now(),
-			}
-			if err := w.sendComplete(&fastReq); err != nil {
-				log.Printf("⚠️ [STAGE 1 FAST DELIVERY FAILED] %v", err)
-			} else {
-				fastDelivered = true
-				log.Printf("⚡ [STAGE 1 DELIVERED] Fast structured report for %s displayed immediately to user!", vin)
-				log.Printf("🔇 [STAGE 2 SILENT] Continuing background Print (Select All) + PDF + Full HTML bundling...")
-			}
-		},
+		nil,
 	)
 
-	// If Stage 1 already unblocked the user, send Stage 2 as a silent background enrichment update
 	completeReq := CompleteRequest{
-		VIN:                vin,
-		VehicleTitle:       harvestRes.VehicleTitle,
-		RawHtmlEn:          harvestRes.RawHtmlEn,
-		FastSummaryJson:    harvestRes.FastSummaryJson,
-		IsBackgroundEnrich: fastDelivered && harvestRes.Success,
-		ErrorCode:          harvestRes.ErrorCode,
-		ErrorMessage:       harvestRes.ErrorMessage,
-		ScreenshotBase64:   harvestRes.ScreenshotBase64,
-		CompletedAt:        time.Now(),
+		VIN:              vin,
+		VehicleTitle:     harvestRes.VehicleTitle,
+		RawHtmlEn:        harvestRes.RawHtmlEn,
+		FastSummaryJson:  harvestRes.FastSummaryJson,
+		ErrorCode:        harvestRes.ErrorCode,
+		ErrorMessage:     harvestRes.ErrorMessage,
+		ScreenshotBase64: harvestRes.ScreenshotBase64,
+		CompletedAt:      time.Now(),
 	}
 
 	if err := w.sendComplete(&completeReq); err != nil {
@@ -215,10 +196,8 @@ func (w *CanadaWorker) pollAndExecute(ctx context.Context) {
 	} else {
 		if !harvestRes.Success {
 			log.Printf("🛑 [ONE-SHOT FREEZE] Safety stop [%s]: %s", harvestRes.ErrorCode, harvestRes.ErrorMessage)
-		} else if fastDelivered {
-			log.Printf("✅ [STAGE 2 SILENT COMPLETED] Full Carfax page + Official PDF for %s uploaded (%d KB)", vin, len(harvestRes.RawHtmlEn)/1024)
 		} else {
-			log.Printf("✅ [TASK COMPLETED] Report for %s delivered (%d bytes)", vin, len(harvestRes.RawHtmlEn))
+			log.Printf("✅ [TASK COMPLETED] Structured JSON report for %s delivered cleanly in seconds!", vin)
 		}
 	}
 

@@ -323,6 +323,40 @@ func (ctrl *VinSearchController) getOrBuildFastReport(cleanVin string) (fiber.Ma
 	return fastMap, nil
 }
 
+// GetQueueStatus returns the live queue position, estimated wait time, or active progress for a VIN
+func (ctrl *VinSearchController) GetQueueStatus(c *fiber.Ctx) error {
+	vin := strings.ToUpper(strings.TrimSpace(c.Params("vin")))
+	cleanVin, isValid, _ := ctrl.vinValidator.ValidateAndClean(vin)
+	if !isValid {
+		return c.Status(400).JSON(fiber.Map{"error": "رقم الشاصي غير صالح"})
+	}
+
+	// 1. If already cached and ready, notify immediately
+	if fastReport, err := ctrl.getOrBuildFastReport(cleanVin); err == nil && fastReport != nil {
+		return c.JSON(fiber.Map{
+			"status":    "ready",
+			"is_ready":  true,
+			"vin":       cleanVin,
+			"report":    fastReport,
+		})
+	}
+
+	// 2. Check position in sequential queue
+	pos, estSec := ctrl.workerGuard.GetQueuePosition(cleanVin)
+	cooldown := ctrl.workerGuard.GetCooldownRemainingSec()
+	workerOnline := ctrl.workerGuard.IsConnected()
+
+	return c.JSON(fiber.Map{
+		"status":            "queued",
+		"is_ready":          false,
+		"vin":               cleanVin,
+		"worker_online":     workerOnline,
+		"queue_position":    pos,
+		"estimated_seconds": estSec,
+		"cooldown_seconds":  cooldown,
+	})
+}
+
 // GetUserSearchHistory returns the authenticated user's own search history
 func (ctrl *VinSearchController) GetUserSearchHistory(c *fiber.Ctx) error {
 	userID, err := extractUserID(c)

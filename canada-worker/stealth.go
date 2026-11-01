@@ -59,15 +59,18 @@ type HarvestResult struct {
 }
 
 type StealthHarvester struct {
-	rnd        *rand.Rand
-	httpClient *http.Client
-	assetCache sync.Map
+	rnd         *rand.Rand
+	httpClient  *http.Client
+	assetCache  sync.Map
+	recentModes []int
+	mu          sync.Mutex
 }
 
 func NewStealthHarvester() *StealthHarvester {
 	return &StealthHarvester{
-		rnd:        rand.New(rand.NewSource(time.Now().UnixNano())),
-		httpClient: &http.Client{Timeout: 8 * time.Second},
+		rnd:         rand.New(rand.NewSource(time.Now().UnixNano())),
+		httpClient:  &http.Client{Timeout: 8 * time.Second},
+		recentModes: make([]int, 0, 5),
 	}
 }
 
@@ -597,59 +600,41 @@ func (sh *StealthHarvester) HarvestReport(
 	}
 
 	// =========================================================================
-	// ⚡ STAGE 1 (FAST INSTANT DELIVERY): Extract Structured Data & Light HTML
+	// ⚡ INSTANT STRUCTURED DATA EXTRACTION (<25ms)
 	// =========================================================================
 	if onProgress != nil {
-		onProgress("extracting_fast", "4/4 تم فتح التقرير! جاري إرسال بيانات الفحص الفورية لتصميمنا وإكمال الطباعة بصمت...", "")
+		onProgress("extracting_data", "4/4 تم فتح التقرير! جاري استخراج بيانات الفحص وقراءة الجداول...", "")
 	}
 
-	reportScreenshot := sh.captureCompressedJPEG(activeReportCtx)
-	fastSummaryJson, lightHtml, fastTitle, isFastErr, fastErrMsg, fastErr := sh.extractFastReportData(activeReportCtx, vin)
+	fastSummaryJson, _, fastTitle, isFastErr, fastErrMsg, fastErr := sh.extractFastReportData(activeReportCtx, vin)
 
-	if fastErr == nil && isFastErr {
+	if fastErr != nil || isFastErr {
+		// Capture screenshot ONLY on failure/challenge for diagnostics
+		errScreenshot := sh.captureCompressedJPEG(activeReportCtx)
 		if openedNewTab && reportTab != nil {
 			sh.CloseTabByID(cdpEndpoint, reportTab.ID)
+		}
+		errMsg := fastErrMsg
+		if errMsg == "" && fastErr != nil {
+			errMsg = fmt.Sprintf("تعذر قراءة بيانات التقرير: %v", fastErr)
 		}
 		return &HarvestResult{
 			Success:          false,
 			ErrorCode:        "VIN_NOT_FOUND_ON_CARFAX",
-			ErrorMessage:     fastErrMsg,
-			ScreenshotBase64: reportScreenshot,
+			ErrorMessage:     errMsg,
+			ScreenshotBase64: errScreenshot,
 		}
 	}
 
-	if fastErr == nil && fastSummaryJson != "" && onFastData != nil {
-		onFastData(&HarvestResult{
-			Success:          true,
-			VehicleTitle:     fastTitle,
-			RawHtmlEn:        lightHtml,
-			FastSummaryJson:  fastSummaryJson,
-			ScreenshotBase64: reportScreenshot,
-		})
-	}
-
 	// =========================================================================
-	// 🔇 STAGE 2 (SILENT BACKGROUND): Gentle Scroll + Printing Options (Select All)
-	//                                + Official PDF + Full Self-Contained HTML
+	// 🧠 ADAPTIVE HUMAN READING SIMULATION (Pattern Breaking & Natural Dwell)
 	// =========================================================================
-	sh.simulateGentleScroll(activeReportCtx)
-
-	finalReportCtx, cleanupPrintTab, printPopupTabID := sh.prepareOfficialPrintModal(parentCtx, cdpEndpoint, activeReportCtx)
-	if cleanupPrintTab != nil {
-		defer cleanupPrintTab()
+	if onProgress != nil {
+		onProgress("human_reading", "محاكاة قراءة بشرية ذكية لمنع كشف السلوك الآلي...", "")
 	}
+	sh.simulateAdaptiveHumanReading(activeReportCtx)
 
-	html, title, isErrorPage, errPageMsg, err := sh.extractClonedReportHTML(finalReportCtx, vin)
-	if title == "" && fastTitle != "" {
-		title = fastTitle
-	}
-
-	// Clean up any extra print popup tab if Carfax opened one
-	if printPopupTabID != "" && (reportTab == nil || printPopupTabID != reportTab.ID) && printPopupTabID != searchTab.ID {
-		sh.CloseTabByID(cdpEndpoint, printPopupTabID)
-	}
-
-	// Clean up: if a popup tab was opened for the report, close ONLY the popup tab so the main search tab stays clean
+	// Clean up: close the report tab immediately and cleanly
 	if openedNewTab && reportTab != nil {
 		sh.CloseTabByID(cdpEndpoint, reportTab.ID)
 	} else {
@@ -660,30 +645,13 @@ func (sh *StealthHarvester) HarvestReport(
 		}
 	}
 
-	if err != nil {
-		return &HarvestResult{
-			Success:          false,
-			ErrorCode:        "DOM_EXTRACT_ERROR",
-			ErrorMessage:     fmt.Sprintf("تعذر نسخ محتوى التقرير من الصفحة: %v", err),
-			ScreenshotBase64: reportScreenshot,
-		}
-	}
-
-	if isErrorPage {
-		return &HarvestResult{
-			Success:          false,
-			ErrorCode:        "VIN_NOT_FOUND_ON_CARFAX",
-			ErrorMessage:     errPageMsg,
-			ScreenshotBase64: reportScreenshot,
-		}
-	}
-
+	// On SUCCESS: Return pure structured JSON with zero heavy HTML or Base64 screenshots
 	return &HarvestResult{
 		Success:          true,
-		VehicleTitle:     title,
-		RawHtmlEn:        html,
+		VehicleTitle:     fastTitle,
+		RawHtmlEn:        "", // No heavy HTML needed; our 1:1 local template renders instantly
 		FastSummaryJson:  fastSummaryJson,
-		ScreenshotBase64: reportScreenshot,
+		ScreenshotBase64: "", // No screenshot in success state to save CPU and RAM
 	}
 }
 
@@ -1184,15 +1152,76 @@ func (sh *StealthHarvester) typeVinHumanly(tabCtx context.Context, selector, vin
 	return nil
 }
 
-func (sh *StealthHarvester) simulateGentleScroll(tabCtx context.Context) {
-	steps := 2 + sh.rnd.Intn(2) // 2 to 3 gentle scrolls
-	for s := 0; s < steps; s++ {
-		scrollBy := 280 + sh.rnd.Intn(250)
-		_ = chromedp.Run(tabCtx, chromedp.Evaluate(fmt.Sprintf(`window.scrollBy({ top: %d, behavior: 'smooth' });`, scrollBy), nil))
-		sh.randomDelay(1100, 1900)
+// simulateAdaptiveHumanReading applies human reading dynamics with strict pattern breaking (4 diverse styles)
+// to ensure no identical browsing signature occurs sequentially or across multiple requests.
+func (sh *StealthHarvester) simulateAdaptiveHumanReading(tabCtx context.Context) {
+	sh.mu.Lock()
+	// Pick a mode that breaks the pattern and differs from the immediately preceding mode
+	candidates := []int{1, 2, 3, 4}
+	sh.rnd.Shuffle(len(candidates), func(i, j int) {
+		candidates[i], candidates[j] = candidates[j], candidates[i]
+	})
+
+	selectedMode := candidates[0]
+	if len(sh.recentModes) > 0 && selectedMode == sh.recentModes[len(sh.recentModes)-1] {
+		selectedMode = candidates[1]
 	}
+
+	sh.recentModes = append(sh.recentModes, selectedMode)
+	if len(sh.recentModes) > 5 {
+		sh.recentModes = sh.recentModes[1:]
+	}
+	sh.mu.Unlock()
+
+	switch selectedMode {
+	case 1:
+		// Style 1: Deep Reading with pause and backtrack (scroll down in 3 chunks, scroll back up 1 chunk)
+		steps := 2 + sh.rnd.Intn(2)
+		for s := 0; s < steps; s++ {
+			scrollPx := 320 + sh.rnd.Intn(240)
+			_ = chromedp.Run(tabCtx, chromedp.Evaluate(fmt.Sprintf(`window.scrollBy({ top: %d, behavior: 'smooth' });`, scrollPx), nil))
+			sh.randomDelay(900, 1600)
+		}
+		// Backtrack slightly
+		backPx := 120 + sh.rnd.Intn(100)
+		_ = chromedp.Run(tabCtx, chromedp.Evaluate(fmt.Sprintf(`window.scrollBy({ top: -%d, behavior: 'smooth' });`, backPx), nil))
+		sh.randomDelay(1100, 1800)
+
+	case 2:
+		// Style 2: Quick Scan (Single medium scroll down, dwell pause, gentle return)
+		downPx := 480 + sh.rnd.Intn(320)
+		_ = chromedp.Run(tabCtx, chromedp.Evaluate(fmt.Sprintf(`window.scrollBy({ top: %d, behavior: 'smooth' });`, downPx), nil))
+		sh.randomDelay(1400, 2400)
+		_ = chromedp.Run(tabCtx, chromedp.Evaluate(`window.scrollTo({ top: 0, behavior: 'smooth' });`, nil))
+		sh.randomDelay(600, 1000)
+
+	case 3:
+		// Style 3: Table Inspection (Step-by-step reading with mouse movement simulation)
+		steps := 3 + sh.rnd.Intn(2)
+		for s := 0; s < steps; s++ {
+			scrollPx := 180 + sh.rnd.Intn(160)
+			jitterX := 200 + sh.rnd.Intn(400)
+			jitterY := 150 + sh.rnd.Intn(300)
+			_ = chromedp.Run(tabCtx,
+				chromedp.Evaluate(fmt.Sprintf(`window.scrollBy({ top: %d, behavior: 'smooth' });`, scrollPx), nil),
+				chromedp.Evaluate(fmt.Sprintf(`
+					const evt = new MouseEvent('mousemove', { clientX: %d, clientY: %d, bubbles: true });
+					document.dispatchEvent(evt);
+				`, jitterX, jitterY), nil),
+			)
+			sh.randomDelay(700, 1300)
+		}
+
+	case 4:
+		// Style 4: Overview Focus (Light scroll, focused dwell time at top overview)
+		downPx := 220 + sh.rnd.Intn(140)
+		_ = chromedp.Run(tabCtx, chromedp.Evaluate(fmt.Sprintf(`window.scrollBy({ top: %d, behavior: 'smooth' });`, downPx), nil))
+		sh.randomDelay(1800, 2800)
+	}
+
+	// Always smooth scroll back towards top before closing
 	_ = chromedp.Run(tabCtx, chromedp.Evaluate(`window.scrollTo({ top: 0, behavior: 'smooth' });`, nil))
-	sh.randomDelay(500, 900)
+	sh.randomDelay(400, 750)
 }
 
 // extractClonedReportHTML clones the document in memory without modifying the live page,
