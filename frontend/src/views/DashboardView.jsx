@@ -36,7 +36,7 @@ export default function DashboardView() {
   useEffect(() => {
     loadSearches()
     fetchWorkerStatus()
-    const timer = setInterval(fetchWorkerStatus, 2500)
+    const timer = setInterval(fetchWorkerStatus, 3000)
     return () => clearInterval(timer)
   }, [])
 
@@ -46,18 +46,15 @@ export default function DashboardView() {
   }
 
   return (
-    <AuthenticatedLayout
-      title="غرفة عمليات حاسبة كندا"
-      subtitle="الاتصال المباشر مع carfaxonline.com وفحص وسحب التقارير"
-    >
-      <div className="space-y-6 text-right w-full" dir="rtl">
-        {/* 1. Canada Stealth Node Live Control & Screenshot Inspector */}
+    <AuthenticatedLayout title="فحص الشاصي">
+      <div className="space-y-5 text-right w-full" dir="rtl">
+        {/* 1. Minimal Canada Connection Bar */}
         <CanadaWorkerCard status={workerStatus} onRefresh={fetchWorkerStatus} />
 
-        {/* 2. Global 17-Char VIN Dispatcher */}
+        {/* 2. Clean VIN Search Card */}
         <VinSearchBox onSuccessSearch={handleSuccessSearch} />
 
-        {/* 3. Pulled & Cached Reports Archive */}
+        {/* 3. Recent Reports Table */}
         <RecentSearchesTable
           searches={searches}
           loading={loadingSearches}

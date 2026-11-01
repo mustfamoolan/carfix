@@ -6,6 +6,7 @@ import LoginView from '@/views/LoginView'
 import DashboardView from '@/views/DashboardView'
 import HistoryView from '@/views/HistoryView'
 import ReportView from '@/views/ReportView'
+import AdminUsersView from '@/views/AdminUsersView'
 import AdminLogsView from '@/views/AdminLogsView'
 
 export default function AppRoutes() {
@@ -13,19 +14,11 @@ export default function AppRoutes() {
 
   return (
     <Routes>
-      {/* Public Route: Login */}
       <Route
         path="/login"
-        element={
-          token ? (
-            <Navigate to="/dashboard" replace />
-          ) : (
-            <LoginView />
-          )
-        }
+        element={token ? <Navigate to="/dashboard" replace /> : <LoginView />}
       />
 
-      {/* Main Canada Command & Control Dashboard */}
       <Route
         path="/dashboard"
         element={
@@ -54,6 +47,15 @@ export default function AppRoutes() {
       />
 
       <Route
+        path="/admin/users"
+        element={
+          <ProtectedRoute>
+            <AdminUsersView />
+          </ProtectedRoute>
+        }
+      />
+
+      <Route
         path="/admin/logs"
         element={
           <ProtectedRoute>
@@ -62,7 +64,6 @@ export default function AppRoutes() {
         }
       />
 
-      {/* Root & Catch-all Redirect to Command Center */}
       <Route
         path="/"
         element={<Navigate to={token ? '/dashboard' : '/login'} replace />}

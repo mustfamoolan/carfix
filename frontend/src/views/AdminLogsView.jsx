@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react'
 import AuthenticatedLayout from '@/components/layout/AuthenticatedLayout'
-import { Card, CardHeader, CardTitle, CardDescription, CardContent } from '@/components/ui/card'
+import { Card, CardHeader, CardTitle, CardContent } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import {
@@ -11,7 +11,7 @@ import {
   TableHead,
   TableCell,
 } from '@/components/ui/table'
-import { Activity, Loader2, ExternalLink } from 'lucide-react'
+import { Loader2, ExternalLink, RefreshCw } from 'lucide-react'
 import { getAdminSearchLogs } from '@/lib/api'
 import { useNavigate } from 'react-router-dom'
 
@@ -37,97 +37,78 @@ export default function AdminLogsView() {
   }, [])
 
   return (
-    <AuthenticatedLayout
-      title="سجل العمليات الحية"
-      subtitle="مراقبة حية لجميع طلبات فحص الشاصي عبر النظام"
-    >
-      <div className="space-y-6 text-right w-full" dir="rtl">
-        <Card className="border-slate-200 dark:border-slate-800 shadow-sm w-full bg-white dark:bg-slate-900 rounded-xl overflow-hidden">
-          <CardHeader className="flex flex-row items-center justify-between pb-3 text-right bg-slate-50 dark:bg-slate-800/50 border-b border-slate-200 dark:border-slate-800">
-            <div>
-              <CardTitle className="text-base font-bold flex items-center gap-2 text-[#003478] dark:text-blue-300">
-                <Activity className="h-4.5 w-4.5 text-[#003478] dark:text-blue-300" />
-                سجل الفحوصات والعمليات الشاملة في المنصة
-              </CardTitle>
-              <CardDescription className="text-xs text-slate-500">
-                متابعة مباشرة لجميع طلبات فحص الشاصي عبر كافة التجار والمستخدمين مع مصدر الجلب وزمن الاستجابة
-              </CardDescription>
-            </div>
+    <AuthenticatedLayout title="سجل العمليات">
+      <div className="space-y-5 text-right w-full" dir="rtl">
+        <Card className="border-border shadow-xs bg-card overflow-hidden">
+          <CardHeader className="flex flex-row items-center justify-between py-3.5 px-5 border-b border-border">
+            <CardTitle className="text-sm font-bold text-foreground">سجل العمليات</CardTitle>
             <Button
-              variant="outline"
+              variant="ghost"
               size="sm"
               onClick={fetchLogs}
-              className="text-xs h-8 hover:bg-slate-100 dark:hover:bg-slate-800"
+              className="text-xs h-8 gap-1.5 text-muted-foreground hover:text-foreground"
             >
-              تحديث
+              <RefreshCw className="h-3.5 w-3.5" />
+              <span>تحديث</span>
             </Button>
           </CardHeader>
           <CardContent className="p-0">
             {loading ? (
-              <div className="flex flex-col items-center justify-center py-12 text-slate-400 gap-2">
-                <Loader2 className="h-6 w-6 animate-spin text-[#003478]" />
-                <span className="text-xs">جاري جلب السجلات...</span>
+              <div className="flex items-center justify-center py-12 text-muted-foreground gap-2 text-xs">
+                <Loader2 className="h-4 w-4 animate-spin text-primary" />
+                <span>جاري التحميل...</span>
               </div>
             ) : logs.length === 0 ? (
-              <div className="text-center py-12 text-slate-400 text-xs">
-                لا توجد عمليات مسجلة بعد في النظام
+              <div className="text-center py-12 text-muted-foreground text-xs">
+                لا توجد عمليات مسجلة بعد
               </div>
             ) : (
-              <div className="overflow-x-auto w-full">
-                <Table className="w-full text-right">
-                  <TableHeader className="bg-[#E8F1F8] dark:bg-slate-800">
-                    <TableRow className="border-b border-slate-200 dark:border-slate-700">
-                      <TableHead className="w-[60px] text-right text-xs font-bold text-[#003478] dark:text-blue-200">#</TableHead>
-                      <TableHead className="text-right text-xs font-bold text-[#003478] dark:text-blue-200">المستخدم</TableHead>
-                      <TableHead className="text-right text-xs font-bold text-[#003478] dark:text-blue-200">رقم الشاصي (VIN)</TableHead>
-                      <TableHead className="text-right text-xs font-bold text-[#003478] dark:text-blue-200">المركبة</TableHead>
-                      <TableHead className="text-right text-xs font-bold text-[#003478] dark:text-blue-200">المصدر</TableHead>
-                      <TableHead className="text-right text-xs font-bold text-[#003478] dark:text-blue-200">الحالة</TableHead>
-                      <TableHead className="text-right text-xs font-bold text-[#003478] dark:text-blue-200">المدة</TableHead>
-                      <TableHead className="text-right text-xs font-bold text-[#003478] dark:text-blue-200">التاريخ والوقت</TableHead>
+              <div className="overflow-x-auto">
+                <Table>
+                  <TableHeader>
+                    <TableRow className="bg-muted/40 hover:bg-muted/40">
+                      <TableHead className="w-[50px] text-right text-xs font-semibold">#</TableHead>
+                      <TableHead className="text-right text-xs font-semibold">المستخدم</TableHead>
+                      <TableHead className="text-right text-xs font-semibold">رقم الشاصي</TableHead>
+                      <TableHead className="text-right text-xs font-semibold">المركبة</TableHead>
+                      <TableHead className="text-right text-xs font-semibold">الحالة</TableHead>
+                      <TableHead className="text-right text-xs font-semibold">التاريخ</TableHead>
                     </TableRow>
                   </TableHeader>
                   <TableBody>
                     {logs.map((log) => (
-                      <TableRow key={log.id} className="hover:bg-blue-50/40 dark:hover:bg-slate-800/40 border-b border-slate-100 dark:border-slate-800 transition-colors">
-                        <TableCell className="font-mono text-xs text-slate-400">
+                      <TableRow key={log.id}>
+                        <TableCell className="font-mono text-xs text-muted-foreground">
                           {log.id}
                         </TableCell>
-                        <TableCell className="text-xs font-bold text-slate-800 dark:text-slate-100">
+                        <TableCell className="text-xs font-medium text-foreground">
                           {log.user?.username ? `@${log.user.username}` : `UID: ${log.user_id}`}
                         </TableCell>
-                        <TableCell className="font-mono font-bold text-xs" dir="ltr">
+                        <TableCell className="font-mono font-semibold text-xs" dir="ltr">
                           <button
                             onClick={() => navigate(`/report/${log.vin}`)}
-                            className="hover:underline text-[#00599C] dark:text-blue-400 flex items-center gap-1"
+                            className="hover:underline text-primary flex items-center gap-1 cursor-pointer"
                           >
                             <span>{log.vin}</span>
                             <ExternalLink className="h-3 w-3 inline" />
                           </button>
                         </TableCell>
-                        <TableCell className="text-xs text-slate-700 dark:text-slate-300">
+                        <TableCell className="text-xs text-foreground">
                           {log.vehicle_title || '—'}
                         </TableCell>
                         <TableCell>
-                          <Badge variant="outline" className="text-[10px] border-slate-300">
-                            {log.fetch_source || 'محلي'}
-                          </Badge>
-                        </TableCell>
-                        <TableCell>
                           <Badge
-                            className={`text-[10px] font-bold border-none ${
+                            variant="outline"
+                            className={`text-[10px] ${
                               log.result_status === 'success'
-                                ? 'bg-emerald-100 text-[#1C8237]'
-                                : 'bg-rose-100 text-[#D0202E]'
+                                ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-700 dark:text-emerald-400'
+                                : 'border-destructive/30 bg-destructive/10 text-destructive'
                             }`}
                           >
-                            {log.result_status}
+                            {log.result_status === 'success' ? 'مكتمل' : log.result_status}
                           </Badge>
                         </TableCell>
-                        <TableCell className="text-xs font-mono text-slate-500">
-                          {log.duration_ms} ms
-                        </TableCell>
-                        <TableCell className="text-xs text-slate-500">
+                        <TableCell className="text-xs text-muted-foreground">
                           {new Date(log.created_at).toLocaleString('ar-EG')}
                         </TableCell>
                       </TableRow>
