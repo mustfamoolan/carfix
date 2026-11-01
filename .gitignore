@@ -1,0 +1,33 @@
+# Binaries
+bin/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+main_linux
+
+# Node modules
+node_modules/
+frontend/node_modules/
+
+# IDEs
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Environment
+.env
+.env.local
+canada-worker/.env
+
+# Dependency directories
+vendor/
+
+# Logs
+storage/logs/*.log
+
+# OS files
+.DS_Store
+Thumbs.db

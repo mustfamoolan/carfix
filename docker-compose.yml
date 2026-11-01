@@ -1,0 +1,58 @@
+services:
+  app:
+    build: .
+    restart: always
+    ports:
+      - "${APP_PORT:-8080}:8080"
+    volumes:
+      - ./public:/app/public
+    env_file:
+      - .env
+    environment:
+      - APP_ENV=production
+      - DB_DRIVER=postgres
+      - DB_HOST=db
+      - DB_PORT=5432
+      - DB_DATABASE=${DB_DATABASE:-carfix}
+      - DB_USERNAME=${DB_USERNAME:-postgres}
+      - DB_PASSWORD=${DB_PASSWORD:-postgres}
+      - REDIS_HOST=redis
+      - CACHE_HOST=redis
+      - WORKER_SECRET_KEY=${WORKER_SECRET_KEY:-almoq3-canada-secret-2026}
+      - CANADA_MAX_DAILY_PULLS=${CANADA_MAX_DAILY_PULLS:-45}
+      - CANADA_MIN_COOLDOWN_SEC=${CANADA_MIN_COOLDOWN_SEC:-25}
+      - USE_MOCK_FALLBACK=${USE_MOCK_FALLBACK:-false}
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_started
+
+  db:
+    image: postgres:15-alpine
+    restart: always
+    environment:
+      POSTGRES_USER: ${DB_USERNAME:-postgres}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-postgres}
+      POSTGRES_DB: ${DB_DATABASE:-carfix}
+    ports:
+      - "127.0.0.1:${DB_PORT:-5433}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USERNAME:-postgres} -d ${DB_DATABASE:-carfix}"]
+      interval: 3s
+      timeout: 3s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    restart: always
+    ports:
+      - "127.0.0.1:${CACHE_PORT:-6379}:6379"
+    volumes:
+      - redis_data:/data
+
+volumes:
+  postgres_data:
+  redis_data:

@@ -1,0 +1,11 @@
+CREATE TABLE IF NOT EXISTS report_caches (
+    vin VARCHAR(17) PRIMARY KEY,
+    vehicle_title VARCHAR(255),
+    raw_html_en TEXT,
+    translated_html_ar TEXT,
+    summary_json JSONB,
+    fetched_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+

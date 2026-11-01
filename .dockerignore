@@ -1,0 +1,9 @@
+.git
+agent
+node_modules
+frontend/node_modules
+canada-worker
+storage/logs/*
+bin
+*.exe
+main_linux
