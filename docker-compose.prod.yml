@@ -22,6 +22,7 @@ services:
       - "127.0.0.1:8080:8080"
     volumes:
       - ./public:/app/public
+      - ./.env:/app/.env:ro
     env_file:
       - .env
     environment:
@@ -75,3 +76,4 @@ volumes:
   redis_data:
   caddy_data:
   caddy_config:
+
