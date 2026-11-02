@@ -57,6 +57,7 @@ func RegisterAPIRoutes(app *fiber.App) {
 	admin.Get("/users", adminUserController.ListUsers)
 	admin.Post("/users", adminUserController.CreateUser)
 	admin.Put("/users/:id", adminUserController.UpdateUser)
+	admin.Delete("/users/:id", adminUserController.DeleteUser)
 	admin.Put("/users/:id/quota", adminUserController.UpdateUserQuota)
 	admin.Get("/search-logs", adminUserController.ListSearchLogs)
 

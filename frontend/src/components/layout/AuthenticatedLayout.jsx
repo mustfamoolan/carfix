@@ -59,12 +59,16 @@ export default function AuthenticatedLayout({ children, title }) {
   const SidebarContent = () => (
     <>
       {/* Logo */}
-      <div className="flex h-14 items-center border-b border-border px-6">
+      <div className="flex h-14 items-center border-b border-border px-5">
         <Link to="/dashboard" className="flex items-center gap-2.5">
-          <div className="flex h-7 w-7 items-center justify-center rounded-md bg-primary text-primary-foreground">
-            <Car className="h-4 w-4" />
-          </div>
-          <span className="font-semibold text-sm text-foreground">كارفاكس كندا</span>
+          <img
+            src="/carfax-assets/carfax-logo.svg"
+            alt="CARFAX"
+            className="h-5 w-auto object-contain"
+          />
+          <span className="font-bold text-xs text-muted-foreground border-r border-border pr-2">
+            بوابة التجار
+          </span>
         </Link>
       </div>
 

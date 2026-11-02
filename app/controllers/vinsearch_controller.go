@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -131,7 +132,7 @@ func (ctrl *VinSearchController) Search(c *fiber.Ctx) error {
 		return c.JSON(fastReport)
 	}
 
-	// ==================== CACHE MISS (Canada Node Integration) ====================
+	// ==================== CACHE MISS ====================
 	rawHtmlEn, vehicleTitle, fastSummaryJson, err := ctrl.fetchFromCanadaNode(cleanVin)
 	if err != nil {
 		duration := time.Since(startTime).Milliseconds()
@@ -139,9 +140,9 @@ func (ctrl *VinSearchController) Search(c *fiber.Ctx) error {
 		logEntry := models.SearchLog{
 			UserID:       userID,
 			VIN:          cleanVin,
-			VehicleTitle: "فشل الجلب من كندا",
+			VehicleTitle: "تعذر استخراج التقرير",
 			ResultStatus: "error",
-			FetchSource:  "canada_node",
+			FetchSource:  "live",
 			DurationMs:   duration,
 			IPAddress:    ipAddress,
 			UserAgent:    userAgent,
@@ -150,7 +151,7 @@ func (ctrl *VinSearchController) Search(c *fiber.Ctx) error {
 		bootstrap.DB.Create(&logEntry)
 
 		return c.Status(502).JSON(fiber.Map{
-			"message": "تعذر جلب التقرير من عقدة كندا: " + err.Error(),
+			"message": err.Error(),
 			"vin":     cleanVin,
 		})
 	}
@@ -357,19 +358,46 @@ func (ctrl *VinSearchController) GetQueueStatus(c *fiber.Ctx) error {
 	})
 }
 
-// GetUserSearchHistory returns the authenticated user's own search history
+// GetUserSearchHistory returns the authenticated user's own search history with fast pagination and filtering
 func (ctrl *VinSearchController) GetUserSearchHistory(c *fiber.Ctx) error {
 	userID, err := extractUserID(c)
 	if err != nil {
 		return c.Status(401).JSON(fiber.Map{"message": "غير مصرح"})
 	}
 
+	page, _ := strconv.Atoi(c.Query("page", "1"))
+	if page < 1 {
+		page = 1
+	}
+	limit, _ := strconv.Atoi(c.Query("limit", "100"))
+	if limit < 1 || limit > 200 {
+		limit = 100
+	}
+	offset := (page - 1) * limit
+	q := strings.TrimSpace(c.Query("q"))
+
+	query := bootstrap.DB.Model(&models.SearchLog{}).Where("user_id = ?", userID)
+	if q != "" {
+		pattern := "%" + q + "%"
+		query = query.Where("vin ILIKE ? OR vehicle_title ILIKE ?", pattern, pattern)
+	}
+
+	var total int64
+	query.Count(&total)
+
 	var logs []models.SearchLog
-	if err := bootstrap.DB.Where("user_id = ?", userID).Order("created_at DESC").Limit(50).Find(&logs).Error; err != nil {
+	if err := query.Order("created_at DESC").Limit(limit).Offset(offset).Find(&logs).Error; err != nil {
 		return c.Status(500).JSON(fiber.Map{"message": "فشل جلب سجل البحث"})
 	}
 
-	return c.JSON(fiber.Map{"logs": logs})
+	return c.JSON(fiber.Map{
+		"logs": logs,
+		"pagination": fiber.Map{
+			"page":  page,
+			"limit": limit,
+			"total": total,
+		},
+	})
 }
 
 // GetCachedReport returns the fast lightweight report (~12 KB) in <5ms instead of transferring 10MB of HTML/PDF
@@ -456,38 +484,41 @@ func (ctrl *VinSearchController) GetReportPdf(c *fiber.Ctx) error {
 	return c.Send(pdfBytes)
 }
 
-// fetchFromCanadaNode communicates with the remote Canada Node or falls back to simulation if permitted
+// fetchFromCanadaNode communicates with the remote worker or falls back to simulation if permitted
 func (ctrl *VinSearchController) fetchFromCanadaNode(vin string) (string, string, string, error) {
 	// 1. Always respect Circuit Breaker first
-	if active, reason := ctrl.workerGuard.IsCircuitBreakerActive(); active {
-		return "", "", "", fmt.Errorf("قاطع الحماية مفعل لحاسبة كندا: %s", reason)
+	if active, _ := ctrl.workerGuard.IsCircuitBreakerActive(); active {
+		return "", "", "", fmt.Errorf("الخدمة مشغولة حالياً أو قيد التحديث اللحظي، يرجى المحاولة بعد قليل")
 	}
 
-	// 2. If Canada Worker is online, dispatch strictly to Canada Worker
+	// 2. If Worker is online, dispatch strictly to Worker
 	if ctrl.workerGuard.IsConnected() {
 		if err := ctrl.workerGuard.EnqueueSearchTask(vin); err != nil {
-			return "", "", "", fmt.Errorf("تعذر إدراج الشاصي في طابور كندا: %v", err)
+			return "", "", "", fmt.Errorf("تعذر إرسال الطلب حالياً، يرجى المحاولة مرة أخرى")
 		}
 
 		res, err := ctrl.workerGuard.WaitForReport(vin, 65*time.Second)
 		if err != nil {
-			return "", "", "", fmt.Errorf("انتهت مهلة انتظار استجابة حاسبة كندا (%v)", err)
+			return "", "", "", fmt.Errorf("استغرقت عملية البحث وقتاً أطول من المعتاد، يرجى المحاولة بعد قليل")
 		}
 
 		if res != nil && res.ErrorCode != "" {
-			return "", "", "", fmt.Errorf("[%s] %s", res.ErrorCode, res.ErrorMessage)
+			if res.ErrorCode == "VIN_NOT_FOUND_ON_CARFAX" {
+				return "", "", "", fmt.Errorf("لم يتم العثور على سجلات لهذا الرقم، يرجى التأكد من صحة رقم الشاصي")
+			}
+			return "", "", "", fmt.Errorf("الخدمة مشغولة حالياً، يرجى المحاولة مرة أخرى بعد قليل")
 		}
 
 		if res != nil && (res.RawHtmlEn != "" || res.FastSummaryJson != "") {
 			return res.RawHtmlEn, res.VehicleTitle, res.FastSummaryJson, nil
 		}
 
-		return "", "", "", fmt.Errorf("لم ترسل حاسبة كندا محتوى صالحاً للتقرير")
+		return "", "", "", fmt.Errorf("تعذر استخراج بيانات التقرير، يرجى المحاولة مرة أخرى")
 	}
 
-	// 3. Canada Worker is offline: check if Mock Simulation Fallback is permitted
+	// 3. Worker is offline: check if Mock Simulation Fallback is permitted
 	if !ctrl.workerGuard.IsMockFallbackEnabled() {
-		return "", "", "", fmt.Errorf("حاسبة كندا غير متصلة حالياً (يرجى تشغيل برنامج كندا أو تفعيل وضع المحاكاة الاختباري)")
+		return "", "", "", fmt.Errorf("الخدمة قيد الصيانة اللحظية حالياً، يرجى المحاولة بعد قليل")
 	}
 
 	html, title, err := ctrl.fetchFromMock(vin)

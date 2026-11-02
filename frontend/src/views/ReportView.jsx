@@ -3,7 +3,7 @@ import { useParams, useNavigate, useLocation } from 'react-router-dom'
 import AuthenticatedLayout from '@/components/layout/AuthenticatedLayout'
 import ReportToolbar from '@/components/report/ReportToolbar'
 import ReportNativeView from '@/components/report/ReportNativeView'
-import { getReport } from '@/lib/api'
+import { getReport, getCachedData } from '@/lib/api'
 import { Loader2 } from 'lucide-react'
 import { toast } from 'sonner'
 
@@ -12,29 +12,37 @@ export default function ReportView() {
   const navigate = useNavigate()
   const location = useLocation()
 
-  const [report, setReport] = useState(location.state?.report || null)
-  const [loading, setLoading] = useState(!report)
+  const cachedReport = vin ? getCachedData(`report:${String(vin).toUpperCase()}`) : null
+  const [report, setReport] = useState(location.state?.report || cachedReport || null)
+  const [loading, setLoading] = useState(!(location.state?.report || cachedReport))
   const [lang, setLang] = useState('en') // Official English layout by default, 1-click Arabic toggle
 
   useEffect(() => {
     if (vin) {
-      if (
+      const cached = getCachedData(`report:${String(vin).toUpperCase()}`)
+      if (cached && (!report || report.vin?.toUpperCase() !== vin.toUpperCase())) {
+        setReport(cached)
+        setLoading(false)
+        loadReport(vin, false)
+      } else if (
         !report ||
         (report.vin && report.vin.toUpperCase() !== vin.toUpperCase())
       ) {
-        loadReport(vin)
+        loadReport(vin, true)
       }
     }
   }, [vin])
 
-  const loadReport = async (vinCode) => {
-    setLoading(true)
+  const loadReport = async (vinCode, showSpinner = true) => {
+    if (showSpinner) setLoading(true)
     try {
       const res = await getReport(vinCode)
       setReport(res?.report || res?.data?.report || res)
     } catch (err) {
-      const msg = err.response?.data?.message || 'تعذر تحميل التقرير المطلوب'
-      toast.error(msg)
+      if (showSpinner) {
+        const msg = err.response?.data?.message || 'تعذر تحميل التقرير المطلوب'
+        toast.error(msg)
+      }
     } finally {
       setLoading(false)
     }
@@ -54,71 +62,7 @@ export default function ReportView() {
     return null
   }, [report?.summary_json])
 
-  const hasOfficialPdf = Boolean(
-    report?.has_official_pdf || summary?.has_official_pdf
-  )
-  const isBackgroundPending = Boolean(
-    summary?.background_pending && !hasOfficialPdf
-  )
-
-  // Silent Background Polling while Stage 2 (4-Section Print PDF) finishes in Canada
-  useEffect(() => {
-    const targetVin = report?.vin || vin
-    if (!targetVin || !isBackgroundPending) return
-
-    let attempts = 0
-    const timer = setInterval(async () => {
-      attempts++
-      if (attempts > 18) {
-        clearInterval(timer)
-        return
-      }
-      try {
-        const res = await getReport(targetVin)
-        const updated = res?.report || res?.data?.report || res
-        let updatedSummary = null
-        try {
-          updatedSummary =
-            typeof updated?.summary_json === 'string'
-              ? JSON.parse(updated.summary_json)
-              : updated?.summary_json
-        } catch {
-          updatedSummary = null
-        }
-
-        if (
-          updated &&
-          (updated.has_official_pdf || updatedSummary?.background_ready)
-        ) {
-          setReport((prev) => ({
-            ...prev,
-            ...updated,
-          }))
-          clearInterval(timer)
-          toast.success('اكتمل تجهيز ملف الطباعة الرسمي PDF في الخلفية!')
-        }
-      } catch {
-        // Ignore silent background poll errors
-      }
-    }, 2500)
-
-    return () => clearInterval(timer)
-  }, [report?.vin, vin, isBackgroundPending])
-
-  const handleDownloadOfficialPdf = () => {
-    const targetVin = report?.vin || vin
-    if (!hasOfficialPdf || !targetVin) {
-      window.print()
-      return
-    }
-    window.open(`/api/reports/${targetVin}/pdf`, '_blank')
-  }
-
   const handlePrint = () => {
-    if (hasOfficialPdf) {
-      handleDownloadOfficialPdf()
-      return
-    }
     window.print()
   }
 
@@ -145,9 +89,6 @@ export default function ReportView() {
               onLangChange={setLang}
               onBack={() => navigate('/dashboard')}
               onPrint={handlePrint}
-              hasOfficialPdf={hasOfficialPdf}
-              isBackgroundLoading={isBackgroundPending}
-              onDownloadOfficialPdf={handleDownloadOfficialPdf}
             />
 
             <ReportNativeView

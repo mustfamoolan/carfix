@@ -104,6 +104,9 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
+	// Auto-Recovery: Ensure Chrome is launched in Off-Screen mode with fresh profile sync
+	_ = worker.stealth.EnsureChromeRunning(worker.cdpWsURL)
+
 	// Perform an initial browser inspection + screenshot on startup
 	worker.reportTelemetry(ctx, true)
 

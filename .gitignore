@@ -1,11 +1,15 @@
-# Binaries
+# Binaries & Packages
 bin/
 *.exe
 *.exe~
 *.dll
 *.so
 *.dylib
+*.zip
 main_linux
+Canada-PC-Ready/*.exe
+public/*.exe
+public/*.zip
 
 # Node modules
 node_modules/

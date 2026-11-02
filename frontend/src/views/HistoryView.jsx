@@ -2,17 +2,19 @@ import React, { useState, useEffect } from 'react'
 import { useNavigate } from 'react-router-dom'
 import AuthenticatedLayout from '@/components/layout/AuthenticatedLayout'
 import RecentSearchesTable from '@/components/dashboard/RecentSearchesTable'
-import { getUserSearches } from '@/lib/api'
+import { getUserSearches, getCachedData } from '@/lib/api'
 
 export default function HistoryView() {
   const navigate = useNavigate()
-  const [searches, setSearches] = useState([])
-  const [loading, setLoading] = useState(true)
+  const cachedSearches = getCachedData('user:searches:')
+  const initialLogs = cachedSearches?.logs || cachedSearches?.data?.logs || null
+  const [searches, setSearches] = useState(initialLogs || [])
+  const [loading, setLoading] = useState(!initialLogs)
 
-  const loadSearches = async () => {
-    setLoading(true)
+  const loadSearches = async (showSpinner = false) => {
+    if (showSpinner || searches.length === 0) setLoading(true)
     try {
-      const res = await getUserSearches()
+      const res = await getUserSearches({ limit: 150 })
       setSearches(res?.logs || res?.data?.logs || [])
     } catch (err) {
       console.error(err)
@@ -22,7 +24,7 @@ export default function HistoryView() {
   }
 
   useEffect(() => {
-    loadSearches()
+    loadSearches(false)
   }, [])
 
   return (
@@ -34,7 +36,7 @@ export default function HistoryView() {
         <RecentSearchesTable
           searches={searches}
           loading={loading}
-          onRefresh={loadSearches}
+          onRefresh={() => loadSearches(true)}
           onSelectReport={(vin) => navigate(`/report/${vin}`)}
         />
       </div>

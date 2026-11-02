@@ -1,15 +1,7 @@
 import React from 'react'
 import { Card, CardContent } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
-import { Badge } from '@/components/ui/badge'
-import {
-  ArrowRight,
-  Globe,
-  Printer,
-  FileDown,
-  Loader2,
-  CheckCircle2,
-} from 'lucide-react'
+import { ArrowRight, Globe, Printer } from 'lucide-react'
 
 export default function ReportToolbar({
   report,
@@ -17,9 +9,6 @@ export default function ReportToolbar({
   onLangChange,
   onBack,
   onPrint,
-  hasOfficialPdf,
-  isBackgroundLoading,
-  onDownloadOfficialPdf,
 }) {
   return (
     <Card className="shadow-xs w-full print:hidden">
@@ -43,26 +32,10 @@ export default function ReportToolbar({
               <span className="text-xs font-mono text-muted-foreground">
                 ({report?.vin})
               </span>
-              {isBackgroundLoading ? (
-                <Badge variant="secondary" className="text-[11px] font-medium gap-1">
-                  <Loader2 className="h-3 w-3 animate-spin" />
-                  <span>جاري تجهيز ملف الطباعة الرسمي PDF...</span>
-                </Badge>
-              ) : (
-                hasOfficialPdf && (
-                  <Badge
-                    variant="outline"
-                    className="text-[11px] font-medium border-emerald-200 bg-emerald-50 text-emerald-700 gap-1"
-                  >
-                    <CheckCircle2 className="h-3 w-3" />
-                    <span>ملف الطباعة الرسمي PDF جاهز</span>
-                  </Badge>
-                )
-              )}
             </div>
           </div>
 
-          {/* Language Switch & Official Print PDF */}
+          {/* Language Switch & Instant Print */}
           <div className="flex flex-wrap items-center gap-2">
             <div className="flex items-center bg-muted p-0.5 rounded-md border text-xs">
               <button
@@ -74,7 +47,7 @@ export default function ReportToolbar({
                     : 'text-muted-foreground hover:text-foreground'
                 }`}
               >
-                English (Original)
+                English
               </button>
               <button
                 type="button"
@@ -90,25 +63,14 @@ export default function ReportToolbar({
               </button>
             </div>
 
-            {hasOfficialPdf && (
-              <Button
-                size="sm"
-                onClick={onDownloadOfficialPdf}
-                className="gap-1.5 text-xs font-semibold h-8 bg-[#1c8237] hover:bg-[#15682b] text-white cursor-pointer"
-              >
-                <FileDown className="h-3.5 w-3.5" />
-                <span>تحميل الطباعة الرسمية PDF</span>
-              </Button>
-            )}
-
             <Button
               size="sm"
-              variant={hasOfficialPdf ? 'outline' : 'default'}
-              onClick={hasOfficialPdf ? onDownloadOfficialPdf : onPrint}
+              variant="default"
+              onClick={onPrint}
               className="gap-1.5 text-xs font-semibold h-8 cursor-pointer"
             >
               <Printer className="h-3.5 w-3.5" />
-              <span>طباعة</span>
+              <span>طباعة التقرير</span>
             </Button>
           </div>
         </div>

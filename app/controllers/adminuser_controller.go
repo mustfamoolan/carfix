@@ -71,7 +71,10 @@ func (a *AdminUserController) ListUsers(c *fiber.Ctx) error {
 		}
 	}
 
-	return c.JSON(response)
+	return c.JSON(fiber.Map{
+		"users": response,
+		"data":  response,
+	})
 }
 
 // CreateUser creates a new user and their quota atomically
@@ -94,9 +97,12 @@ func (a *AdminUserController) CreateUser(c *fiber.Ctx) error {
 
 	input.Username = strings.TrimSpace(input.Username)
 	input.FullName = strings.TrimSpace(input.FullName)
+	if input.FullName == "" {
+		input.FullName = input.Username
+	}
 
-	if input.Username == "" || input.Password == "" || input.FullName == "" {
-		return c.Status(400).JSON(fiber.Map{"message": "الاسم الكامل، اسم المستخدم وكلمة المرور مطلوبة"})
+	if input.Username == "" || input.Password == "" {
+		return c.Status(400).JSON(fiber.Map{"message": "اسم المستخدم وكلمة المرور مطلوبة"})
 	}
 
 	// Check if username is already taken
@@ -183,6 +189,7 @@ func (a *AdminUserController) UpdateUser(c *fiber.Ctx) error {
 
 	var input struct {
 		FullName string `json:"full_name"`
+		Username string `json:"username"`
 		Phone    string `json:"phone"`
 		Password string `json:"password"`
 		Role     string `json:"role"`
@@ -196,11 +203,21 @@ func (a *AdminUserController) UpdateUser(c *fiber.Ctx) error {
 	updates := make(map[string]interface{})
 	if strings.TrimSpace(input.FullName) != "" {
 		updates["full_name"] = strings.TrimSpace(input.FullName)
-		user.FullName = input.FullName
+		user.FullName = strings.TrimSpace(input.FullName)
+	}
+	if strings.TrimSpace(input.Username) != "" && strings.TrimSpace(input.Username) != user.Username {
+		newUsername := strings.TrimSpace(input.Username)
+		var existing int64
+		bootstrap.DB.Model(&models.User{}).Where("username = ? AND id != ?", newUsername, user.ID).Count(&existing)
+		if existing > 0 {
+			return c.Status(409).JSON(fiber.Map{"message": "اسم المستخدم هذا مستخدم بالفعل لحساب آخر"})
+		}
+		updates["username"] = newUsername
+		user.Username = newUsername
 	}
 	if input.Phone != "" {
 		updates["phone"] = strings.TrimSpace(input.Phone)
-		user.Phone = input.Phone
+		user.Phone = strings.TrimSpace(input.Phone)
 	}
 	if input.Role == "admin" || input.Role == "user" {
 		updates["role"] = input.Role
@@ -227,6 +244,34 @@ func (a *AdminUserController) UpdateUser(c *fiber.Ctx) error {
 	return c.JSON(user)
 }
 
+// DeleteUser removes a user account and their quota
+func (a *AdminUserController) DeleteUser(c *fiber.Ctx) error {
+	id, err := strconv.ParseUint(c.Params("id"), 10, 32)
+	if err != nil {
+		return c.Status(400).JSON(fiber.Map{"message": "معرف المستخدم غير صحيح"})
+	}
+
+	if currentID, ok := c.Locals("user_id").(uint); ok && currentID == uint(id) {
+		return c.Status(400).JSON(fiber.Map{"message": "لا يمكنك حذف حسابك الشخصي الحالي"})
+	}
+
+	var user models.User
+	if err := bootstrap.DB.First(&user, id).Error; err != nil {
+		return c.Status(404).JSON(fiber.Map{"message": "المستخدم غير موجود"})
+	}
+
+	err = bootstrap.DB.Transaction(func(tx *gorm.DB) error {
+		tx.Where("user_id = ?", user.ID).Delete(&models.UserQuota{})
+		tx.Where("user_id = ?", user.ID).Delete(&models.SearchLog{})
+		return tx.Delete(&user).Error
+	})
+	if err != nil {
+		return c.Status(500).JSON(fiber.Map{"message": "فشل حذف المستخدم"})
+	}
+
+	return c.JSON(fiber.Map{"message": "تم حذف الحساب بنجاح"})
+}
+
 // UpdateUserQuota updates or resets user search quota limits
 func (a *AdminUserController) UpdateUserQuota(c *fiber.Ctx) error {
 	id, err := strconv.ParseUint(c.Params("id"), 10, 32)
@@ -236,7 +281,15 @@ func (a *AdminUserController) UpdateUserQuota(c *fiber.Ctx) error {
 
 	var quota models.UserQuota
 	if err := bootstrap.DB.Where("user_id = ?", id).First(&quota).Error; err != nil {
-		return c.Status(404).JSON(fiber.Map{"message": "سجل الرصيد غير موجود للمستخدم"})
+		quota = models.UserQuota{
+			UserID:        uint(id),
+			TotalLimit:    50,
+			DailyLimit:    10,
+			LastResetDate: time.Now(),
+		}
+		if createErr := bootstrap.DB.Create(&quota).Error; createErr != nil {
+			return c.Status(404).JSON(fiber.Map{"message": "سجل الرصيد غير موجود للمستخدم"})
+		}
 	}
 
 	var input struct {
@@ -244,6 +297,7 @@ func (a *AdminUserController) UpdateUserQuota(c *fiber.Ctx) error {
 		DailyLimit *int       `json:"daily_limit"`
 		ExpiresAt  *time.Time `json:"expires_at"`
 		ResetDaily bool       `json:"reset_daily"`
+		ResetToday bool       `json:"reset_today"`
 		ResetTotal bool       `json:"reset_total"`
 	}
 
@@ -264,7 +318,7 @@ func (a *AdminUserController) UpdateUserQuota(c *fiber.Ctx) error {
 		updates["expires_at"] = input.ExpiresAt
 		quota.ExpiresAt = input.ExpiresAt
 	}
-	if input.ResetDaily {
+	if input.ResetDaily || input.ResetToday {
 		updates["used_today"] = 0
 		updates["last_reset_date"] = time.Now()
 		quota.UsedToday = 0
@@ -346,6 +400,7 @@ func (a *AdminUserController) ListSearchLogs(c *fiber.Ctx) error {
 	}
 
 	return c.JSON(fiber.Map{
+		"logs": logs,
 		"data": logs,
 		"pagination": fiber.Map{
 			"page":  page,

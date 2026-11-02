@@ -6,13 +6,15 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"math/rand"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
-	"regexp"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/chromedp/cdproto/page"
@@ -139,9 +141,193 @@ func (sh *StealthHarvester) CloseTabByID(cdpEndpoint, tabID string) {
 	}
 }
 
+// findCookiesFile locates the Chrome Cookies SQLite file inside a User Data directory.
+func findCookiesFile(userDataDir string) (string, os.FileInfo, bool) {
+	candidates := []string{
+		filepath.Join(userDataDir, `Default\Network\Cookies`),
+		filepath.Join(userDataDir, `Default\Cookies`),
+	}
+	for _, p := range candidates {
+		if info, err := os.Stat(p); err == nil && info.Size() > 0 {
+			return p, info, true
+		}
+	}
+	return "", nil, false
+}
+
+// isFileUnlocked verifies that a file can be opened for reading without a Windows sharing violation lock.
+func isFileUnlocked(filePath string) bool {
+	f, err := os.Open(filePath)
+	if err != nil {
+		return false
+	}
+	_ = f.Close()
+	return true
+}
+
+// dealerProfileExists returns true if C:\CarfaxDealerProfile already has a valid Local State and Cookies database.
+func dealerProfileExists() bool {
+	dst := `C:\CarfaxDealerProfile`
+	if _, err := os.Stat(filepath.Join(dst, "Local State")); err != nil {
+		return false
+	}
+	_, _, ok := findCookiesFile(dst)
+	return ok
+}
+
+// SyncProfileFromMainChrome safely copies the session cookies, preferences, and login state
+// from the Canada user's default Chrome (%LOCALAPPDATA%\Google\Chrome\User Data)
+// into C:\CarfaxDealerProfile WITHOUT ever overwriting newer worker cookies or corrupting Local State.
+func SyncProfileFromMainChrome(requireNewerAndUnlocked bool) error {
+	localAppData := os.Getenv("LOCALAPPDATA")
+	if localAppData == "" {
+		localAppData = filepath.Join(os.Getenv("USERPROFILE"), "AppData", "Local")
+	}
+	src := filepath.Join(localAppData, `Google\Chrome\User Data`)
+	dst := `C:\CarfaxDealerProfile`
+
+	if _, err := os.Stat(src); err != nil {
+		log.Printf("⚠️ Main Chrome User Data not found at %s: %v", src, err)
+		return err
+	}
+
+	srcCookiesPath, srcInfo, srcOk := findCookiesFile(src)
+	if !srcOk {
+		return fmt.Errorf("main Chrome cookies file not found")
+	}
+
+	// Never copy Local State if Main Chrome's Cookies file is locked by a running Main Chrome process,
+	// because overwriting Local State without Cookies mismatches the DPAPI encryption key!
+	if !isFileUnlocked(srcCookiesPath) {
+		log.Printf("ℹ️ [PROFILE-SYNC] Main Chrome Cookies file is currently locked by an open Chrome window; keeping existing C:\\CarfaxDealerProfile session intact.")
+		return fmt.Errorf("main Chrome cookies file is locked")
+	}
+
+	if requireNewerAndUnlocked {
+		if _, dstInfo, dstOk := findCookiesFile(dst); dstOk {
+			if !srcInfo.ModTime().After(dstInfo.ModTime()) {
+				log.Printf("ℹ️ [PROFILE-SYNC] C:\\CarfaxDealerProfile cookies are already newer than or equal to Main Chrome; preserving worker session.")
+				return fmt.Errorf("worker profile is already up to date")
+			}
+		}
+	}
+
+	log.Printf("🔄 [PROFILE-SYNC] Syncing newer unlocked cookies & login session from Main Chrome to %s...", dst)
+
+	// Use /XO (Exclude Older) instead of /IS /IT so we NEVER overwrite newer files in C:\CarfaxDealerProfile
+	cmd := exec.Command("robocopy",
+		src,
+		dst,
+		"/E", "/XO", "/R:1", "/W:1",
+		"/XD", "Cache", "Code Cache", "GPUCache", "ShaderCache", "GrShaderCache", "DawnCache", "Crashpad", "SwReporter", "Safe Browsing", "OptimizationGuidePredictionModels", "BrowserMetrics", "ComponentCRXCache",
+		"/XF", "*.tmp", "lockfile", "Singleton*",
+	)
+	cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: 0x08000000} // CREATE_NO_WINDOW: never flash terminal
+	_ = cmd.Run()
+	log.Printf("✅ [PROFILE-SYNC] Safe session & cookies sync completed!")
+	return nil
+}
+
+// killWorkerChromeOnly terminates only the Chrome instance bound to port 9222 without disturbing user's own Chrome.
+func killWorkerChromeOnly() {
+	cmdNetstat := exec.Command("cmd", "/c", "netstat -a -n -o | findstr 127.0.0.1:9222 | findstr LISTENING")
+	cmdNetstat.SysProcAttr = &syscall.SysProcAttr{CreationFlags: 0x08000000} // CREATE_NO_WINDOW
+	out, err := cmdNetstat.Output()
+	if err == nil {
+		lines := strings.Split(string(out), "\n")
+		for _, line := range lines {
+			fields := strings.Fields(line)
+			if len(fields) >= 5 {
+				pid := fields[len(fields)-1]
+				log.Printf("🛑 Terminating existing worker Chrome process (PID %s)...", pid)
+				cmdKill := exec.Command("taskkill", "/PID", pid, "/T")
+				cmdKill.SysProcAttr = &syscall.SysProcAttr{CreationFlags: 0x08000000}
+				_ = cmdKill.Run()
+			}
+		}
+	}
+}
+
+// RestartChromeWithFreshSync only restarts worker Chrome if Main Chrome has a newer, unlocked login session.
+// Otherwise it leaves the worker Chrome open so the user's login in C:\CarfaxDealerProfile is never lost!
+func (sh *StealthHarvester) RestartChromeWithFreshSync(cdpEndpoint string) error {
+	localAppData := os.Getenv("LOCALAPPDATA")
+	if localAppData == "" {
+		localAppData = filepath.Join(os.Getenv("USERPROFILE"), "AppData", "Local")
+	}
+	src := filepath.Join(localAppData, `Google\Chrome\User Data`)
+	dst := `C:\CarfaxDealerProfile`
+
+	srcCookiesPath, srcInfo, srcOk := findCookiesFile(src)
+	if !srcOk || !isFileUnlocked(srcCookiesPath) {
+		return fmt.Errorf("main Chrome session not unlocked for sync")
+	}
+	if _, dstInfo, dstOk := findCookiesFile(dst); dstOk {
+		if !srcInfo.ModTime().After(dstInfo.ModTime()) {
+			return fmt.Errorf("worker profile cookies are already newer")
+		}
+	}
+
+	killWorkerChromeOnly()
+	time.Sleep(1 * time.Second)
+	_ = SyncProfileFromMainChrome(true)
+	return sh.EnsureChromeRunning(cdpEndpoint)
+}
+
+// EnsureChromeRunning checks if Chrome CDP port 9222 is alive; if closed or crashed, it auto-launches it!
+func (sh *StealthHarvester) EnsureChromeRunning(cdpEndpoint string) error {
+	_, err := sh.ListOpenTabs(cdpEndpoint)
+	if err == nil {
+		return nil // Already running and healthy
+	}
+
+	log.Printf("⚠️ [AUTO-RECOVERY] Chrome is closed or disconnected on 9222. Respawning Chrome host automatically...")
+
+	// Preserve existing C:\CarfaxDealerProfile login & cookies! Only seed from Main Chrome if profile does not exist yet.
+	if !dealerProfileExists() {
+		_ = SyncProfileFromMainChrome(false)
+	}
+
+	chromePaths := []string{
+		`C:\Program Files\Google\Chrome\Application\chrome.exe`,
+		`C:\Program Files (x86)\Google\Chrome\Application\chrome.exe`,
+		filepath.Join(os.Getenv("LOCALAPPDATA"), `Google\Chrome\Application\chrome.exe`),
+	}
+
+	for _, cp := range chromePaths {
+		if _, stat := os.Stat(cp); stat == nil {
+			cmd := exec.Command(cp,
+				"--remote-debugging-port=9222",
+				"--remote-allow-origins=*",
+				"--user-data-dir=C:\\CarfaxDealerProfile",
+				"--disable-blink-features=AutomationControlled",
+				"--no-first-run",
+				"--no-default-browser-check",
+				"https://www.carfaxonline.com",
+			)
+			// Launch Chrome directly with zero CMD windows (Chrome is GUI so opens visible window)
+			cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: 0x08000000}
+			_ = cmd.Start()
+			break
+		}
+	}
+
+	// Wait up to 10 seconds for port 9222 to become available
+	for i := 0; i < 20; i++ {
+		time.Sleep(500 * time.Millisecond)
+		if _, checkErr := sh.ListOpenTabs(cdpEndpoint); checkErr == nil {
+			log.Printf("✅ [AUTO-RECOVERY SUCCESS] Chrome host respawned and connected on 9222!")
+			return nil
+		}
+	}
+
+	return fmt.Errorf("تعذر إعادة تشغيل كروم تلقائياً")
+}
+
 // FindCarfaxSearchTab finds the open carfaxonline.com tab, or falls back to the first visible page tab.
 // Never closes any user tabs.
 func (sh *StealthHarvester) FindCarfaxSearchTab(cdpEndpoint string) (*CDPTab, bool, error) {
+	_ = sh.EnsureChromeRunning(cdpEndpoint)
 	tabs, err := sh.ListOpenTabs(cdpEndpoint)
 	if err != nil {
 		return nil, false, err
@@ -401,9 +587,7 @@ func (sh *StealthHarvester) InspectBrowserState(parentCtx context.Context, cdpEn
 }
 
 // HarvestReport executes the strict One-Shot Or Freeze protocol on carfaxonline.com
-// using Two-Stage Progressive Delivery:
-//   - Stage 1 (Fast): Immediately extracts structured report data + lightweight HTML (~2s) and triggers onFastData so the user views the report right away in our design.
-//   - Stage 2 (Silent Background): Opens Printing Options -> Select All -> PrintToPDF (saves to C:\CarfaxReports\CARFAX_<VIN>.pdf) + inlines all CSS/Images and returns the full bundle.
+// with pure structured JSON extraction and adaptive human reading simulation.
 func (sh *StealthHarvester) HarvestReport(
 	parentCtx context.Context,
 	cdpEndpoint string,
@@ -411,12 +595,15 @@ func (sh *StealthHarvester) HarvestReport(
 	onProgress func(step, stepAr string, screenshot string),
 	onFastData func(fastRes *HarvestResult),
 ) *HarvestResult {
-	// 1. Pre-Flight Silent Inspection
+	// Auto-Recovery: Respawn Chrome if someone closed it before task arrived
+	_ = sh.EnsureChromeRunning(cdpEndpoint)
+
+	// 1. Pre-Flight Silent Inspection (lightweight DOM check only, zero screenshot overhead on normal path)
 	if onProgress != nil {
 		onProgress("pre_flight", "1/4 فحص أمان وجاهزية متصفح كندا (Pre-Flight Check)...", "")
 	}
 
-	state := sh.InspectBrowserState(parentCtx, cdpEndpoint, true)
+	state := sh.InspectBrowserState(parentCtx, cdpEndpoint, false)
 
 	if !state.ChromeConnected {
 		return &HarvestResult{
@@ -427,20 +614,32 @@ func (sh *StealthHarvester) HarvestReport(
 	}
 
 	if state.HasChallenge {
+		snapState := sh.InspectBrowserState(parentCtx, cdpEndpoint, true)
 		return &HarvestResult{
 			Success:          false,
 			ErrorCode:        "CAPTCHA_DETECTED",
 			ErrorMessage:     state.StatusMessage,
-			ScreenshotBase64: state.ScreenshotBase64,
+			ScreenshotBase64: snapState.ScreenshotBase64,
 		}
 	}
 
 	if state.IsLoginPage {
-		return &HarvestResult{
-			Success:          false,
-			ErrorCode:        "SESSION_EXPIRED",
-			ErrorMessage:     state.StatusMessage,
-			ScreenshotBase64: state.ScreenshotBase64,
+		log.Printf("🔒 [LOGIN DETECTED] Checking if Main Chrome has a newer unlocked session...")
+		if onProgress != nil {
+			onProgress("sync_session", "التحقق من جلسة تسجيل الدخول في متصفح كندا...", "")
+		}
+		if err := sh.RestartChromeWithFreshSync(cdpEndpoint); err == nil {
+			sh.randomDelay(2000, 3000)
+			state = sh.InspectBrowserState(parentCtx, cdpEndpoint, false)
+		}
+		if state.IsLoginPage {
+			snapState := sh.InspectBrowserState(parentCtx, cdpEndpoint, true)
+			return &HarvestResult{
+				Success:          false,
+				ErrorCode:        "SESSION_EXPIRED",
+				ErrorMessage:     "🔒 حساب carfaxonline.com يحتاج لتسجيل الدخول مرة واحدة في متصفح كروم على حاسبة كندا",
+				ScreenshotBase64: snapState.ScreenshotBase64,
+			}
 		}
 	}
 
@@ -451,25 +650,33 @@ func (sh *StealthHarvester) HarvestReport(
 			_ = chromedp.Run(navTabCtx, chromedp.Navigate("https://www.carfaxonline.com/"))
 			cleanupNav()
 			sh.randomDelay(2500, 3500)
-			state = sh.InspectBrowserState(parentCtx, cdpEndpoint, true)
+			state = sh.InspectBrowserState(parentCtx, cdpEndpoint, false)
 		}
 	}
 
 	if !state.CarfaxTabFound || state.IsLoginPage {
-		return &HarvestResult{
-			Success:          false,
-			ErrorCode:        "SESSION_EXPIRED",
-			ErrorMessage:     state.StatusMessage,
-			ScreenshotBase64: state.ScreenshotBase64,
+		if state.IsLoginPage {
+			_ = sh.RestartChromeWithFreshSync(cdpEndpoint)
+			state = sh.InspectBrowserState(parentCtx, cdpEndpoint, false)
+		}
+		if !state.CarfaxTabFound || state.IsLoginPage {
+			snapState := sh.InspectBrowserState(parentCtx, cdpEndpoint, true)
+			return &HarvestResult{
+				Success:          false,
+				ErrorCode:        "SESSION_EXPIRED",
+				ErrorMessage:     state.StatusMessage,
+				ScreenshotBase64: snapState.ScreenshotBase64,
+			}
 		}
 	}
 
 	if !state.VinInputFound || state.VinInputSelector == "" {
+		snapState := sh.InspectBrowserState(parentCtx, cdpEndpoint, true)
 		return &HarvestResult{
 			Success:          false,
 			ErrorCode:        "VIN_INPUT_NOT_FOUND",
 			ErrorMessage:     "توقف احترازي (One-Shot Protection): حقل إدخال الشاصي غير ظاهر في الصفحة الحالية داخل حاسبة كندا.",
-			ScreenshotBase64: state.ScreenshotBase64,
+			ScreenshotBase64: snapState.ScreenshotBase64,
 		}
 	}
 
@@ -477,10 +684,9 @@ func (sh *StealthHarvester) HarvestReport(
 	searchTab, _, err := sh.FindCarfaxSearchTab(cdpEndpoint)
 	if err != nil || searchTab == nil {
 		return &HarvestResult{
-			Success:          false,
-			ErrorCode:        "TAB_LOST",
-			ErrorMessage:     "فقد الاتصال بتبويب البحث قبل البدء مباشرة.",
-			ScreenshotBase64: state.ScreenshotBase64,
+			Success:      false,
+			ErrorCode:    "TAB_LOST",
+			ErrorMessage: "فقد الاتصال بتبويب البحث قبل البدء مباشرة.",
 		}
 	}
 
@@ -500,17 +706,16 @@ func (sh *StealthHarvester) HarvestReport(
 	tabCtx, cleanupSearchTab, attachErr := sh.attachExistingTab(parentCtx, cdpEndpoint, searchTab.ID)
 	if attachErr != nil {
 		return &HarvestResult{
-			Success:          false,
-			ErrorCode:        "TAB_LOST",
-			ErrorMessage:     fmt.Sprintf("تعذر الارتباط بتبويب البحث: %v", attachErr),
-			ScreenshotBase64: state.ScreenshotBase64,
+			Success:      false,
+			ErrorCode:    "TAB_LOST",
+			ErrorMessage: fmt.Sprintf("تعذر الارتباط بتبويب البحث: %v", attachErr),
 		}
 	}
 	defer cleanupSearchTab()
 
-	// 2. Human VIN Typing
+	// 2. Human VIN Typing (zero screenshot overhead on normal path)
 	if onProgress != nil {
-		onProgress("typing_vin", fmt.Sprintf("2/4 جاري كتابة رقم الشاصي (%s) بمحاكاة بشرية...", vin), state.ScreenshotBase64)
+		onProgress("typing_vin", fmt.Sprintf("2/4 جاري كتابة رقم الشاصي (%s) بمحاكاة بشرية...", vin), "")
 	}
 
 	if err := sh.typeVinHumanly(tabCtx, state.VinInputSelector, vin); err != nil {
@@ -883,20 +1088,17 @@ func (sh *StealthHarvester) extractFastReportData(tabCtx context.Context, vin st
         tables: tables,
         detailed_records: detailedRecords,
         accident_events: accidentEvents,
-        background_pending: true,
+        background_pending: false,
+        background_ready: true,
         analyzed_at: new Date().toISOString()
     };
-
-    // Create a lightweight clean HTML snapshot (no heavy scripts/SVGs) for immediate storage
-    const clone = document.documentElement.cloneNode(true);
-    clone.querySelectorAll('script, noscript, iframe, svg').forEach(el => el.remove());
 
     return {
         isError: false,
         errorMsg: '',
         title: title,
         summaryJson: JSON.stringify(summaryObj),
-        lightHtml: '<!DOCTYPE html>\n' + clone.outerHTML
+        lightHtml: ''
     };
 })();
 `, vin)
@@ -918,181 +1120,6 @@ func (sh *StealthHarvester) extractFastReportData(tabCtx context.Context, vin st
 	}
 
 	return out.SummaryJson, out.LightHtml, out.Title, false, "", nil
-}
-
-// prepareOfficialPrintModal safely clicks the top "Print" button on the Carfax report page,
-// selects all 4 report sections inside the "Printing Options" modal (CARFAX Report, History-Based Value,
-// Warranty Check, Buyback Guarantee), clicks the modal's "Print" button while intercepting window.print()
-// so no native OS print dialog blocks Chrome, and hides the modal overlay once the full sections render.
-func (sh *StealthHarvester) prepareOfficialPrintModal(
-	parentCtx context.Context,
-	cdpEndpoint string,
-	activeReportCtx context.Context,
-) (context.Context, context.CancelFunc, string) {
-	// Record tabs before clicking Print in case Carfax opens a separate print tab
-	tabsBeforePrint, _ := sh.ListOpenTabs(cdpEndpoint)
-	knownBeforePrint := make(map[string]bool)
-	for _, t := range tabsBeforePrint {
-		knownBeforePrint[t.ID] = true
-	}
-
-	// 1. Intercept window.print() on current document and any future document in this tab
-	overridePrintJS := `
-(() => {
-    window.__carfaxPrintTriggered = false;
-    window.print = function() {
-        window.__carfaxPrintTriggered = true;
-    };
-})();
-`
-	_ = chromedp.Run(activeReportCtx,
-		chromedp.ActionFunc(func(ctx context.Context) error {
-			_, _ = page.AddScriptToEvaluateOnNewDocument(overridePrintJS).Do(ctx)
-			return nil
-		}),
-		chromedp.Evaluate(overridePrintJS, nil),
-	)
-
-	// 2. Click the top-right "Print" button on the Carfax report page to open "Printing Options"
-	clickTopPrintJS := `
-(() => {
-    const els = Array.from(document.querySelectorAll('button, a, [role="button"]'));
-    for (const el of els) {
-        if (el.offsetParent === null) continue;
-        const txt = (el.innerText || el.textContent || '').trim();
-        const id = (el.id || '').toLowerCase();
-        const cls = (typeof el.className === 'string' ? el.className : '').toLowerCase();
-        if (txt === 'Print' || txt.includes('Print') || id.includes('print') || cls.includes('print-btn') || cls.includes('print-button')) {
-            el.click();
-            return true;
-        }
-    }
-    return false;
-})();
-`
-	var clickedTopPrint bool
-	if err := chromedp.Run(activeReportCtx, chromedp.Evaluate(clickTopPrintJS, &clickedTopPrint)); err != nil || !clickedTopPrint {
-		return activeReportCtx, nil, ""
-	}
-
-	// Wait 1.3s to 1.9s like a human for the "Printing Options" modal to appear
-	sh.randomDelay(1300, 1900)
-
-	// 3. In "Printing Options" modal: click "Select All" AND ensure every checkbox is checked
-	selectAllOptionsJS := `
-(() => {
-    const allContainers = Array.from(document.querySelectorAll('[role="dialog"], [class*="modal" i], [class*="dialog" i], div'));
-    let modal = null;
-    for (const d of allContainers) {
-        if (d.offsetParent === null) continue;
-        const t = (d.innerText || '');
-        if ((t.includes('Printing Options') || t.includes('Print Selected Reports')) && t.includes('Cancel')) {
-            modal = d;
-        }
-    }
-    const root = modal || document;
-
-    // Click "Select All" if present and visible
-    const links = Array.from(root.querySelectorAll('a, button, span, [role="button"]'));
-    for (const l of links) {
-        const txt = (l.innerText || l.textContent || '').trim().toLowerCase();
-        if (txt === 'select all' && l.offsetParent !== null) {
-            l.click();
-            break;
-        }
-    }
-
-    // Ensure all checkboxes inside the modal (CARFAX Report, History-Based Value, Warranty Check, Buyback Guarantee) are checked
-    const checkboxes = Array.from(root.querySelectorAll('input[type="checkbox"]'));
-    let checkedCount = 0;
-    for (const cb of checkboxes) {
-        const labelText = ((cb.closest('label') ? cb.closest('label').innerText : '') || (cb.parentElement ? cb.parentElement.innerText : '') || '').toLowerCase();
-        if (labelText.includes('display carfax in online listings')) {
-            continue;
-        }
-        if (!cb.checked) {
-            cb.click();
-        }
-        if (cb.checked) {
-            checkedCount++;
-        }
-    }
-    return checkedCount;
-})();
-`
-	var checkedCount int
-	_ = chromedp.Run(activeReportCtx, chromedp.Evaluate(selectAllOptionsJS, &checkedCount))
-	sh.randomDelay(500, 850)
-
-	// 4. Click the blue "Print" button inside the "Printing Options" modal
-	clickModalPrintJS := `
-(() => {
-    const allContainers = Array.from(document.querySelectorAll('[role="dialog"], [class*="modal" i], [class*="dialog" i], div'));
-    let modal = null;
-    for (const d of allContainers) {
-        if (d.offsetParent === null) continue;
-        const t = (d.innerText || '');
-        if ((t.includes('Printing Options') || t.includes('Print Selected Reports')) && t.includes('Cancel')) {
-            modal = d;
-        }
-    }
-    const root = modal || document;
-    const buttons = Array.from(root.querySelectorAll('button, input[type="button"], input[type="submit"], a[ role="button" ]'));
-    let targetBtn = null;
-    for (const b of buttons) {
-        if (b.offsetParent === null) continue;
-        const txt = (b.innerText || b.value || b.textContent || '').trim();
-        if (txt === 'Print') {
-            targetBtn = b;
-        }
-    }
-    if (targetBtn) {
-        targetBtn.click();
-        return true;
-    }
-    return false;
-})();
-`
-	var clickedModalPrint bool
-	_ = chromedp.Run(activeReportCtx, chromedp.Evaluate(clickModalPrintJS, &clickedModalPrint))
-
-	// Wait 2.6s to 3.6s for Carfax to assemble & render all 4 selected sections (or open a print tab)
-	sh.randomDelay(2600, 3600)
-
-	// 5. Check if clicking Print in the modal opened a brand-new print tab
-	tabsAfterPrint, _ := sh.ListOpenTabs(cdpEndpoint)
-	for i := range tabsAfterPrint {
-		t := tabsAfterPrint[i]
-		if !knownBeforePrint[t.ID] && t.URL != "about:blank" {
-			if pCtx, pCleanup, pErr := sh.attachExistingTab(parentCtx, cdpEndpoint, t.ID); pErr == nil {
-				_ = chromedp.Run(pCtx, chromedp.Evaluate(overridePrintJS, nil))
-				sh.randomDelay(1500, 2200)
-				return pCtx, pCleanup, t.ID
-			}
-		}
-	}
-
-	// 6. Hide any remaining "Printing Options" modal dialog / backdrop so the report & PDF are 100% unobstructed
-	hideModalJS := `
-(() => {
-    const allContainers = Array.from(document.querySelectorAll('[role="dialog"], [class*="modal" i], [class*="dialog" i], [class*="backdrop" i], [class*="overlay" i]'));
-    for (const el of allContainers) {
-        const t = (el.innerText || '');
-        const cls = (typeof el.className === 'string' ? el.className : '').toLowerCase();
-        if (t.includes('Printing Options') || t.includes('Print Selected Reports') || cls.includes('backdrop') || cls.includes('modal-overlay') || el.getAttribute('role') === 'dialog') {
-            el.style.setProperty('display', 'none', 'important');
-            el.style.setProperty('visibility', 'hidden', 'important');
-        }
-    }
-    if (document.body) {
-        document.body.style.overflow = 'visible';
-    }
-})();
-`
-	_ = chromedp.Run(activeReportCtx, chromedp.Evaluate(hideModalJS, nil))
-	sh.randomDelay(300, 500)
-
-	return activeReportCtx, nil, ""
 }
 
 // typeVinHumanly focuses the VIN input, clears it, types the 17 characters with human rhythm, and verifies the value
@@ -1222,346 +1249,4 @@ func (sh *StealthHarvester) simulateAdaptiveHumanReading(tabCtx context.Context)
 	// Always smooth scroll back towards top before closing
 	_ = chromedp.Run(tabCtx, chromedp.Evaluate(`window.scrollTo({ top: 0, behavior: 'smooth' });`, nil))
 	sh.randomDelay(400, 750)
-}
-
-// extractClonedReportHTML clones the document in memory without modifying the live page,
-// inlines all loaded CSS stylesheets and images from Chrome's memory cache (bypassing geo-blocks),
-// and embeds the official native Chrome PrintToPDF output.
-func (sh *StealthHarvester) extractClonedReportHTML(tabCtx context.Context, vin string) (string, string, bool, string, error) {
-	extractJS := `
-(() => {
-    const bodyText = (document.body ? document.body.innerText : '');
-    const lowerText = bodyText.toLowerCase();
-
-    // Check if Carfax returned an invalid VIN or no record message on the search page
-    if (lowerText.includes('invalid vin') || lowerText.includes('not a valid vin') || lowerText.includes('no records found for this vin')) {
-        return {
-            html: '',
-            title: '',
-            isError: true,
-            errorMsg: 'أفاد موقع كارفاكس أن رقم الشاصي هذا غير صحيح أو لا توجد له سجلات في قاعدة بيانات كارفاكس.'
-        };
-    }
-
-    // Clone the entire document in memory so the live page is NEVER touched
-    const clone = document.documentElement.cloneNode(true);
-
-    // 1. Remove scripts, noscript, iframes, and <picture><source> tags from the clone
-    clone.querySelectorAll('script, noscript, iframe, picture source').forEach(el => el.remove());
-
-    // 2. Sync every cloned <img> src to the exact currentSrc loaded by Chrome in the live DOM
-    const liveImgs = Array.from(document.querySelectorAll('img'));
-    const cloneImgs = Array.from(clone.querySelectorAll('img'));
-    const origin = window.location.origin;
-    for (let i = 0; i < cloneImgs.length; i++) {
-        const cImg = cloneImgs[i];
-        const lImg = liveImgs[i];
-        cImg.removeAttribute('srcset');
-        if (lImg && lImg.currentSrc) {
-            cImg.setAttribute('src', lImg.currentSrc);
-        } else {
-            const src = cImg.getAttribute('src');
-            if (src && src.startsWith('/')) {
-                cImg.setAttribute('src', origin + src);
-            }
-        }
-    }
-
-    // 3. Also convert any relative stylesheet links to absolute URLs
-    clone.querySelectorAll('link[rel="stylesheet"]').forEach(link => {
-        const href = link.getAttribute('href');
-        if (href && href.startsWith('/')) {
-            link.setAttribute('href', origin + href);
-        }
-    });
-
-    // 4. Extract any accessible runtime CSSOM rules from document.styleSheets
-    try {
-        let cssomText = '';
-        for (const sheet of Array.from(document.styleSheets)) {
-            try {
-                if (sheet.ownerNode && sheet.ownerNode.tagName === 'STYLE' && sheet.ownerNode.textContent.trim().length > 0) {
-                    continue;
-                }
-                const rules = Array.from(sheet.cssRules || []);
-                if (rules.length > 0) {
-                    cssomText += rules.map(r => r.cssText).join('\n') + '\n';
-                }
-            } catch (e) {}
-        }
-        if (cssomText.length > 0) {
-            const st = document.createElement('style');
-            st.setAttribute('id', 'carfax-runtime-cssom');
-            st.textContent = cssomText;
-            const head = clone.querySelector('head');
-            if (head) head.appendChild(st);
-        }
-    } catch (e) {}
-
-    // 5. Extract vehicle title (Year Make Model)
-    let title = document.title || '';
-    const titleSelectors = [
-        '.vehicle-information-year-make-model',
-        '.header-vehicle-name',
-        '[data-testid*="vehicle" i]',
-        'h1',
-        'h2.vehicle-title',
-        '.vehicle-header h1'
-    ];
-    for (const sel of titleSelectors) {
-        const el = document.querySelector(sel);
-        if (el && el.innerText && el.innerText.trim().length > 3) {
-            title = el.innerText.trim().replace(/\s+/g, ' ');
-            break;
-        }
-    }
-
-    return {
-        html: '<!DOCTYPE html>\n' + clone.outerHTML,
-        title: title,
-        isError: false,
-        errorMsg: ''
-    };
-})();
-`
-	var out struct {
-		HTML     string `json:"html"`
-		Title    string `json:"title"`
-		IsError  bool   `json:"isError"`
-		ErrorMsg string `json:"errorMsg"`
-	}
-
-	if err := chromedp.Run(tabCtx, chromedp.Evaluate(extractJS, &out)); err != nil {
-		return "", "", false, "", err
-	}
-
-	if out.IsError {
-		return "", "", true, out.ErrorMsg, nil
-	}
-
-	if len(out.HTML) < 400 {
-		return "", "", true, "محتوى الصفحة المستخرج فارغ أو لم يكتمل تحميل التقرير في حاسبة كندا.", nil
-	}
-
-	if out.Title == "" {
-		out.Title = fmt.Sprintf("CARFAX Vehicle History Report (%s)", vin)
-	}
-
-	// Inline all CSS stylesheets and images from Chrome's C++ cache + attach official PrintToPDF
-	out.HTML = sh.bundleSelfContainedReportAndPDF(tabCtx, out.HTML, vin)
-
-	return out.HTML, out.Title, false, "", nil
-}
-
-// bundleSelfContainedReportAndPDF reads all cached CSS stylesheets and images directly from
-// Chrome's C++ memory cache via CDP (Page.getResourceTree / Page.getResourceContent) with zero
-// extra network requests, inlines them into the HTML, saves the official multi-page PDF locally
-// on the Canada PC (C:\CarfaxReports\CARFAX_<VIN>.pdf), and appends it to the HTML payload.
-func (sh *StealthHarvester) bundleSelfContainedReportAndPDF(tabCtx context.Context, rawHTML string, vin string) string {
-	var inlinedCSSBuilder strings.Builder
-	imageDataURIs := make(map[string]string)
-	var pdfBase64 string
-
-	_ = chromedp.Run(tabCtx, chromedp.ActionFunc(func(ctx context.Context) error {
-		_ = page.Enable().Do(ctx)
-
-		tree, err := page.GetResourceTree().Do(ctx)
-		if err == nil && tree != nil && tree.Frame != nil {
-			frameID := tree.Frame.ID
-			for _, res := range tree.Resources {
-				if res == nil || res.Failed || res.Canceled || res.URL == "" {
-					continue
-				}
-				lowerURL := strings.ToLower(res.URL)
-				lowerMime := strings.ToLower(res.MimeType)
-
-				// 1. Inline CSS Stylesheets (e.g. vhr.css)
-				if string(res.Type) == "Stylesheet" || strings.Contains(lowerMime, "css") || strings.Contains(lowerURL, ".css") {
-					contentBytes, cErr := page.GetResourceContent(frameID, res.URL).Do(ctx)
-					if cErr == nil && len(contentBytes) > 0 {
-						inlinedCSSBuilder.WriteString("\n/* Inlined from " + res.URL + " */\n")
-						inlinedCSSBuilder.Write(contentBytes)
-						inlinedCSSBuilder.WriteString("\n")
-					}
-					continue
-				}
-
-				// 2. Inline Images (SVG, PNG, GIF, WebP, AVIF)
-				if string(res.Type) == "Image" || strings.HasPrefix(lowerMime, "image/") ||
-					strings.HasSuffix(lowerURL, ".svg") || strings.HasSuffix(lowerURL, ".png") ||
-					strings.HasSuffix(lowerURL, ".gif") || strings.HasSuffix(lowerURL, ".webp") {
-					contentBytes, cErr := page.GetResourceContent(frameID, res.URL).Do(ctx)
-					if cErr == nil && len(contentBytes) > 0 {
-						mime := res.MimeType
-						if mime == "" {
-							switch {
-							case strings.Contains(lowerURL, ".svg"):
-								mime = "image/svg+xml"
-							case strings.Contains(lowerURL, ".gif"):
-								mime = "image/gif"
-							case strings.Contains(lowerURL, ".webp"):
-								mime = "image/webp"
-							case strings.Contains(lowerURL, ".avif"):
-								mime = "image/avif"
-							default:
-								mime = "image/png"
-							}
-						}
-						b64Data := base64.StdEncoding.EncodeToString(contentBytes)
-						imageDataURIs[res.URL] = "data:" + mime + ";base64," + b64Data
-					}
-				}
-			}
-		}
-
-		// 3. Generate Official Native Chrome PrintToPDF & save locally to C:\CarfaxReports\CARFAX_<VIN>.pdf
-		pdfBuf, _, pdfErr := page.PrintToPDF().
-			WithPrintBackground(true).
-			WithPreferCSSPageSize(true).
-			Do(ctx)
-		if pdfErr == nil && len(pdfBuf) > 0 {
-			pdfBase64 = base64.StdEncoding.EncodeToString(pdfBuf)
-			saveDir := `C:\CarfaxReports`
-			if mkErr := os.MkdirAll(saveDir, 0755); mkErr == nil {
-				cleanVin := strings.ToUpper(strings.TrimSpace(vin))
-				if cleanVin == "" {
-					cleanVin = "REPORT"
-				}
-				pdfPath := filepath.Join(saveDir, fmt.Sprintf("CARFAX_%s.pdf", cleanVin))
-				if wErr := os.WriteFile(pdfPath, pdfBuf, 0644); wErr == nil {
-					fmt.Printf("[💾] Saved Official PDF (%d KB) to %s\n", len(pdfBuf)/1024, pdfPath)
-				}
-			}
-		}
-
-		return nil
-	}))
-
-	// Fallback: if any <link rel="stylesheet"> was not in GetResourceContent, fetch once on Canada PC and cache in RAM
-	linkRe := regexp.MustCompile(`(?i)<link[^>]+rel=["']stylesheet["'][^>]*href=["'](https?://[^"']+)["'][^>]*>|<link[^>]+href=["'](https?://[^"']+)["'][^>]*rel=["']stylesheet["'][^>]*>`)
-	linkMatches := linkRe.FindAllStringSubmatch(rawHTML, -1)
-	for _, m := range linkMatches {
-		cssURL := m[1]
-		if cssURL == "" {
-			cssURL = m[2]
-		}
-		cssURL = strings.ReplaceAll(cssURL, "&amp;", "&")
-		if cssURL == "" || strings.Contains(cssURL, "fonts.googleapis.com") {
-			continue
-		}
-		if !strings.Contains(inlinedCSSBuilder.String(), cssURL) {
-			if bodyBytes, _, err := sh.fetchAssetCached(cssURL); err == nil && len(bodyBytes) > 0 {
-				inlinedCSSBuilder.WriteString("\n/* Inlined fallback from " + cssURL + " */\n")
-				inlinedCSSBuilder.Write(bodyBytes)
-				inlinedCSSBuilder.WriteString("\n")
-			}
-		}
-	}
-
-	// Inject all captured CSS directly into <head> and remove external carfax <link> tags so browsers outside Canada don't hang waiting on blocked CDNs
-	if inlinedCSSBuilder.Len() > 0 {
-		carfaxLinkRe := regexp.MustCompile(`(?i)<link[^>]+href=["']https?://[^"']*carfax[^"']*["'][^>]*>`)
-		rawHTML = carfaxLinkRe.ReplaceAllString(rawHTML, "")
-		styleBlock := `<style id="carfax-cdp-inlined-css">` + inlinedCSSBuilder.String() + `</style>`
-		if strings.Contains(rawHTML, "</head>") {
-			rawHTML = strings.Replace(rawHTML, "</head>", styleBlock+"</head>", 1)
-		} else {
-			rawHTML = styleBlock + rawHTML
-		}
-	}
-
-	// Replace image URLs (both raw and HTML-entity encoded &amp;) with Base64 data URIs
-	for origURL, dataURI := range imageDataURIs {
-		rawHTML = strings.ReplaceAll(rawHTML, `"`+origURL+`"`, `"`+dataURI+`"`)
-		rawHTML = strings.ReplaceAll(rawHTML, `'`+origURL+`'`, `'`+dataURI+`'`)
-		escapedURL := strings.ReplaceAll(origURL, "&", "&amp;")
-		if escapedURL != origURL {
-			rawHTML = strings.ReplaceAll(rawHTML, `"`+escapedURL+`"`, `"`+dataURI+`"`)
-			rawHTML = strings.ReplaceAll(rawHTML, `'`+escapedURL+`'`, `'`+dataURI+`'`)
-		}
-	}
-
-	// Fallback for any remaining <img src="https://..."> not in GetResourceContent
-	imgRe := regexp.MustCompile(`(?i)<img[^>]+src=["'](https?://[^"']+)["']`)
-	imgMatches := imgRe.FindAllStringSubmatch(rawHTML, -1)
-	seenImgs := make(map[string]bool)
-	for _, m := range imgMatches {
-		rawImgURL := m[1]
-		cleanImgURL := strings.ReplaceAll(rawImgURL, "&amp;", "&")
-		if seenImgs[cleanImgURL] {
-			continue
-		}
-		seenImgs[cleanImgURL] = true
-		if bodyBytes, mime, err := sh.fetchAssetCached(cleanImgURL); err == nil && len(bodyBytes) > 0 {
-			dataURI := "data:" + mime + ";base64," + base64.StdEncoding.EncodeToString(bodyBytes)
-			rawHTML = strings.ReplaceAll(rawHTML, `"`+rawImgURL+`"`, `"`+dataURI+`"`)
-			rawHTML = strings.ReplaceAll(rawHTML, `'`+rawImgURL+`'`, `'`+dataURI+`'`)
-			rawHTML = strings.ReplaceAll(rawHTML, `"`+cleanImgURL+`"`, `"`+dataURI+`"`)
-		}
-	}
-
-	// Embed the official native PDF at the end of </body> so the platform can download/print it 1:1
-	if pdfBase64 != "" {
-		pdfTag := `<script id="carfix-official-pdf" type="application/pdf-base64">` + pdfBase64 + `</script>`
-		if strings.Contains(rawHTML, "</body>") {
-			rawHTML = strings.Replace(rawHTML, "</body>", pdfTag+"</body>", 1)
-		} else {
-			rawHTML = rawHTML + pdfTag
-		}
-	}
-
-	return rawHTML
-}
-
-type cachedAsset struct {
-	data []byte
-	mime string
-}
-
-func (sh *StealthHarvester) fetchAssetCached(assetURL string) ([]byte, string, error) {
-	if val, ok := sh.assetCache.Load(assetURL); ok {
-		ca := val.(cachedAsset)
-		return ca.data, ca.mime, nil
-	}
-	req, err := http.NewRequest("GET", assetURL, nil)
-	if err != nil {
-		return nil, "", err
-	}
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
-	req.Header.Set("Referer", "https://www.carfaxonline.com/")
-	resp, err := sh.httpClient.Do(req)
-	if err != nil {
-		return nil, "", err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
-		return nil, "", fmt.Errorf("status %d", resp.StatusCode)
-	}
-	data, err := io.ReadAll(resp.Body)
-	if err != nil || len(data) == 0 {
-		return nil, "", fmt.Errorf("empty body")
-	}
-	mime := resp.Header.Get("Content-Type")
-	if idx := strings.Index(mime, ";"); idx != -1 {
-		mime = strings.TrimSpace(mime[:idx])
-	}
-	lowerURL := strings.ToLower(assetURL)
-	if mime == "" || mime == "application/octet-stream" {
-		switch {
-		case strings.Contains(lowerURL, ".svg"):
-			mime = "image/svg+xml"
-		case strings.Contains(lowerURL, ".gif"):
-			mime = "image/gif"
-		case strings.Contains(lowerURL, ".webp"):
-			mime = "image/webp"
-		case strings.Contains(lowerURL, ".avif"):
-			mime = "image/avif"
-		case strings.Contains(lowerURL, ".css"):
-			mime = "text/css"
-		default:
-			mime = "image/png"
-		}
-	}
-	sh.assetCache.Store(assetURL, cachedAsset{data: data, mime: mime})
-	return data, mime, nil
 }
