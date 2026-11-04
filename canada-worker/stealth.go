@@ -839,6 +839,24 @@ func (sh *StealthHarvester) HarvestReport(
 	}
 	sh.simulateAdaptiveHumanReading(activeReportCtx)
 
+	// =========================================================================
+	// 🖨️ OFFICIAL CARFAX PRINT MODAL (Select All Sections & Native PDF)
+	// =========================================================================
+	if onProgress != nil {
+		onProgress("generating_pdf", "جاري تجهيز تقرير الطباعة الرسمي من كارفاكس...", "")
+	}
+	finalReportCtx, cleanupPrintTab, printPopupTabID := sh.prepareOfficialPrintModal(parentCtx, cdpEndpoint, activeReportCtx)
+	if cleanupPrintTab != nil {
+		defer cleanupPrintTab()
+	}
+
+	officialPdfBase64 := sh.captureOfficialPrintPDF(finalReportCtx, vin)
+
+	// Clean up any extra print popup tab if Carfax opened one
+	if printPopupTabID != "" && (reportTab == nil || printPopupTabID != reportTab.ID) && printPopupTabID != searchTab.ID {
+		sh.CloseTabByID(cdpEndpoint, printPopupTabID)
+	}
+
 	// Clean up: close the report tab immediately and cleanly
 	if openedNewTab && reportTab != nil {
 		sh.CloseTabByID(cdpEndpoint, reportTab.ID)
@@ -850,11 +868,16 @@ func (sh *StealthHarvester) HarvestReport(
 		}
 	}
 
-	// On SUCCESS: Return pure structured JSON with zero heavy HTML or Base64 screenshots
+	rawHtmlWithPdf := ""
+	if officialPdfBase64 != "" {
+		rawHtmlWithPdf = `<script id="carfix-official-pdf" type="application/pdf-base64">` + officialPdfBase64 + `</script>`
+	}
+
+	// On SUCCESS: Return structured JSON + Official Carfax PDF
 	return &HarvestResult{
 		Success:          true,
 		VehicleTitle:     fastTitle,
-		RawHtmlEn:        "", // No heavy HTML needed; our 1:1 local template renders instantly
+		RawHtmlEn:        rawHtmlWithPdf,
 		FastSummaryJson:  fastSummaryJson,
 		ScreenshotBase64: "", // No screenshot in success state to save CPU and RAM
 	}
@@ -1249,4 +1272,210 @@ func (sh *StealthHarvester) simulateAdaptiveHumanReading(tabCtx context.Context)
 	// Always smooth scroll back towards top before closing
 	_ = chromedp.Run(tabCtx, chromedp.Evaluate(`window.scrollTo({ top: 0, behavior: 'smooth' });`, nil))
 	sh.randomDelay(400, 750)
+}
+
+// prepareOfficialPrintModal clicks the top "Print" button on the Carfax report page,
+// opens the "Printing Options" modal, ensures all section checkboxes are selected,
+// clicks the modal's "Print" button while intercepting window.print() so no native OS print dialog blocks Chrome,
+// and hides the modal overlay once the full sections render.
+func (sh *StealthHarvester) prepareOfficialPrintModal(
+	parentCtx context.Context,
+	cdpEndpoint string,
+	activeReportCtx context.Context,
+) (context.Context, context.CancelFunc, string) {
+	// Record tabs before clicking Print in case Carfax opens a separate print tab
+	tabsBeforePrint, _ := sh.ListOpenTabs(cdpEndpoint)
+	knownBeforePrint := make(map[string]bool)
+	for _, t := range tabsBeforePrint {
+		knownBeforePrint[t.ID] = true
+	}
+
+	// 1. Intercept window.print() on current document and any future document in this tab
+	overridePrintJS := `
+(() => {
+    window.__carfaxPrintTriggered = false;
+    window.print = function() {
+        window.__carfaxPrintTriggered = true;
+    };
+})();
+`
+	_ = chromedp.Run(activeReportCtx,
+		chromedp.ActionFunc(func(ctx context.Context) error {
+			_, _ = page.AddScriptToEvaluateOnNewDocument(overridePrintJS).Do(ctx)
+			return nil
+		}),
+		chromedp.Evaluate(overridePrintJS, nil),
+	)
+
+	// 2. Click the top-right "Print" button on the Carfax report page to open "Printing Options"
+	clickTopPrintJS := `
+(() => {
+    const els = Array.from(document.querySelectorAll('button, a, [role="button"]'));
+    for (const el of els) {
+        if (el.offsetParent === null) continue;
+        const txt = (el.innerText || el.textContent || '').trim();
+        const id = (el.id || '').toLowerCase();
+        const cls = (typeof el.className === 'string' ? el.className : '').toLowerCase();
+        if (txt === 'Print' || txt.includes('Print') || id.includes('print') || cls.includes('print-btn') || cls.includes('print-button')) {
+            el.click();
+            return true;
+        }
+    }
+    return false;
+})();
+`
+	var clickedTopPrint bool
+	if err := chromedp.Run(activeReportCtx, chromedp.Evaluate(clickTopPrintJS, &clickedTopPrint)); err != nil || !clickedTopPrint {
+		return activeReportCtx, nil, ""
+	}
+
+	// Wait 1.3s to 1.9s like a human for the "Printing Options" modal to appear
+	sh.randomDelay(1300, 1900)
+
+	// 3. In "Printing Options" modal: click "Select All" AND ensure every checkbox is checked
+	selectAllOptionsJS := `
+(() => {
+    const allContainers = Array.from(document.querySelectorAll('[role="dialog"], [class*="modal" i], [class*="dialog" i], div'));
+    let modal = null;
+    for (const d of allContainers) {
+        if (d.offsetParent === null) continue;
+        const t = (d.innerText || '');
+        if ((t.includes('Printing Options') || t.includes('Print Selected Reports')) && t.includes('Cancel')) {
+            modal = d;
+        }
+    }
+    const root = modal || document;
+
+    // Click "Select All" if present and visible
+    const links = Array.from(root.querySelectorAll('a, button, span, [role="button"]'));
+    for (const l of links) {
+        const txt = (l.innerText || l.textContent || '').trim().toLowerCase();
+        if (txt === 'select all' && l.offsetParent !== null) {
+            l.click();
+            break;
+        }
+    }
+
+    // Ensure all checkboxes inside the modal (CARFAX Report, History-Based Value, Warranty Check, Buyback Guarantee) are checked
+    const checkboxes = Array.from(root.querySelectorAll('input[type="checkbox"]'));
+    let checkedCount = 0;
+    for (const cb of checkboxes) {
+        const labelText = ((cb.closest('label') ? cb.closest('label').innerText : '') || (cb.parentElement ? cb.parentElement.innerText : '') || '').toLowerCase();
+        if (labelText.includes('display carfax in online listings')) {
+            continue;
+        }
+        if (!cb.checked) {
+            cb.click();
+        }
+        if (cb.checked) {
+            checkedCount++;
+        }
+    }
+    return checkedCount;
+})();
+`
+	var checkedCount int
+	_ = chromedp.Run(activeReportCtx, chromedp.Evaluate(selectAllOptionsJS, &checkedCount))
+	sh.randomDelay(500, 850)
+
+	// 4. Click the blue "Print" button inside the "Printing Options" modal
+	clickModalPrintJS := `
+(() => {
+    const allContainers = Array.from(document.querySelectorAll('[role="dialog"], [class*="modal" i], [class*="dialog" i], div'));
+    let modal = null;
+    for (const d of allContainers) {
+        if (d.offsetParent === null) continue;
+        const t = (d.innerText || '');
+        if ((t.includes('Printing Options') || t.includes('Print Selected Reports')) && t.includes('Cancel')) {
+            modal = d;
+        }
+    }
+    const root = modal || document;
+    const buttons = Array.from(root.querySelectorAll('button, input[type="button"], input[type="submit"], a[role="button"]'));
+    let targetBtn = null;
+    for (const b of buttons) {
+        if (b.offsetParent === null) continue;
+        const txt = (b.innerText || b.value || b.textContent || '').trim();
+        if (txt === 'Print') {
+            targetBtn = b;
+        }
+    }
+    if (targetBtn) {
+        targetBtn.click();
+        return true;
+    }
+    return false;
+})();
+`
+	var clickedModalPrint bool
+	_ = chromedp.Run(activeReportCtx, chromedp.Evaluate(clickModalPrintJS, &clickedModalPrint))
+
+	// Wait 2.6s to 3.6s for Carfax to assemble & render all 4 selected sections (or open a print tab)
+	sh.randomDelay(2600, 3600)
+
+	// 5. Check if clicking Print in the modal opened a brand-new print tab
+	tabsAfterPrint, _ := sh.ListOpenTabs(cdpEndpoint)
+	for i := range tabsAfterPrint {
+		t := tabsAfterPrint[i]
+		if !knownBeforePrint[t.ID] && t.URL != "about:blank" {
+			if pCtx, pCleanup, pErr := sh.attachExistingTab(parentCtx, cdpEndpoint, t.ID); pErr == nil {
+				_ = chromedp.Run(pCtx, chromedp.Evaluate(overridePrintJS, nil))
+				sh.randomDelay(1500, 2200)
+				return pCtx, pCleanup, t.ID
+			}
+		}
+	}
+
+	// 6. Hide any remaining "Printing Options" modal dialog / backdrop so the report & PDF are 100% unobstructed
+	hideModalJS := `
+(() => {
+    const allContainers = Array.from(document.querySelectorAll('[role="dialog"], [class*="modal" i], [class*="dialog" i], [class*="backdrop" i], [class*="overlay" i]'));
+    for (const el of allContainers) {
+        const t = (el.innerText || '');
+        const cls = (typeof el.className === 'string' ? el.className : '').toLowerCase();
+        if (t.includes('Printing Options') || t.includes('Print Selected Reports') || cls.includes('backdrop') || cls.includes('modal-overlay') || el.getAttribute('role') === 'dialog') {
+            el.style.setProperty('display', 'none', 'important');
+            el.style.setProperty('visibility', 'hidden', 'important');
+        }
+    }
+    if (document.body) {
+        document.body.style.overflow = 'visible';
+    }
+})();
+`
+	_ = chromedp.Run(activeReportCtx, chromedp.Evaluate(hideModalJS, nil))
+	sh.randomDelay(300, 500)
+
+	return activeReportCtx, nil, ""
+}
+
+// captureOfficialPrintPDF captures the full 4-section Carfax report via Chrome's native Page.printToPDF
+// and saves a local copy in C:\CarfaxReports\CARFAX_<VIN>.pdf
+func (sh *StealthHarvester) captureOfficialPrintPDF(tabCtx context.Context, vin string) string {
+	var pdfBase64 string
+	_ = chromedp.Run(tabCtx, chromedp.ActionFunc(func(ctx context.Context) error {
+		pdfBuf, _, pdfErr := page.PrintToPDF().
+			WithPrintBackground(true).
+			WithPreferCSSPageSize(true).
+			Do(ctx)
+		if pdfErr == nil && len(pdfBuf) > 0 {
+			pdfBase64 = base64.StdEncoding.EncodeToString(pdfBuf)
+			saveDir := `C:\CarfaxReports`
+			if mkErr := os.MkdirAll(saveDir, 0755); mkErr == nil {
+				cleanVin := strings.ToUpper(strings.TrimSpace(vin))
+				if cleanVin == "" {
+					cleanVin = "REPORT"
+				}
+				pdfPath := filepath.Join(saveDir, fmt.Sprintf("CARFAX_%s.pdf", cleanVin))
+				if wErr := os.WriteFile(pdfPath, pdfBuf, 0644); wErr == nil {
+					log.Printf("[💾] Saved Official Carfax PDF (%d KB) to %s", len(pdfBuf)/1024, pdfPath)
+				}
+			}
+		} else if pdfErr != nil {
+			log.Printf("⚠️ [PDF CAPTURE WARNING] PrintToPDF error: %v", pdfErr)
+		}
+		return nil
+	}))
+
+	return pdfBase64
 }

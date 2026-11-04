@@ -63,7 +63,21 @@ export default function ReportView() {
   }, [report?.summary_json])
 
   const handlePrint = () => {
-    window.print()
+    if (!vin) return
+    const token = localStorage.getItem('carfix_token')
+    const pdfUrl = `/api/reports/${encodeURIComponent(vin)}/pdf${token ? `?token=${encodeURIComponent(token)}` : ''}`
+    
+    // Direct official download / open in new tab
+    const win = window.open(pdfUrl, '_blank')
+    if (!win) {
+      // Fallback if popup blocked: create temporary hidden anchor tag
+      const a = document.createElement('a')
+      a.href = pdfUrl
+      a.download = `CARFAX_${vin}.pdf`
+      document.body.appendChild(a)
+      a.click()
+      document.body.removeChild(a)
+    }
   }
 
   return (
