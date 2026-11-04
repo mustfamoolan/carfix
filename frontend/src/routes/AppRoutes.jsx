@@ -8,6 +8,7 @@ import HistoryView from '@/views/HistoryView'
 import ReportView from '@/views/ReportView'
 import AdminUsersView from '@/views/AdminUsersView'
 import AdminLogsView from '@/views/AdminLogsView'
+import AdminCopartView from '@/views/AdminCopartView'
 
 export default function AppRoutes() {
   const { token } = useAuth()
@@ -60,6 +61,15 @@ export default function AppRoutes() {
         element={
           <ProtectedRoute>
             <AdminLogsView />
+          </ProtectedRoute>
+        }
+      />
+
+      <Route
+        path="/admin/copart"
+        element={
+          <ProtectedRoute>
+            <AdminCopartView />
           </ProtectedRoute>
         }
       />

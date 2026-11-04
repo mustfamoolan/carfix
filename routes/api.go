@@ -79,7 +79,13 @@ func RegisterAPIRoutes(app *fiber.App) {
 	worker.Post("/progress", workerController.Progress)
 	worker.Post("/complete", workerController.Complete)
 
-	// 4. Public Tools & Services inspection endpoints
+	// 4. Admin-Only Copart Bidding & Lot Gateway (Completely isolated from Carfax)
+	copartController := controllers.NewCopartController()
+	admin.Get("/copart/lot/:lot", copartController.GetLot)
+	admin.Post("/copart/bid", copartController.PlacePreBid)
+	admin.Get("/copart/bids", copartController.ListBids)
+
+	// 5. Public Tools & Services inspection endpoints
 	tools := api.Group("/tools")
 	vinValidator := services.NewVinValidatorService()
 	translator := services.NewCarfaxTranslatorService()

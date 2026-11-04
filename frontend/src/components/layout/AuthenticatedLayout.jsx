@@ -14,6 +14,7 @@ import {
   Menu,
   X,
   Car,
+  Gavel,
 } from 'lucide-react'
 
 export default function AuthenticatedLayout({ children, title }) {
@@ -46,6 +47,11 @@ export default function AuthenticatedLayout({ children, title }) {
             path: '/admin/logs',
             label: 'سجل العمليات',
             icon: Activity,
+          },
+          {
+            path: '/admin/copart',
+            label: 'مزادات Copart',
+            icon: Gavel,
           },
         ]
       : []),

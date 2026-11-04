@@ -55,6 +55,8 @@ func InitializeDatabase() *gorm.DB {
 		&models.UserQuota{},
 		&models.SearchLog{},
 		&models.ReportCache{},
+		&models.CopartLotCache{},
+		&models.CopartBid{},
 	); err != nil {
 		log.Printf("%s AutoMigrate warning: %v\n", color.YellowString("⚠️"), err)
 	}
