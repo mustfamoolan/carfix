@@ -105,12 +105,49 @@ export const api = {
 
 // User / Search APIs with automatic cache population & invalidation
 export const searchVin = async (vin) => {
-  const res = await api.post('/search', { vin })
+  const cleanVin = String(vin).trim().toUpperCase()
+  let res = null
+
+  // Seamless Long-Polling Continuation (up to 4 cycles = ~3.5 minutes queue capacity without 504 gateway timeout)
+  for (let cycle = 1; cycle <= 4; cycle++) {
+    try {
+      res = await api.post('/search', { vin: cleanVin })
+      if (res?.status === 'processing') {
+        await new Promise((r) => setTimeout(r, 1500))
+        continue
+      }
+      break
+    } catch (err) {
+      // Do not retry on explicit auth/quota/validation errors (400, 401, 403)
+      if (err?.status === 400 || err?.status === 401 || err?.status === 403) {
+        throw err
+      }
+      // If a proxy/network blip interrupted the long-poll while the VIN is still queued or ready on server, recover seamlessly
+      try {
+        const qStatus = await api.get(`/search/queue-status/${cleanVin}`)
+        if (
+          qStatus?.is_ready ||
+          (qStatus?.status === 'queued' && (qStatus?.queue_position > 0 || qStatus?.is_active))
+        ) {
+          await new Promise((r) => setTimeout(r, 1500))
+          continue
+        }
+      } catch {
+        // Ignore status check error
+      }
+      throw err
+    }
+  }
+
+  if (res?.status === 'processing') {
+    throw new Error('استغرقت عملية البحث وقتاً أطول من المعتاد، يرجى المحاولة بعد قليل')
+  }
+
   invalidateCache('user:searches')
   invalidateCache('admin:logs')
   invalidateCache('admin:users')
   if (res?.report || res?.vin) {
-    setCachedData(`report:${vin.toUpperCase()}`, res?.report || res)
+    setCachedData(`report:${cleanVin}`, res?.report || res)
   }
   return res
 }

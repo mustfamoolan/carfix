@@ -15,6 +15,7 @@ export default function VinSearchBox({ onSuccessSearch, inputRef }) {
   const [activeTab, setActiveTab] = useState('vin')
   const [searching, setSearching] = useState(false)
   const [queueInfo, setQueueInfo] = useState(null)
+  const [displaySeconds, setDisplaySeconds] = useState(0)
   const [specsLoading, setSpecsLoading] = useState(false)
   const [vehicleSpecs, setVehicleSpecs] = useState(null)
   const [vinCheckError, setVinCheckError] = useState('')
@@ -34,6 +35,7 @@ export default function VinSearchBox({ onSuccessSearch, inputRef }) {
   useEffect(() => {
     if (!searching || vin.length !== 17) {
       setQueueInfo(null)
+      setDisplaySeconds(0)
       return
     }
 
@@ -41,8 +43,16 @@ export default function VinSearchBox({ onSuccessSearch, inputRef }) {
     const poll = async () => {
       try {
         const qRes = await getQueueStatus(vin)
-        if (active && qRes) {
-          setQueueInfo(qRes?.data || qRes)
+        const info = qRes?.data || qRes
+        if (active && info) {
+          setQueueInfo(info)
+          if (info.estimated_seconds > 0) {
+            setDisplaySeconds((prev) =>
+              prev === 0 || Math.abs(prev - info.estimated_seconds) > 4
+                ? info.estimated_seconds
+                : prev
+            )
+          }
         }
       } catch {
         // Ignore poll error
@@ -50,10 +60,15 @@ export default function VinSearchBox({ onSuccessSearch, inputRef }) {
     }
 
     poll()
-    const timer = setInterval(poll, 1500)
+    const pollTimer = setInterval(poll, 2000)
+    const tickTimer = setInterval(() => {
+      setDisplaySeconds((prev) => (prev > 2 ? prev - 1 : prev))
+    }, 1000)
+
     return () => {
       active = false
-      clearInterval(timer)
+      clearInterval(pollTimer)
+      clearInterval(tickTimer)
     }
   }, [searching, vin])
 
@@ -356,9 +371,9 @@ export default function VinSearchBox({ onSuccessSearch, inputRef }) {
                 {`جاري استخراج وتجهيز التقرير للمركبة (${vehicleSpecs?.title || vin}) يرجى الانتظار لحظات...`}
               </span>
             </div>
-            {queueInfo?.estimated_seconds > 0 && (
+            {displaySeconds > 0 && (
               <span className="inline-flex items-center gap-1 text-[11px] font-mono font-semibold text-sky-200 bg-white/10 px-2 py-0.5 rounded border border-white/20">
-                <Clock className="h-3 w-3" />~{queueInfo.estimated_seconds} ثانية
+                <Clock className="h-3 w-3" />~{displaySeconds} ثانية
               </span>
             )}
           </div>

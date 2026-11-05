@@ -243,6 +243,10 @@ func (s *WorkerGuardService) SaveProgress(p *WorkerProgress) {
 	ctx := context.Background()
 	p.UpdatedAt = time.Now()
 
+	if p.VIN != "" {
+		bootstrap.Redis.Set(ctx, "canada:active_vin", p.VIN, 90*time.Second)
+	}
+
 	if p.ScreenshotBase64 != "" {
 		bootstrap.Redis.Set(ctx, "canada:last_screenshot", p.ScreenshotBase64, 24*time.Hour)
 		bootstrap.Redis.Set(ctx, "canada:last_screenshot_at", time.Now().Unix(), 24*time.Hour)
@@ -317,6 +321,7 @@ func (s *WorkerGuardService) EmergencyStop() error {
 	ctx := context.Background()
 	bootstrap.Redis.Del(ctx, "canada:tasks:queue")
 	bootstrap.Redis.Del(ctx, "canada:active_progress")
+	bootstrap.Redis.Del(ctx, "canada:active_vin")
 	s.TriggerCircuitBreaker("MANUAL_STOP", "تم إيقاف السحب الآلي يدوياً من غرفة العمليات")
 	return nil
 }
@@ -330,16 +335,65 @@ func (s *WorkerGuardService) ResetCircuitBreaker() error {
 	bootstrap.Redis.Del(ctx, "canada:circuit_breaker_active")
 	bootstrap.Redis.Del(ctx, "canada:circuit_breaker_reason")
 	bootstrap.Redis.Del(ctx, "canada:active_progress")
+	bootstrap.Redis.Del(ctx, "canada:active_vin")
 	return nil
 }
 
-// EnqueueSearchTask pushes VIN into the sequential FIFO queue
+// IsVinActive checks if the given VIN is currently being harvested right now by the worker node
+func (s *WorkerGuardService) IsVinActive(vin string) (bool, *WorkerProgress) {
+	if bootstrap.Redis == nil || vin == "" {
+		return false, nil
+	}
+	ctx := context.Background()
+
+	if pBytes, err := bootstrap.Redis.Get(ctx, "canada:active_progress").Bytes(); err == nil && len(pBytes) > 0 {
+		var p WorkerProgress
+		if json.Unmarshal(pBytes, &p) == nil && p.VIN == vin && time.Since(p.UpdatedAt) < 90*time.Second {
+			return true, &p
+		}
+	}
+
+	if activeVin, err := bootstrap.Redis.Get(ctx, "canada:active_vin").Result(); err == nil && activeVin == vin {
+		return true, nil
+	}
+
+	return false, nil
+}
+
+// IsVinPendingOrActive returns true if the VIN is either waiting in the FIFO queue or actively being harvested
+func (s *WorkerGuardService) IsVinPendingOrActive(vin string) bool {
+	if active, _ := s.IsVinActive(vin); active {
+		return true
+	}
+	if bootstrap.Redis == nil {
+		return false
+	}
+	ctx := context.Background()
+	list, err := bootstrap.Redis.LRange(ctx, "canada:tasks:queue", 0, -1).Result()
+	if err == nil {
+		for _, v := range list {
+			if v == vin {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// EnqueueSearchTask pushes VIN into the sequential FIFO queue with Singleflight In-Flight Deduplication
 func (s *WorkerGuardService) EnqueueSearchTask(vin string) error {
 	if bootstrap.Redis == nil {
 		return nil
 	}
 	ctx := context.Background()
 
+	// 1. In-Flight Singleflight Lock: if the worker is already harvesting this VIN right now,
+	// do not push a duplicate task; both requests will receive the report simultaneously via Pub/Sub!
+	if active, _ := s.IsVinActive(vin); active {
+		return nil
+	}
+
+	// 2. Queue Deduplication: if the VIN is already waiting in the FIFO queue, do not push a second copy
 	list, err := bootstrap.Redis.LRange(ctx, "canada:tasks:queue", 0, -1).Result()
 	if err == nil {
 		for _, v := range list {
@@ -352,33 +406,83 @@ func (s *WorkerGuardService) EnqueueSearchTask(vin string) error {
 	return bootstrap.Redis.RPush(ctx, "canada:tasks:queue", vin).Err()
 }
 
-// GetQueuePosition returns the 1-based position of a VIN in the waiting queue and estimated wait seconds
+// estimateStepRemainingSec maps a WorkerProgress Step to realistic remaining harvest seconds
+func estimateStepRemainingSec(p *WorkerProgress) int {
+	if p == nil {
+		return 18
+	}
+	switch p.Step {
+	case "DISPATCHED", "STARTING":
+		return 20
+	case "TYPING_VIN":
+		return 16
+	case "SUBMITTING":
+		return 12
+	case "WAIT_REPORT":
+		return 8
+	case "HARVESTING":
+		return 4
+	default:
+		return 15
+	}
+}
+
+// GetQueuePosition returns the 1-based position of a VIN in the waiting/active pipeline and estimated wait seconds
 func (s *WorkerGuardService) GetQueuePosition(vin string) (int, int) {
 	if bootstrap.Redis == nil {
 		return 0, 0
 	}
 	ctx := context.Background()
 
+	// 1. Check if this VIN is actively being pulled right now (Position 1)
+	if active, prog := s.IsVinActive(vin); active {
+		return 1, estimateStepRemainingSec(prog)
+	}
+
+	// 2. Check position in the waiting FIFO queue
 	list, err := bootstrap.Redis.LRange(ctx, "canada:tasks:queue", 0, -1).Result()
 	if err != nil || len(list) == 0 {
 		return 0, 0
 	}
 
-	pos := -1
+	idxInQueue := -1
 	for idx, v := range list {
 		if v == vin {
-			pos = idx + 1
+			idxInQueue = idx
 			break
 		}
 	}
 
-	if pos == -1 {
+	if idxInQueue == -1 {
 		return 0, 0
 	}
 
+	// Check if another VIN is currently active in the worker
+	activeOffset := 0
+	activeRemainingSec := 0
+	if activeVin, err := bootstrap.Redis.Get(ctx, "canada:active_vin").Result(); err == nil && activeVin != "" && activeVin != vin {
+		activeOffset = 1
+		activeRemainingSec = 16
+		if pBytes, pErr := bootstrap.Redis.Get(ctx, "canada:active_progress").Bytes(); pErr == nil && len(pBytes) > 0 {
+			var p WorkerProgress
+			if json.Unmarshal(pBytes, &p) == nil {
+				activeRemainingSec = estimateStepRemainingSec(&p)
+			}
+		}
+	}
+
+	pos := idxInQueue + 1 + activeOffset
 	cooldown := s.GetCooldownRemainingSec()
-	// Average pull takes ~8 seconds + cooldown per item in front
-	estimatedSec := cooldown + ((pos - 1) * (s.minCooldownSec + 8))
+
+	// Each full pull cycle takes ~20s harvest + minCooldownSec (15s) = ~35s
+	cycleSec := s.minCooldownSec + 20
+	var estimatedSec int
+	if activeOffset > 0 {
+		estimatedSec = activeRemainingSec + s.minCooldownSec + (idxInQueue * cycleSec) + 20
+	} else {
+		estimatedSec = cooldown + (idxInQueue * cycleSec) + 20
+	}
+
 	if estimatedSec < 5 {
 		estimatedSec = 5
 	}
@@ -421,6 +525,18 @@ func (s *WorkerGuardService) PollNextTask() (string, int, error) {
 		return "", 0, err
 	}
 
+	// Immediately mark VIN as active so concurrent requests coalesce onto this in-flight pull
+	bootstrap.Redis.Set(ctx, "canada:active_vin", vin, 90*time.Second)
+	initProg := WorkerProgress{
+		VIN:       vin,
+		Step:      "DISPATCHED",
+		StepAr:    "تم توجيه الطلب لبدء الفحص",
+		UpdatedAt: time.Now(),
+	}
+	if b, mErr := json.Marshal(&initProg); mErr == nil {
+		bootstrap.Redis.Set(ctx, "canada:active_progress", b, 90*time.Second)
+	}
+
 	return vin, 0, nil
 }
 
@@ -433,8 +549,9 @@ func (s *WorkerGuardService) CompleteTask(res *WorkerTaskResult) error {
 	}
 	ctx := context.Background()
 
-	// Clear active progress now that task finished
+	// Clear active progress & active_vin lock now that task finished
 	bootstrap.Redis.Del(ctx, "canada:active_progress")
+	bootstrap.Redis.Del(ctx, "canada:active_vin")
 
 	// Save screenshot if sent with completion
 	if res.ScreenshotBase64 != "" {
@@ -458,13 +575,13 @@ func (s *WorkerGuardService) CompleteTask(res *WorkerTaskResult) error {
 		_, _ = pipe.Exec(ctx)
 	}
 
-	// Store result in Redis only if successful (or for short 5s window if error) so retries don't read stale errors
+	// Store result in Redis only if successful so retries don't read stale errors
 	resForWaiter := *res
 	resForWaiter.ScreenshotBase64 = ""
 	resBytes, _ := json.Marshal(&resForWaiter)
 	resultKey := fmt.Sprintf("canada:result:%s", res.VIN)
 	if res.ErrorCode == "" {
-		bootstrap.Redis.Set(ctx, resultKey, resBytes, 10*time.Minute)
+		bootstrap.Redis.Set(ctx, resultKey, resBytes, 15*time.Minute)
 	} else {
 		bootstrap.Redis.Del(ctx, resultKey)
 	}
@@ -475,42 +592,63 @@ func (s *WorkerGuardService) CompleteTask(res *WorkerTaskResult) error {
 	return nil
 }
 
-// WaitForReport waits synchronously for Canada worker to deliver report or times out
+// WaitForReport waits synchronously for Canada worker to deliver report or times out.
+// Subscribes to Pub/Sub BEFORE checking Redis key and also polls every 1s to guarantee zero missed completions.
 func (s *WorkerGuardService) WaitForReport(vin string, timeout time.Duration) (*WorkerTaskResult, error) {
 	if bootstrap.Redis == nil {
 		return nil, errors.New("redis unavailable")
 	}
 	ctx := context.Background()
 
-	resultKey := fmt.Sprintf("canada:result:%s", vin)
-	val, err := bootstrap.Redis.Get(ctx, resultKey).Result()
-	if err == nil && val != "" {
-		var res WorkerTaskResult
-		if json.Unmarshal([]byte(val), &res) == nil && res.ErrorCode == "" {
-			return &res, nil
-		}
-		bootstrap.Redis.Del(ctx, resultKey)
-	}
-
 	channel := fmt.Sprintf("canada:pubsub:%s", vin)
 	sub := bootstrap.Redis.Subscribe(ctx, channel)
 	defer sub.Close()
-
 	ch := sub.Channel()
 
-	select {
-	case msg := <-ch:
-		if msg == nil {
+	resultKey := fmt.Sprintf("canada:result:%s", vin)
+	checkCachedResult := func() *WorkerTaskResult {
+		val, err := bootstrap.Redis.Get(ctx, resultKey).Result()
+		if err == nil && val != "" {
+			var res WorkerTaskResult
+			if json.Unmarshal([]byte(val), &res) == nil && res.ErrorCode == "" {
+				return &res
+			}
+			bootstrap.Redis.Del(ctx, resultKey)
+		}
+		return nil
+	}
+
+	if res := checkCachedResult(); res != nil {
+		return res, nil
+	}
+
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+	deadline := time.After(timeout)
+
+	for {
+		select {
+		case msg := <-ch:
+			if msg == nil {
+				return nil, ErrWorkerTimedOut
+			}
+			var res WorkerTaskResult
+			if err := json.Unmarshal([]byte(msg.Payload), &res); err != nil {
+				return nil, err
+			}
+			return &res, nil
+
+		case <-ticker.C:
+			if res := checkCachedResult(); res != nil {
+				return res, nil
+			}
+
+		case <-deadline:
+			if res := checkCachedResult(); res != nil {
+				return res, nil
+			}
 			return nil, ErrWorkerTimedOut
 		}
-		var res WorkerTaskResult
-		if err := json.Unmarshal([]byte(msg.Payload), &res); err != nil {
-			return nil, err
-		}
-		return &res, nil
-
-	case <-time.After(timeout):
-		return nil, ErrWorkerTimedOut
 	}
 }
 

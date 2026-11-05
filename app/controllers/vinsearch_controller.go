@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -17,6 +18,7 @@ import (
 )
 
 var fastMemoryCache sync.Map
+var ErrStillInQueue = errors.New("STILL_IN_QUEUE")
 
 func InvalidateFastReportCache(vin string) {
 	cleanVin := strings.ToUpper(strings.TrimSpace(vin))
@@ -24,6 +26,104 @@ func InvalidateFastReportCache(vin string) {
 	if bootstrap.Redis != nil {
 		bootstrap.Redis.Del(context.Background(), "report:fast:"+cleanVin)
 	}
+}
+
+// UpsertReportCache safely creates or updates a ReportCache record in PostgreSQL and updates Redis/RAM caches
+// without ever failing on duplicate VIN keys or overwriting rich HTML with empty Stage-1 HTML.
+func UpsertReportCache(cleanVin, vehicleTitle, rawHtmlEn, fastSummaryJson string, translator *services.CarfaxTranslatorService) (*models.ReportCache, fiber.Map) {
+	cleanVin = strings.ToUpper(strings.TrimSpace(cleanVin))
+
+	var translatedHtmlAr, extractedTitle, summaryJson string
+	if rawHtmlEn != "" && translator != nil {
+		translatedHtmlAr, extractedTitle, summaryJson = translator.TranslateAndExtract(rawHtmlEn, cleanVin)
+		if extractedTitle != "" && !strings.HasPrefix(extractedTitle, "مركبة شاصي") && vehicleTitle == "" {
+			vehicleTitle = extractedTitle
+		}
+	}
+	if fastSummaryJson != "" && summaryJson == "" {
+		summaryJson = fastSummaryJson
+	}
+	if vehicleTitle == "" {
+		vehicleTitle = "CARFAX Vehicle Report - " + cleanVin
+	}
+
+	hasFullHtml := len(rawHtmlEn) > 500
+	hasOfficialPdf := strings.Contains(rawHtmlEn, "carfix-official-pdf") || strings.Contains(summaryJson, `"has_official_pdf":true`)
+
+	if hasFullHtml {
+		var summaryMap map[string]interface{}
+		if json.Unmarshal([]byte(summaryJson), &summaryMap) == nil && summaryMap != nil {
+			summaryMap["background_pending"] = false
+			summaryMap["background_ready"] = true
+			summaryMap["has_official_pdf"] = hasOfficialPdf
+			summaryMap["has_full_html"] = true
+			if updatedBytes, mErr := json.Marshal(summaryMap); mErr == nil {
+				summaryJson = string(updatedBytes)
+			}
+		}
+	}
+
+	now := time.Now()
+	reportRecord := &models.ReportCache{
+		VIN:              cleanVin,
+		VehicleTitle:     vehicleTitle,
+		RawHtmlEn:        rawHtmlEn,
+		TranslatedHtmlAr: translatedHtmlAr,
+		SummaryJson:      summaryJson,
+		FetchedAt:        now,
+		UpdatedAt:        now,
+	}
+
+	var existingVin string
+	bootstrap.DB.Model(&models.ReportCache{}).Select("vin").Where("vin = ?", cleanVin).Scan(&existingVin)
+
+	if existingVin == "" {
+		if err := bootstrap.DB.Create(reportRecord).Error; err != nil {
+			updates := map[string]interface{}{
+				"vehicle_title": vehicleTitle,
+				"summary_json":  summaryJson,
+				"updated_at":    now,
+			}
+			if hasFullHtml {
+				updates["raw_html_en"] = rawHtmlEn
+				updates["translated_html_ar"] = translatedHtmlAr
+			}
+			bootstrap.DB.Model(&models.ReportCache{}).Where("vin = ?", cleanVin).Updates(updates)
+		}
+	} else {
+		updates := map[string]interface{}{
+			"vehicle_title": vehicleTitle,
+			"summary_json":  summaryJson,
+			"updated_at":    now,
+		}
+		if hasFullHtml {
+			updates["raw_html_en"] = rawHtmlEn
+			updates["translated_html_ar"] = translatedHtmlAr
+		}
+		bootstrap.DB.Model(&models.ReportCache{}).Where("vin = ?", cleanVin).Updates(updates)
+	}
+
+	fastPayload := fiber.Map{
+		"vin":              cleanVin,
+		"vehicle_title":    vehicleTitle,
+		"summary_json":     summaryJson,
+		"has_full_html":    hasFullHtml || strings.Contains(summaryJson, `"has_full_html":true`),
+		"has_official_pdf": hasOfficialPdf,
+		"fetched_at":       now,
+	}
+
+	if !strings.Contains(summaryJson, `"background_pending":true`) {
+		fastMemoryCache.Store(cleanVin, fastPayload)
+		if bootstrap.Redis != nil {
+			if b, mErr := json.Marshal(fastPayload); mErr == nil {
+				bootstrap.Redis.Set(context.Background(), "report:fast:"+cleanVin, string(b), 24*time.Hour)
+			}
+		}
+	} else {
+		InvalidateFastReportCache(cleanVin)
+	}
+
+	return reportRecord, fastPayload
 }
 
 type VinSearchController struct {
@@ -101,6 +201,13 @@ func (ctrl *VinSearchController) Search(c *fiber.Ctx) error {
 		})
 	}
 
+	// 3.5. Pre-Flight Quota Check (resets daily counter at midnight & blocks exhausted users BEFORE queueing to Canada)
+	if _, qErr := ctrl.quotaManager.CheckAndPrepareQuota(userID); qErr != nil {
+		return c.Status(403).JSON(fiber.Map{
+			"message": qErr.Error(),
+		})
+	}
+
 	// 4. Step B: 2-Tier Cache Inspection (Tier 1: Redis RAM + PostgreSQL report_caches)
 	if fastReport, err := ctrl.getOrBuildFastReport(cleanVin); err == nil && fastReport != nil {
 		// ==================== CACHE HIT ====================
@@ -135,6 +242,21 @@ func (ctrl *VinSearchController) Search(c *fiber.Ctx) error {
 	// ==================== CACHE MISS ====================
 	rawHtmlEn, vehicleTitle, fastSummaryJson, err := ctrl.fetchFromCanadaNode(cleanVin)
 	if err != nil {
+		// If the VIN is still waiting in queue or actively being harvested after a 48s HTTP window,
+		// return 202 Processing so the client seamlessly continues waiting without 504/502 timeout or false error logs!
+		if errors.Is(err, ErrStillInQueue) {
+			pos, estSec := ctrl.workerGuard.GetQueuePosition(cleanVin)
+			isActive, _ := ctrl.workerGuard.IsVinActive(cleanVin)
+			return c.Status(202).JSON(fiber.Map{
+				"status":            "processing",
+				"vin":               cleanVin,
+				"is_active":         isActive,
+				"queue_position":    pos,
+				"estimated_seconds": estSec,
+				"message":           "جاري استخراج وتجهيز التقرير، يرجى الانتظار لحظات...",
+			})
+		}
+
 		duration := time.Since(startTime).Milliseconds()
 
 		logEntry := models.SearchLog{
@@ -156,49 +278,10 @@ func (ctrl *VinSearchController) Search(c *fiber.Ctx) error {
 		})
 	}
 
-	// Translate English HTML (if Stage 1 includes HTML or Mock) and extract metadata & JSON summary
-	var translatedHtmlAr, extractedTitle, summaryJson string
-	if rawHtmlEn != "" {
-		translatedHtmlAr, extractedTitle, summaryJson = ctrl.translator.TranslateAndExtract(rawHtmlEn, cleanVin)
-		if extractedTitle != "" && !strings.HasPrefix(extractedTitle, "مركبة شاصي") && vehicleTitle == "" {
-			vehicleTitle = extractedTitle
-		}
-	}
-	if fastSummaryJson != "" {
-		summaryJson = fastSummaryJson
-	}
-	if vehicleTitle == "" {
-		vehicleTitle = "CARFAX Vehicle Report - " + cleanVin
-	}
-
-	// Save to report_caches table for fast future queries
-	newReport := models.ReportCache{
-		VIN:              cleanVin,
-		VehicleTitle:     vehicleTitle,
-		RawHtmlEn:        rawHtmlEn,
-		TranslatedHtmlAr: translatedHtmlAr,
-		SummaryJson:      summaryJson,
-		FetchedAt:        time.Now(),
-	}
-	bootstrap.DB.Create(&newReport)
-
-	hasFullHtml := len(rawHtmlEn) > 500
-	hasOfficialPdf := strings.Contains(rawHtmlEn, "carfix-official-pdf")
-
-	fastPayload := fiber.Map{
-		"vin":              newReport.VIN,
-		"vehicle_title":    newReport.VehicleTitle,
-		"summary_json":     newReport.SummaryJson,
-		"has_full_html":    hasFullHtml,
-		"has_official_pdf": hasOfficialPdf,
-		"fetched_at":       newReport.FetchedAt,
-	}
-
-	if bootstrap.Redis != nil && !strings.Contains(summaryJson, `"background_pending":true`) {
-		if b, mErr := json.Marshal(fastPayload); mErr == nil {
-			bootstrap.Redis.Set(context.Background(), "report:fast:"+cleanVin, string(b), 24*time.Hour)
-		}
-	}
+	// Save or update in report_caches (idempotent even if WorkerController.Complete already persisted it)
+	newReport, fastPayload := UpsertReportCache(cleanVin, vehicleTitle, rawHtmlEn, fastSummaryJson, ctrl.translator)
+	hasFullHtml, _ := fastPayload["has_full_html"].(bool)
+	hasOfficialPdf, _ := fastPayload["has_official_pdf"].(bool)
 
 	// Deduct user quota
 	if err := ctrl.quotaManager.ConsumeQuota(userID); err != nil {
@@ -213,7 +296,7 @@ func (ctrl *VinSearchController) Search(c *fiber.Ctx) error {
 	logEntry := models.SearchLog{
 		UserID:       userID,
 		VIN:          cleanVin,
-		VehicleTitle: vehicleTitle,
+		VehicleTitle: newReport.VehicleTitle,
 		ResultStatus: "success",
 		FetchSource:  "canada_node",
 		DurationMs:   duration,
@@ -342,14 +425,16 @@ func (ctrl *VinSearchController) GetQueueStatus(c *fiber.Ctx) error {
 		})
 	}
 
-	// 2. Check position in sequential queue
+	// 2. Check position in sequential queue / active pull
 	pos, estSec := ctrl.workerGuard.GetQueuePosition(cleanVin)
+	isActive, _ := ctrl.workerGuard.IsVinActive(cleanVin)
 	cooldown := ctrl.workerGuard.GetCooldownRemainingSec()
 	workerOnline := ctrl.workerGuard.IsConnected()
 
 	return c.JSON(fiber.Map{
 		"status":            "queued",
 		"is_ready":          false,
+		"is_active":         isActive,
 		"vin":               cleanVin,
 		"worker_online":     workerOnline,
 		"queue_position":    pos,
@@ -498,8 +583,14 @@ func (ctrl *VinSearchController) fetchFromCanadaNode(vin string) (string, string
 				return "", "", "", fmt.Errorf("تعذر إرسال الطلب حالياً، يرجى المحاولة مرة أخرى")
 			}
 
-			res, err := ctrl.workerGuard.WaitForReport(vin, 65*time.Second)
+			// Wait up to 48s per HTTP cycle (safely below Nginx/Cloudflare 60s gateway timeout)
+			res, err := ctrl.workerGuard.WaitForReport(vin, 48*time.Second)
 			if err != nil {
+				// If the report is still in queue or actively being extracted by the worker,
+				// signal 202 Processing continuation instead of failing!
+				if ctrl.workerGuard.IsVinPendingOrActive(vin) && ctrl.workerGuard.IsConnected() {
+					return "", "", "", ErrStillInQueue
+				}
 				return "", "", "", fmt.Errorf("استغرقت عملية البحث وقتاً أطول من المعتاد، يرجى المحاولة بعد قليل")
 			}
 

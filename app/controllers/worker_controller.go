@@ -1,13 +1,7 @@
 package controllers
 
 import (
-	"encoding/json"
-	"strings"
-	"time"
-
-	"carfix/app/models"
 	"carfix/app/services"
-	"carfix/bootstrap"
 	"github.com/gofiber/fiber/v2"
 )
 
@@ -128,46 +122,18 @@ func (ctrl *WorkerController) Complete(c *fiber.Ctx) error {
 
 	// Stage 2 Silent Background Enrichment: Update existing ReportCache with full Carfax HTML + Official PDF
 	if payload.IsBackgroundEnrich && payload.ErrorCode == "" && payload.RawHtmlEn != "" {
-		cleanVin := strings.ToUpper(strings.TrimSpace(payload.VIN))
-		translatedHtmlAr, extractedTitle, fallbackSummary := ctrl.translator.TranslateAndExtract(payload.RawHtmlEn, cleanVin)
-		title := payload.VehicleTitle
-		if title == "" {
-			title = extractedTitle
-		}
-
-		summaryJson := fallbackSummary
-		if summaryJson == "" {
-			summaryJson = payload.FastSummaryJson
-		}
-
-		hasOfficialPdf := strings.Contains(payload.RawHtmlEn, "carfix-official-pdf")
-
-		// Mark background_pending = false and background_ready = true inside summary_json
-		var summaryMap map[string]interface{}
-		if json.Unmarshal([]byte(summaryJson), &summaryMap) == nil && summaryMap != nil {
-			summaryMap["background_pending"] = false
-			summaryMap["background_ready"] = true
-			summaryMap["has_official_pdf"] = hasOfficialPdf
-			summaryMap["has_full_html"] = true
-			if updatedBytes, mErr := json.Marshal(summaryMap); mErr == nil {
-				summaryJson = string(updatedBytes)
-			}
-		}
-
-		bootstrap.DB.Model(&models.ReportCache{}).Where("vin = ?", cleanVin).Updates(map[string]interface{}{
-			"vehicle_title":      title,
-			"raw_html_en":        payload.RawHtmlEn,
-			"translated_html_ar": translatedHtmlAr,
-			"summary_json":       summaryJson,
-			"updated_at":         time.Now(),
-		})
-
-		InvalidateFastReportCache(cleanVin)
+		UpsertReportCache(payload.VIN, payload.VehicleTitle, payload.RawHtmlEn, payload.FastSummaryJson, ctrl.translator)
 
 		return c.JSON(fiber.Map{
 			"status":  "enriched",
 			"message": "تم تحديث التقرير بالنسخة الكاملة وملف الطباعة الرسمي بصمت",
 		})
+	}
+
+	// Stage 1 Immediate Worker-Side Persistence: Save completed report directly to PostgreSQL report_caches
+	// BEFORE waking up waiting HTTP requests, guaranteeing zero report loss even if a customer's browser disconnects!
+	if payload.ErrorCode == "" && (payload.RawHtmlEn != "" || payload.FastSummaryJson != "") {
+		UpsertReportCache(payload.VIN, payload.VehicleTitle, payload.RawHtmlEn, payload.FastSummaryJson, ctrl.translator)
 	}
 
 	if err := ctrl.guard.CompleteTask(&payload); err != nil {
