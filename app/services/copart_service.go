@@ -258,3 +258,4 @@ func (s *CopartService) buildFallbackLotData(query string, isVin bool) (*CopartL
 		Images:          []string{},
 	}, nil
 }
+

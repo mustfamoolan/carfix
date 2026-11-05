@@ -56,3 +56,4 @@ type CopartBid struct {
 func (CopartBid) TableName() string {
 	return "copart_bids"
 }
+

@@ -491,26 +491,33 @@ func (ctrl *VinSearchController) fetchFromCanadaNode(vin string) (string, string
 		return "", "", "", fmt.Errorf("الخدمة مشغولة حالياً أو قيد التحديث اللحظي، يرجى المحاولة بعد قليل")
 	}
 
-	// 2. If Worker is online, dispatch strictly to Worker
+	// 2. If Worker is online, dispatch strictly to Worker (with 1 automatic silent retry on transient DOM/typing hiccup)
 	if ctrl.workerGuard.IsConnected() {
-		if err := ctrl.workerGuard.EnqueueSearchTask(vin); err != nil {
-			return "", "", "", fmt.Errorf("تعذر إرسال الطلب حالياً، يرجى المحاولة مرة أخرى")
-		}
-
-		res, err := ctrl.workerGuard.WaitForReport(vin, 65*time.Second)
-		if err != nil {
-			return "", "", "", fmt.Errorf("استغرقت عملية البحث وقتاً أطول من المعتاد، يرجى المحاولة بعد قليل")
-		}
-
-		if res != nil && res.ErrorCode != "" {
-			if res.ErrorCode == "VIN_NOT_FOUND_ON_CARFAX" {
-				return "", "", "", fmt.Errorf("لم يتم العثور على سجلات لهذا الرقم، يرجى التأكد من صحة رقم الشاصي")
+		for attempt := 1; attempt <= 2; attempt++ {
+			if err := ctrl.workerGuard.EnqueueSearchTask(vin); err != nil {
+				return "", "", "", fmt.Errorf("تعذر إرسال الطلب حالياً، يرجى المحاولة مرة أخرى")
 			}
-			return "", "", "", fmt.Errorf("الخدمة مشغولة حالياً، يرجى المحاولة مرة أخرى بعد قليل")
-		}
 
-		if res != nil && (res.RawHtmlEn != "" || res.FastSummaryJson != "") {
-			return res.RawHtmlEn, res.VehicleTitle, res.FastSummaryJson, nil
+			res, err := ctrl.workerGuard.WaitForReport(vin, 65*time.Second)
+			if err != nil {
+				return "", "", "", fmt.Errorf("استغرقت عملية البحث وقتاً أطول من المعتاد، يرجى المحاولة بعد قليل")
+			}
+
+			if res != nil && res.ErrorCode != "" {
+				if res.ErrorCode == "VIN_NOT_FOUND_ON_CARFAX" {
+					return "", "", "", fmt.Errorf("لم يتم العثور على سجلات لهذا الرقم، يرجى التأكد من صحة رقم الشاصي")
+				}
+				// If it was a transient browser focus/typing/tab hiccup on attempt 1, retry once silently
+				if attempt == 1 && (res.ErrorCode == "VIN_TYPE_ERROR" || res.ErrorCode == "TAB_LOST" || res.ErrorCode == "VIN_INPUT_NOT_FOUND") {
+					time.Sleep(1500 * time.Millisecond)
+					continue
+				}
+				return "", "", "", fmt.Errorf("الخدمة مشغولة حالياً، يرجى المحاولة مرة أخرى بعد قليل")
+			}
+
+			if res != nil && (res.RawHtmlEn != "" || res.FastSummaryJson != "") {
+				return res.RawHtmlEn, res.VehicleTitle, res.FastSummaryJson, nil
+			}
 		}
 
 		return "", "", "", fmt.Errorf("تعذر استخراج بيانات التقرير، يرجى المحاولة مرة أخرى")

@@ -112,3 +112,4 @@ func (ctrl *CopartController) ListBids(c *fiber.Ctx) error {
 		"total":  len(bids),
 	})
 }
+

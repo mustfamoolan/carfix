@@ -1152,10 +1152,15 @@ func (sh *StealthHarvester) typeVinHumanly(tabCtx context.Context, selector, vin
 	// Clear field and focus via JS first
 	clearJS := fmt.Sprintf(`
 (() => {
-    const el = document.querySelector(%q);
+    const el = document.querySelector(%q) || document.querySelector('input[name="VIN"]') || document.querySelector('input[name="vin"]') || document.querySelector('input[placeholder*="VIN" i]');
     if (!el) return false;
     el.focus();
-    el.value = '';
+    const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
+    if (setter) {
+        setter.call(el, '');
+    } else {
+        el.value = '';
+    }
     el.dispatchEvent(new Event('input', { bubbles: true }));
     return true;
 })();
@@ -1167,28 +1172,32 @@ func (sh *StealthHarvester) typeVinHumanly(tabCtx context.Context, selector, vin
 
 	for i, c := range []rune(vin) {
 		sh.randomDelay(75, 195)
-		if err := chromedp.Run(tabCtx, chromedp.KeyEvent(string(c))); err != nil {
-			return err
-		}
+		_ = chromedp.Run(tabCtx, chromedp.KeyEvent(string(c)))
 		if (i+1)%5 == 0 {
 			sh.randomDelay(250, 480)
 		}
 	}
 
-	// Verify the input value matches the full 17-char VIN (in case a keystroke was dropped by React/Angular state)
+	// Verify the input value matches the full 17-char VIN (even if the window wasn't focused in Windows OS)
 	verifyJS := fmt.Sprintf(`
 (() => {
-    const el = document.querySelector(%q);
+    const el = document.querySelector(%q) || document.querySelector('input[name="VIN"]') || document.querySelector('input[name="vin"]') || document.querySelector('input[placeholder*="VIN" i]');
     if (!el) return '';
-    if (el.value.trim().toUpperCase() !== %q) {
-        const nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
-        nativeInputValueSetter.call(el, %q);
-        el.dispatchEvent(new Event('input', { bubbles: true }));
+    el.focus();
+    if ((el.value || '').trim().toUpperCase() !== %q) {
+        const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
+        if (setter) {
+            setter.call(el, %q);
+        } else {
+            el.value = %q;
+        }
+        el.dispatchEvent(new InputEvent('input', { bubbles: true, data: %q, inputType: 'insertText' }));
         el.dispatchEvent(new Event('change', { bubbles: true }));
+        el.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true, key: '9' }));
     }
-    return el.value.trim().toUpperCase();
+    return (el.value || '').trim().toUpperCase();
 })();
-`, selector, vin, vin)
+`, selector, vin, vin, vin, vin)
 
 	var finalVal string
 	if err := chromedp.Run(tabCtx, chromedp.Evaluate(verifyJS, &finalVal)); err != nil {

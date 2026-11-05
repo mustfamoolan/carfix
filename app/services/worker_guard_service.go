@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -205,6 +206,16 @@ func (s *WorkerGuardService) SaveTelemetry(t *WorkerTelemetry) {
 		return
 	}
 	ctx := context.Background()
+
+	// Self-Healing: if browser is healthy, logged in, and showing the VIN input with zero security challenge,
+	// automatically clear any prior non-manual circuit breaker state so users are never stuck blocked!
+	if t.ChromeConnected && t.SessionActive && t.VinInputFound && !t.HasChallenge && !t.IsLoginPage {
+		if active, reason := s.IsCircuitBreakerActive(); active {
+			if !strings.Contains(reason, "MANUAL_STOP") {
+				_ = s.ResetCircuitBreaker()
+			}
+		}
+	}
 
 	if t.ScreenshotBase64 != "" {
 		bootstrap.Redis.Set(ctx, "canada:last_screenshot", t.ScreenshotBase64, 24*time.Hour)
@@ -431,9 +442,10 @@ func (s *WorkerGuardService) CompleteTask(res *WorkerTaskResult) error {
 		bootstrap.Redis.Set(ctx, "canada:last_screenshot_at", time.Now().Unix(), 24*time.Hour)
 	}
 
-	// Enforce One-Shot Or Freeze: any error code from Canada browser trips the breaker except VIN_NOT_FOUND_ON_CARFAX
+	// Only trip the global Circuit Breaker on actual account/security blocks (CAPTCHA_DETECTED or SESSION_EXPIRED),
+	// NEVER on transient DOM/typing/tab hiccups (VIN_TYPE_ERROR, TAB_LOST, VIN_INPUT_NOT_FOUND, CHROME_NOT_CONNECTED)
 	if res.ErrorCode != "" {
-		if res.ErrorCode != "VIN_NOT_FOUND_ON_CARFAX" {
+		if res.ErrorCode == "CAPTCHA_DETECTED" || res.ErrorCode == "SESSION_EXPIRED" {
 			s.TriggerCircuitBreaker(res.ErrorCode, res.ErrorMessage)
 		}
 	} else {
@@ -446,12 +458,16 @@ func (s *WorkerGuardService) CompleteTask(res *WorkerTaskResult) error {
 		_, _ = pipe.Exec(ctx)
 	}
 
-	// Store result in Redis (without duplicating large base64 screenshot in pubsub payload)
+	// Store result in Redis only if successful (or for short 5s window if error) so retries don't read stale errors
 	resForWaiter := *res
 	resForWaiter.ScreenshotBase64 = ""
 	resBytes, _ := json.Marshal(&resForWaiter)
 	resultKey := fmt.Sprintf("canada:result:%s", res.VIN)
-	bootstrap.Redis.Set(ctx, resultKey, resBytes, 10*time.Minute)
+	if res.ErrorCode == "" {
+		bootstrap.Redis.Set(ctx, resultKey, resBytes, 10*time.Minute)
+	} else {
+		bootstrap.Redis.Del(ctx, resultKey)
+	}
 
 	channel := fmt.Sprintf("canada:pubsub:%s", res.VIN)
 	bootstrap.Redis.Publish(ctx, channel, resBytes)
@@ -470,9 +486,10 @@ func (s *WorkerGuardService) WaitForReport(vin string, timeout time.Duration) (*
 	val, err := bootstrap.Redis.Get(ctx, resultKey).Result()
 	if err == nil && val != "" {
 		var res WorkerTaskResult
-		if json.Unmarshal([]byte(val), &res) == nil {
+		if json.Unmarshal([]byte(val), &res) == nil && res.ErrorCode == "" {
 			return &res, nil
 		}
+		bootstrap.Redis.Del(ctx, resultKey)
 	}
 
 	channel := fmt.Sprintf("canada:pubsub:%s", vin)
