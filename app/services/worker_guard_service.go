@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math/rand"
 	"os"
 	"strconv"
 	"strings"
@@ -104,11 +105,14 @@ func NewWorkerGuardService() *WorkerGuardService {
 			}
 		}
 
-		minCooldown := 25
+		minCooldown := 13
 		if val := os.Getenv("CANADA_MIN_COOLDOWN_SEC"); val != "" {
 			if parsed, err := strconv.Atoi(val); err == nil && parsed > 0 {
 				minCooldown = parsed
 			}
+		}
+		if minCooldown > 15 {
+			minCooldown = 13
 		}
 
 		mockFallback := true
@@ -540,6 +544,19 @@ func (s *WorkerGuardService) PollNextTask() (string, int, error) {
 	return vin, 0, nil
 }
 
+// TouchCooldownWithJitter sets the anti-ban cooldown timestamp with natural human jitter (10s - 13s)
+// and clears active_vin after Stage 2 background PDF enrichment finishes.
+func (s *WorkerGuardService) TouchCooldownWithJitter() {
+	if bootstrap.Redis == nil {
+		return
+	}
+	ctx := context.Background()
+	jitter := int64(rand.Intn(4)) // 0, 1, 2, or 3 seconds jitter
+	bootstrap.Redis.Del(ctx, "canada:active_progress")
+	bootstrap.Redis.Del(ctx, "canada:active_vin")
+	bootstrap.Redis.Set(ctx, "canada:last_pull_ended_at", time.Now().Unix()-jitter, 0)
+}
+
 // CompleteTask handles response from Canada node
 func (s *WorkerGuardService) CompleteTask(res *WorkerTaskResult) error {
 	s.RecordHeartbeat()
@@ -549,9 +566,15 @@ func (s *WorkerGuardService) CompleteTask(res *WorkerTaskResult) error {
 	}
 	ctx := context.Background()
 
-	// Clear active progress & active_vin lock now that task finished
-	bootstrap.Redis.Del(ctx, "canada:active_progress")
-	bootstrap.Redis.Del(ctx, "canada:active_vin")
+	// If Stage 1 completed without RawHtmlEn, Stage 2 (human reading + PDF) continues for ~10s on the worker;
+	// keep active_vin alive with a 15s TTL until Stage 2 calls TouchCooldownWithJitter!
+	if res.ErrorCode == "" && res.RawHtmlEn == "" {
+		bootstrap.Redis.Expire(ctx, "canada:active_vin", 15*time.Second)
+		bootstrap.Redis.Expire(ctx, "canada:active_progress", 15*time.Second)
+	} else {
+		bootstrap.Redis.Del(ctx, "canada:active_progress")
+		bootstrap.Redis.Del(ctx, "canada:active_vin")
+	}
 
 	// Save screenshot if sent with completion
 	if res.ScreenshotBase64 != "" {
@@ -567,11 +590,12 @@ func (s *WorkerGuardService) CompleteTask(res *WorkerTaskResult) error {
 		}
 	} else {
 		// Successful report fetch
+		jitter := int64(rand.Intn(4))
 		pipe := bootstrap.Redis.Pipeline()
 		dailyKey := s.getDailyKey()
 		pipe.Incr(ctx, dailyKey)
 		pipe.Expire(ctx, dailyKey, 24*time.Hour)
-		pipe.Set(ctx, "canada:last_pull_ended_at", time.Now().Unix(), 0)
+		pipe.Set(ctx, "canada:last_pull_ended_at", time.Now().Unix()-jitter, 0)
 		_, _ = pipe.Exec(ctx)
 	}
 

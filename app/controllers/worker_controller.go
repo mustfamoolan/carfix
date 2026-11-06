@@ -123,6 +123,7 @@ func (ctrl *WorkerController) Complete(c *fiber.Ctx) error {
 	// Stage 2 Silent Background Enrichment: Update existing ReportCache with full Carfax HTML + Official PDF
 	if payload.IsBackgroundEnrich && payload.ErrorCode == "" && payload.RawHtmlEn != "" {
 		UpsertReportCache(payload.VIN, payload.VehicleTitle, payload.RawHtmlEn, payload.FastSummaryJson, ctrl.translator)
+		ctrl.guard.TouchCooldownWithJitter()
 
 		return c.JSON(fiber.Map{
 			"status":  "enriched",

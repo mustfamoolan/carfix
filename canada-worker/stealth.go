@@ -766,31 +766,35 @@ func (sh *StealthHarvester) HarvestReport(
 		_ = chromedp.Run(tabCtx, chromedp.KeyEvent("\r"))
 	}
 
-	// Wait 3.2 to 4.2 seconds for the report tab to open
-	sh.randomDelay(3200, 4200)
-
-	// Check if a new tab was opened for the report (standard on carfaxonline.com)
-	tabsAfter, _ := sh.ListOpenTabs(cdpEndpoint)
+	// Smart Tab Detection: Poll local CDP every 350ms (up to 4.2s max) instead of sleeping blindly for 4.2s
+	sh.randomDelay(750, 1050)
 	var reportTab *CDPTab
 	openedNewTab := false
-	for i := range tabsAfter {
-		t := tabsAfter[i]
-		if !knownTabIDs[t.ID] && t.URL != "about:blank" {
-			reportTab = &t
-			openedNewTab = true
-			break
-		}
-	}
-	// If no brand-new tab opened, check if an existing tab holds this exact VIN's report (/vhr/<VIN>)
-	if reportTab == nil {
+
+	for attempt := 0; attempt < 11; attempt++ {
+		tabsAfter, _ := sh.ListOpenTabs(cdpEndpoint)
 		for i := range tabsAfter {
 			t := tabsAfter[i]
-			if t.ID != searchTab.ID && (strings.Contains(strings.ToUpper(t.URL), upperTargetVin) || strings.Contains(strings.ToUpper(t.Title), upperTargetVin)) {
+			if !knownTabIDs[t.ID] && t.URL != "about:blank" {
 				reportTab = &t
 				openedNewTab = true
 				break
 			}
 		}
+		if reportTab == nil {
+			for i := range tabsAfter {
+				t := tabsAfter[i]
+				if t.ID != searchTab.ID && (strings.Contains(strings.ToUpper(t.URL), upperTargetVin) || strings.Contains(strings.ToUpper(t.Title), upperTargetVin)) {
+					reportTab = &t
+					openedNewTab = true
+					break
+				}
+			}
+		}
+		if reportTab != nil {
+			break
+		}
+		time.Sleep(350 * time.Millisecond)
 	}
 
 	// If no new tab opened, the report is in the current searchTab
@@ -799,13 +803,26 @@ func (sh *StealthHarvester) HarvestReport(
 		if rTabCtx, cleanupReportTab, rErr := sh.attachExistingTab(parentCtx, cdpEndpoint, reportTab.ID); rErr == nil {
 			defer cleanupReportTab()
 			activeReportCtx = rTabCtx
-			// Wait 1.6s to 2.2s for the report DOM text & tables to render
-			sh.randomDelay(1600, 2200)
+			// Smart DOM Readiness Polling: wait only until report tables/text render in DOM (up to 3s max)
+			for domWait := 0; domWait < 10; domWait++ {
+				var domReady bool
+				_ = chromedp.Run(activeReportCtx, chromedp.Evaluate(`
+					(() => {
+						const txt = (document.body ? document.body.innerText : '').toLowerCase();
+						return (txt.includes('ownership history') || txt.includes('detailed history') || txt.includes('history-based value') || txt.includes('invalid vin') || txt.includes('no records found'));
+					})()
+				`, &domReady))
+				if domReady {
+					break
+				}
+				time.Sleep(300 * time.Millisecond)
+			}
+			sh.randomDelay(500, 800)
 		}
 	}
 
 	// =========================================================================
-	// ⚡ INSTANT STRUCTURED DATA EXTRACTION (<25ms)
+	// ⚡ STAGE 1: INSTANT STRUCTURED DATA EXTRACTION (<25ms) & IMMEDIATE DELIVERY
 	// =========================================================================
 	if onProgress != nil {
 		onProgress("extracting_data", "4/4 تم فتح التقرير! جاري استخراج بيانات الفحص وقراءة الجداول...", "")
@@ -829,6 +846,16 @@ func (sh *StealthHarvester) HarvestReport(
 			ErrorMessage:     errMsg,
 			ScreenshotBase64: errScreenshot,
 		}
+	}
+
+	// Deliver Stage 1 immediately (~6-8s) so the customer sees the full interactive report right away
+	// while Stage 2 (human reading + official Print PDF) completes naturally in the background!
+	if onFastData != nil {
+		onFastData(&HarvestResult{
+			Success:         true,
+			VehicleTitle:    fastTitle,
+			FastSummaryJson: fastSummaryJson,
+		})
 	}
 
 	// =========================================================================

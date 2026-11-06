@@ -75,7 +75,7 @@ func main() {
 		cdpWsURL = "http://127.0.0.1:9222"
 	}
 
-	pollSec := 3
+	pollSec := 1
 	if val := os.Getenv("POLL_INTERVAL_SEC"); val != "" {
 		if s, err := strconv.Atoi(val); err == nil && s > 0 {
 			pollSec = s
@@ -131,8 +131,8 @@ func (w *CanadaWorker) Run(ctx context.Context) {
 func (w *CanadaWorker) pollAndExecute(ctx context.Context) {
 	w.pollCounter++
 
-	// Every 4th poll (~12s), refresh lightweight browser state (no screenshot unless requested)
-	if w.pollCounter%4 == 0 {
+	// Every 12th poll (~12s), refresh lightweight browser state (no screenshot unless requested)
+	if w.pollCounter%12 == 0 {
 		w.reportTelemetry(ctx, false)
 	}
 
@@ -163,10 +163,11 @@ func (w *CanadaWorker) pollAndExecute(ctx context.Context) {
 		return
 	}
 
-	// 5. Task received: Execute strict One-Shot Harvest with Single Fast Cycle
+	// 5. Task received: Execute strict One-Shot Harvest with 2-Stage Split Delivery (Instant UI + Background Official PDF)
 	vin := pollRes.VIN
 	log.Printf("🚀 [TASK RECEIVED] Starting One-Shot Carfax pull for VIN: %s", vin)
 
+	stage1Delivered := false
 	harvestRes := w.stealth.HarvestReport(
 		ctx,
 		w.cdpWsURL,
@@ -180,18 +181,32 @@ func (w *CanadaWorker) pollAndExecute(ctx context.Context) {
 				ScreenshotBase64: screenshot,
 			})
 		},
-		nil,
+		func(fastRes *HarvestResult) {
+			if fastRes != nil && fastRes.Success && fastRes.FastSummaryJson != "" {
+				stage1Req := CompleteRequest{
+					VIN:             vin,
+					VehicleTitle:    fastRes.VehicleTitle,
+					FastSummaryJson: fastRes.FastSummaryJson,
+					CompletedAt:     time.Now(),
+				}
+				if err := w.sendComplete(&stage1Req); err == nil {
+					stage1Delivered = true
+					log.Printf("⚡ [STAGE 1 DELIVERED] Instant structured report sent to customer for %s in ~7s! Finishing human reading & Official PDF in background...", vin)
+				}
+			}
+		},
 	)
 
 	completeReq := CompleteRequest{
-		VIN:              vin,
-		VehicleTitle:     harvestRes.VehicleTitle,
-		RawHtmlEn:        harvestRes.RawHtmlEn,
-		FastSummaryJson:  harvestRes.FastSummaryJson,
-		ErrorCode:        harvestRes.ErrorCode,
-		ErrorMessage:     harvestRes.ErrorMessage,
-		ScreenshotBase64: harvestRes.ScreenshotBase64,
-		CompletedAt:      time.Now(),
+		VIN:                vin,
+		VehicleTitle:       harvestRes.VehicleTitle,
+		RawHtmlEn:          harvestRes.RawHtmlEn,
+		FastSummaryJson:    harvestRes.FastSummaryJson,
+		IsBackgroundEnrich: stage1Delivered && harvestRes.Success,
+		ErrorCode:          harvestRes.ErrorCode,
+		ErrorMessage:       harvestRes.ErrorMessage,
+		ScreenshotBase64:   harvestRes.ScreenshotBase64,
+		CompletedAt:        time.Now(),
 	}
 
 	if err := w.sendComplete(&completeReq); err != nil {
@@ -200,7 +215,7 @@ func (w *CanadaWorker) pollAndExecute(ctx context.Context) {
 		if !harvestRes.Success {
 			log.Printf("🛑 [ONE-SHOT FREEZE] Safety stop [%s]: %s", harvestRes.ErrorCode, harvestRes.ErrorMessage)
 		} else {
-			log.Printf("✅ [TASK COMPLETED] Structured JSON report for %s delivered cleanly in seconds!", vin)
+			log.Printf("✅ [STAGE 2 COMPLETED] Human reading + Official PDF for %s finalized and enriched!", vin)
 		}
 	}
 

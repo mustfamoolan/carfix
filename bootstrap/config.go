@@ -18,7 +18,11 @@ func InitializeConfig() {
 
 	if err := viper.ReadInConfig(); err != nil {
 		if _, ok := err.(viper.ConfigFileNotFoundError); ok {
-			log.Fatalf("%s .env file not found. Please create one based on .env.example", color.RedString("FATAL:"))
+			// Inside Docker containers, environment variables are injected via env_file / environment,
+			// so a missing .env file on disk is completely normal when APP_KEY is present in env.
+			if os.Getenv("APP_KEY") == "" {
+				log.Fatalf("%s .env file not found and APP_KEY not set in environment.", color.RedString("FATAL:"))
+			}
 		} else {
 			log.Fatalf("%s Error reading .env file: %v", color.RedString("FATAL:"), err)
 		}

@@ -6,6 +6,7 @@ services:
       - "${APP_PORT:-8080}:8080"
     volumes:
       - ./public:/app/public
+      - ./.env:/app/.env:ro
     env_file:
       - .env
     environment:
@@ -20,7 +21,7 @@ services:
       - CACHE_HOST=redis
       - WORKER_SECRET_KEY=${WORKER_SECRET_KEY:-almoq3-canada-secret-2026}
       - CANADA_MAX_DAILY_PULLS=${CANADA_MAX_DAILY_PULLS:-45}
-      - CANADA_MIN_COOLDOWN_SEC=${CANADA_MIN_COOLDOWN_SEC:-25}
+      - CANADA_MIN_COOLDOWN_SEC=${CANADA_MIN_COOLDOWN_SEC:-12}
       - USE_MOCK_FALLBACK=${USE_MOCK_FALLBACK:-false}
     depends_on:
       db:

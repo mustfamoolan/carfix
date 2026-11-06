@@ -534,21 +534,32 @@ func (ctrl *VinSearchController) GetReportHtml(c *fiber.Ctx) error {
 	})
 }
 
-// GetReportPdf streams the official 4-Section Chrome PrintToPDF directly as binary application/pdf
+// GetReportPdf streams the official 4-Section Chrome PrintToPDF directly as binary application/pdf.
+// If Stage 2 background PDF generation is still completing (within 30s of Stage 1), it waits up to 15s seamlessly!
 func (ctrl *VinSearchController) GetReportPdf(c *fiber.Ctx) error {
 	vin := strings.ToUpper(strings.TrimSpace(c.Params("vin")))
+	const markerStart = `<script id="carfix-official-pdf" type="application/pdf-base64">`
 
 	var rawHtml string
-	if err := bootstrap.DB.Model(&models.ReportCache{}).
-		Select("raw_html_en").
-		Where("vin = ?", vin).
-		Scan(&rawHtml).Error; err != nil || rawHtml == "" {
-		return c.Status(404).JSON(fiber.Map{"message": "التقرير غير موجود"})
+	var startIdx int = -1
+
+	for attempt := 0; attempt < 18; attempt++ {
+		rawHtml = ""
+		_ = bootstrap.DB.Model(&models.ReportCache{}).
+			Select("raw_html_en").
+			Where("vin = ?", vin).
+			Scan(&rawHtml).Error
+
+		if rawHtml != "" {
+			startIdx = strings.Index(rawHtml, markerStart)
+			if startIdx != -1 {
+				break
+			}
+		}
+		time.Sleep(800 * time.Millisecond)
 	}
 
-	const markerStart = `<script id="carfix-official-pdf" type="application/pdf-base64">`
-	startIdx := strings.Index(rawHtml, markerStart)
-	if startIdx == -1 {
+	if rawHtml == "" || startIdx == -1 {
 		return c.Status(404).JSON(fiber.Map{"message": "ملف الطباعة الرسمي PDF غير متوفر لهذا التقرير"})
 	}
 	contentStart := startIdx + len(markerStart)
