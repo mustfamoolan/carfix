@@ -84,30 +84,42 @@ export default function VinSearchBox({ onSuccessSearch, inputRef }) {
 
     setSpecsLoading(true)
     setVinCheckError('')
-    let localErr = ''
+    setVehicleSpecs(null)
     try {
-      // 1. Local VIN syntax check
+      // 1. Strict Backend VIN Check Digit & Structure Verification
       try {
         const valRes = await api.post('/tools/vin-validate', { vin: vinCode })
-        if (valRes && valRes.is_valid === false && valRes.error_msg) {
-          localErr = valRes.error_msg
-          setVinCheckError(localErr)
+        if (valRes && valRes.is_valid === false) {
+          const msg =
+            valRes.error_msg ||
+            'رقم الشاصي غير صحيح: يوجد خطأ في أحد الأرقام أو الحروف، يرجى مراجعة الرقم بدقة'
+          setVehicleSpecs(null)
+          setVinCheckError(msg)
+          setCachedVinSpecs(vinCode, { specs: null, error: msg })
+          setSpecsLoading(false)
+          return
         }
       } catch {
-        // Ignore local tool check failure
+        // Continue to factory lookup if local check endpoint had a transient network blip
       }
 
-      // 2. Vehicle Factory Specifications Lookup
+      // 2. Vehicle Factory Specifications Lookup (Strict Real Make & Check Digit verification)
       const res = await fetch(
         `https://vpic.nhtsa.dot.gov/api/vehicles/DecodeVinValues/${vinCode}?format=json`
       )
       const data = await res.json()
       if (data?.Results?.[0]) {
         const item = data.Results[0]
-        const errCode = String(item.ErrorCode || '')
-        const hasValidMakeOrYear = Boolean(item.Make || item.ModelYear)
+        const errCodes = String(item.ErrorCode || '')
+          .split(',')
+          .map((c) => c.trim())
+        const hasFatalVinError =
+          errCodes.includes('1') || errCodes.includes('6') || errCodes.includes('7')
+        const realMake = (item.Make || '').trim()
+        const realYear = (item.ModelYear || '').trim()
+        const realModel = (item.Model || item.Series || '').trim()
 
-        if (hasValidMakeOrYear) {
+        if (realMake && realYear && !hasFatalVinError) {
           const engineParts = [
             item.DisplacementL ? `${Number(item.DisplacementL).toFixed(1)}L` : '',
             item.EngineConfiguration || '',
@@ -117,26 +129,33 @@ export default function VinSearchBox({ onSuccessSearch, inputRef }) {
             .join(' ')
 
           const decoded = {
-            year: item.ModelYear || '—',
-            make: item.Make || '—',
-            model: item.Model || '—',
-            trim: item.Trim || item.Series || '',
-            title: `${item.ModelYear || ''} ${item.Make || ''} ${item.Model || ''} ${item.Trim || ''}`.trim(),
-            body: item.BodyClass || item.VehicleType || 'Passenger Vehicle',
-            engine: engineParts || item.FuelTypePrimary || 'Standard Engine',
-            drive: item.DriveType || 'Standard Drive',
-            fuel: item.FuelTypePrimary || 'Gasoline',
-            country: item.PlantCountry || item.PlantState || 'North America',
-            manufacturer: item.Manufacturer || '',
-            isCheckDigitValid: errCode.startsWith('0'),
+            year: realYear,
+            make: realMake,
+            model: realModel,
+            trim: (item.Trim || '').trim(),
+            title: `${realYear} ${realMake} ${realModel} ${item.Trim || ''}`.replace(/\s+/g, ' ').trim(),
+            body: (item.BodyClass || item.VehicleType || 'غير محدد').trim(),
+            engine: (engineParts || item.EngineModel || item.FuelTypePrimary || 'غير محدد').trim(),
+            drive: (item.DriveType || '').trim(),
+            fuel: (item.FuelTypePrimary || 'غير محدد').trim(),
+            country: (item.PlantCountry || item.PlantState || 'غير محدد').trim(),
+            manufacturer: (item.Manufacturer || '').trim(),
+            isCheckDigitValid: true,
           }
           setVehicleSpecs(decoded)
+          setVinCheckError('')
           setCachedVinSpecs(vinCode, { specs: decoded, error: '' })
         } else {
-          const errMsg = localErr || 'يرجى التأكد من صحة كتابة رقم الشاصي'
+          const errMsg =
+            'رقم الشاصي غير صحيح أو غير مسجل لأي مركبة حقيقية — يرجى التأكد من صحة جميع الأرقام والحروف'
+          setVehicleSpecs(null)
           setVinCheckError(errMsg)
           setCachedVinSpecs(vinCode, { specs: null, error: errMsg })
         }
+      } else {
+        const errMsg = 'تعذر التحقق من رقم الشاصي، يرجى التأكد من صحة الرقم'
+        setVehicleSpecs(null)
+        setVinCheckError(errMsg)
       }
     } catch {
       // Ignore network error
@@ -158,6 +177,16 @@ export default function VinSearchBox({ onSuccessSearch, inputRef }) {
     e.preventDefault()
     if (vin.length !== 17) {
       toast.error('رقم الشاصي (VIN) يجب أن يتكون من 17 رمزاً')
+      return
+    }
+    if (specsLoading) {
+      toast.info('يرجى الانتظار لحظة ريثما يكتمل التحقق المبدئي من صحة رقم الشاصي')
+      return
+    }
+    if (vinCheckError || !vehicleSpecs) {
+      toast.error(
+        vinCheckError || 'رقم الشاصي غير صحيح، لا يمكن إرسال طلب فحص لرقم خاطئ'
+      )
       return
     }
 
@@ -182,7 +211,8 @@ export default function VinSearchBox({ onSuccessSearch, inputRef }) {
     }
   }
 
-  const isReady = vin.length === 17
+  const isReady =
+    vin.length === 17 && !specsLoading && Boolean(vehicleSpecs) && !vinCheckError
 
   return (
     <div className="bg-white dark:bg-card rounded-md shadow-md border border-slate-200/90 dark:border-border p-5 sm:p-6 flex flex-col justify-between h-full">
@@ -298,11 +328,11 @@ export default function VinSearchBox({ onSuccessSearch, inputRef }) {
       {/* 2. VIN Validation Error Warning */}
       {!specsLoading && vinCheckError && !vehicleSpecs && (
         <div
-          className="mt-4 flex items-center gap-2 p-3 bg-amber-50 dark:bg-amber-950/30 rounded-lg border border-amber-200 text-xs text-amber-800 dark:text-amber-300"
+          className="mt-4 flex items-center gap-2 p-3 bg-rose-50 dark:bg-rose-950/30 rounded-lg border border-rose-200 text-xs text-rose-800 dark:text-rose-300"
           dir="rtl"
         >
-          <AlertTriangle className="h-4 w-4 shrink-0 text-amber-600" />
-          <span className="font-semibold">{vinCheckError}</span>
+          <AlertTriangle className="h-4 w-4 shrink-0 text-rose-600" />
+          <span className="font-bold">{vinCheckError}</span>
         </div>
       )}
 
@@ -348,7 +378,8 @@ export default function VinSearchBox({ onSuccessSearch, inputRef }) {
             <div className="bg-white dark:bg-card p-2.5 rounded border border-slate-200/80 dark:border-border">
               <span className="text-slate-500 block text-[10px] font-semibold">المحرك والدفع:</span>
               <span className="font-bold text-slate-800 dark:text-foreground block mt-0.5" dir="ltr">
-                {vehicleSpecs.engine} ({vehicleSpecs.drive})
+                {vehicleSpecs.engine}
+                {vehicleSpecs.drive ? ` (${vehicleSpecs.drive})` : ''}
               </span>
             </div>
             <div className="bg-white dark:bg-card p-2.5 rounded border border-slate-200/80 dark:border-border">
