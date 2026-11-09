@@ -384,6 +384,55 @@ func (s *WorkerGuardService) IsVinPendingOrActive(vin string) bool {
 	return false
 }
 
+// RemoveFromQueue removes a specific VIN from the FIFO waiting queue
+func (s *WorkerGuardService) RemoveFromQueue(vin string) error {
+	if bootstrap.Redis == nil {
+		return nil
+	}
+	ctx := context.Background()
+	cleanVin := strings.ToUpper(strings.TrimSpace(vin))
+	return bootstrap.Redis.LRem(ctx, "canada:tasks:queue", 0, cleanVin).Err()
+}
+
+// PromoteInQueue moves a specific VIN to the front (top) of the waiting queue
+func (s *WorkerGuardService) PromoteInQueue(vin string) error {
+	if bootstrap.Redis == nil {
+		return nil
+	}
+	ctx := context.Background()
+	cleanVin := strings.ToUpper(strings.TrimSpace(vin))
+	// Remove from current position and LPUSH to the front
+	bootstrap.Redis.LRem(ctx, "canada:tasks:queue", 0, cleanVin)
+	return bootstrap.Redis.LPush(ctx, "canada:tasks:queue", cleanVin).Err()
+}
+
+// PurgeQueue completely clears all pending tasks in the waiting queue
+func (s *WorkerGuardService) PurgeQueue() error {
+	if bootstrap.Redis == nil {
+		return nil
+	}
+	ctx := context.Background()
+	return bootstrap.Redis.Del(ctx, "canada:tasks:queue").Err()
+}
+
+// GetDetailedQueue returns the active VIN and the ordered list of VINs currently waiting in queue
+func (s *WorkerGuardService) GetDetailedQueue() (string, *WorkerProgress, []string) {
+	if bootstrap.Redis == nil {
+		return "", nil, nil
+	}
+	ctx := context.Background()
+	activeVin, _ := bootstrap.Redis.Get(ctx, "canada:active_vin").Result()
+	var activeProg *WorkerProgress
+	if pBytes, err := bootstrap.Redis.Get(ctx, "canada:active_progress").Bytes(); err == nil && len(pBytes) > 0 {
+		var p WorkerProgress
+		if json.Unmarshal(pBytes, &p) == nil {
+			activeProg = &p
+		}
+	}
+	list, _ := bootstrap.Redis.LRange(ctx, "canada:tasks:queue", 0, -1).Result()
+	return activeVin, activeProg, list
+}
+
 // EnqueueSearchTask pushes VIN into the sequential FIFO queue with Singleflight In-Flight Deduplication
 func (s *WorkerGuardService) EnqueueSearchTask(vin string) error {
 	if bootstrap.Redis == nil {

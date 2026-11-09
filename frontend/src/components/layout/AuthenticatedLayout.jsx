@@ -8,6 +8,7 @@ import {
   History,
   Users,
   Activity,
+  ListOrdered,
   Shield,
   User as UserIcon,
   LogOut,
@@ -47,6 +48,11 @@ export default function AuthenticatedLayout({ children, title }) {
             path: '/admin/logs',
             label: 'سجل العمليات',
             icon: Activity,
+          },
+          {
+            path: '/admin/queue',
+            label: 'طابور السحب اللحظي',
+            icon: ListOrdered,
           },
           {
             path: '/admin/copart',

@@ -183,6 +183,54 @@ func (ctrl *WorkerController) ResetCircuitBreaker(c *fiber.Ctx) error {
 	})
 }
 
+// GetQueueDetails returns the active task and full list of pending tasks in queue
+func (ctrl *WorkerController) GetQueueDetails(c *fiber.Ctx) error {
+	activeVin, activeProg, queueList := ctrl.guard.GetDetailedQueue()
+	cooldown := ctrl.guard.GetCooldownRemainingSec()
+	connected := ctrl.guard.IsConnected()
+
+	return c.JSON(fiber.Map{
+		"connected":        connected,
+		"active_vin":       activeVin,
+		"active_progress":  activeProg,
+		"queue":            queueList,
+		"queue_count":      len(queueList),
+		"cooldown_seconds": cooldown,
+	})
+}
+
+// RemoveQueueTask removes a VIN from the waiting queue
+func (ctrl *WorkerController) RemoveQueueTask(c *fiber.Ctx) error {
+	vin := c.Params("vin")
+	if vin == "" {
+		return c.Status(400).JSON(fiber.Map{"error": "رقم الشاصي مطلوب"})
+	}
+	if err := ctrl.guard.RemoveFromQueue(vin); err != nil {
+		return c.Status(500).JSON(fiber.Map{"error": err.Error()})
+	}
+	return c.JSON(fiber.Map{"status": "ok", "message": "تم حذف الشاصي من قائمة الانتظار بنجاح"})
+}
+
+// PromoteQueueTask moves a VIN to the front of the queue
+func (ctrl *WorkerController) PromoteQueueTask(c *fiber.Ctx) error {
+	vin := c.Params("vin")
+	if vin == "" {
+		return c.Status(400).JSON(fiber.Map{"error": "رقم الشاصي مطلوب"})
+	}
+	if err := ctrl.guard.PromoteInQueue(vin); err != nil {
+		return c.Status(500).JSON(fiber.Map{"error": err.Error()})
+	}
+	return c.JSON(fiber.Map{"status": "ok", "message": "تم تقديم الشاصي إلى مقدمة الطابور كأولوية قصوى"})
+}
+
+// PurgeAllQueue clears all pending tasks
+func (ctrl *WorkerController) PurgeAllQueue(c *fiber.Ctx) error {
+	if err := ctrl.guard.PurgeQueue(); err != nil {
+		return c.Status(500).JSON(fiber.Map{"error": err.Error()})
+	}
+	return c.JSON(fiber.Map{"status": "ok", "message": "تم تفريغ قائمة الانتظار بالكامل"})
+}
+
 // SetWorkerMode toggles between Strict Live Canada Mode and Mock Simulation Fallback
 func (ctrl *WorkerController) SetWorkerMode(c *fiber.Ctx) error {
 	var body struct {

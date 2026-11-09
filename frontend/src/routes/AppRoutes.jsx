@@ -8,6 +8,7 @@ import HistoryView from '@/views/HistoryView'
 import ReportView from '@/views/ReportView'
 import AdminUsersView from '@/views/AdminUsersView'
 import AdminLogsView from '@/views/AdminLogsView'
+import AdminQueueView from '@/views/AdminQueueView'
 import AdminCopartView from '@/views/AdminCopartView'
 
 export default function AppRoutes() {
@@ -61,6 +62,15 @@ export default function AppRoutes() {
         element={
           <ProtectedRoute>
             <AdminLogsView />
+          </ProtectedRoute>
+        }
+      />
+
+      <Route
+        path="/admin/queue"
+        element={
+          <ProtectedRoute>
+            <AdminQueueView />
           </ProtectedRoute>
         }
       />

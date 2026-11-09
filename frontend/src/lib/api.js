@@ -108,8 +108,9 @@ export const searchVin = async (vin) => {
   const cleanVin = String(vin).trim().toUpperCase()
   let res = null
 
-  // Seamless Long-Polling Continuation (up to 4 cycles = ~3.5 minutes queue capacity without 504 gateway timeout)
-  for (let cycle = 1; cycle <= 4; cycle++) {
+  // Adaptive Polling: never give up while task is in queue or actively being fetched!
+  // Checks up to 100 cycles (~15 minutes capacity for large queues)
+  for (let cycle = 1; cycle <= 100; cycle++) {
     try {
       res = await api.post('/search', { vin: cleanVin })
       if (res?.status === 'processing') {
@@ -118,29 +119,36 @@ export const searchVin = async (vin) => {
       }
       break
     } catch (err) {
-      // Do not retry on explicit auth/quota/validation errors (400, 401, 403)
-      if (err?.status === 400 || err?.status === 401 || err?.status === 403) {
+      // Do not retry on explicit client/auth/quota/validation errors (400, 401, 403, 404)
+      if (err?.status === 400 || err?.status === 401 || err?.status === 403 || err?.status === 404) {
         throw err
       }
-      // If a proxy/network blip interrupted the long-poll while the VIN is still queued or ready on server, recover seamlessly
+      // If a proxy/network blip or gateway timeout happened while the VIN is still queued or active, keep waiting smoothly
       try {
         const qStatus = await api.get(`/search/queue-status/${cleanVin}`)
+        const data = qStatus?.data || qStatus
         if (
-          qStatus?.is_ready ||
-          (qStatus?.status === 'queued' && (qStatus?.queue_position > 0 || qStatus?.is_active))
+          data?.is_ready ||
+          data?.status === 'ready' ||
+          data?.is_active ||
+          (data?.status === 'queued' && (data?.queue_position > 0 || data?.worker_online))
         ) {
-          await new Promise((r) => setTimeout(r, 1500))
+          if (data?.is_ready && data?.report) {
+            res = data.report
+            break
+          }
+          await new Promise((r) => setTimeout(r, 2000))
           continue
         }
       } catch {
-        // Ignore status check error
+        // Status check had network blip, continue waiting if within safe limit
       }
       throw err
     }
   }
 
   if (res?.status === 'processing') {
-    throw new Error('استغرقت عملية البحث وقتاً أطول من المعتاد، يرجى المحاولة بعد قليل')
+    throw new Error('الطلب لا يزال في قائمة الانتظار، يرجى الاستمرار في الانتظار أو مراجعة السجل بعد قليل')
   }
 
   invalidateCache('user:searches')
@@ -231,3 +239,9 @@ export const getAdminSearchLogs = async (params = {}) => {
   setCachedData(key, res)
   return res
 }
+
+// Queue Management APIs
+export const getAdminQueue = () => api.get('/admin/worker/queue-details')
+export const removeAdminQueueTask = (vin) => api.delete(`/admin/worker/queue/${vin}`)
+export const promoteAdminQueueTask = (vin) => api.post(`/admin/worker/queue/${vin}/promote`, {})
+export const purgeAdminQueue = () => api.post('/admin/worker/queue/purge', {})
