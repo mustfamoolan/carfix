@@ -168,10 +168,12 @@ func (s *WorkerGuardService) RecordHeartbeat() {
 	}
 	ctx := context.Background()
 	now := time.Now().Unix()
-	bootstrap.Redis.Set(ctx, "canada:last_heartbeat", now, 2*time.Minute)
+	bootstrap.Redis.Set(ctx, "canada:last_heartbeat", now, 3*time.Minute)
 }
 
-// IsConnected checks if worker sent heartbeat within last 20 seconds
+// IsConnected checks if worker sent heartbeat within last 60 seconds.
+// Threshold raised from 20s → 60s to tolerate cooldown gaps (13-15s poll interval)
+// and transient network jitter between Canada node and VPS without false "disconnected" alerts.
 func (s *WorkerGuardService) IsConnected() bool {
 	if bootstrap.Redis == nil {
 		return false
@@ -181,7 +183,7 @@ func (s *WorkerGuardService) IsConnected() bool {
 	if err != nil {
 		return false
 	}
-	return (time.Now().Unix() - val) <= 20
+	return (time.Now().Unix() - val) <= 60
 }
 
 // RequestImmediateInspect sets a flag telling Canada Worker to take a fresh JPEG screenshot on next poll

@@ -147,6 +147,20 @@ func (ctrl *WorkerController) Complete(c *fiber.Ctx) error {
 	})
 }
 
+// Heartbeat is a lightweight keep-alive endpoint called by the Canada node every ~10s.
+// It records a heartbeat without triggering any task logic, preventing false "disconnected" alerts
+// during long cooldown gaps or when the queue is empty and the node is idle.
+func (ctrl *WorkerController) Heartbeat(c *fiber.Ctx) error {
+	if !ctrl.verifySecret(c) {
+		return c.Status(401).JSON(fiber.Map{"error": "غير مصرح"})
+	}
+	ctrl.guard.RecordHeartbeat()
+	return c.JSON(fiber.Map{
+		"status": "ok",
+		"ts":     c.Context().Time().Unix(),
+	})
+}
+
 // GetWorkerStatus returns the live status, telemetry, and screenshot of Canada Node
 func (ctrl *WorkerController) GetWorkerStatus(c *fiber.Ctx) error {
 	status := ctrl.guard.GetStatus()

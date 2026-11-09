@@ -78,6 +78,7 @@ func RegisterAPIRoutes(app *fiber.App) {
 
 	// Remote Worker Secured Endpoints (Header: X-Worker-Secret)
 	worker := api.Group("/worker")
+	worker.Post("/heartbeat", workerController.Heartbeat)
 	worker.Get("/poll", workerController.Poll)
 	worker.Post("/telemetry", workerController.Telemetry)
 	worker.Post("/progress", workerController.Progress)
