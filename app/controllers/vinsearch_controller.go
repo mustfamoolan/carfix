@@ -587,51 +587,42 @@ func (ctrl *VinSearchController) fetchFromCanadaNode(vin string) (string, string
 		return "", "", "", fmt.Errorf("الخدمة مشغولة حالياً أو قيد التحديث اللحظي، يرجى المحاولة بعد قليل")
 	}
 
-	// 2. If Worker is online, dispatch strictly to Worker (with 1 automatic silent retry on transient DOM/typing hiccup)
-	if ctrl.workerGuard.IsConnected() {
-		for attempt := 1; attempt <= 2; attempt++ {
-			if err := ctrl.workerGuard.EnqueueSearchTask(vin); err != nil {
-				return "", "", "", fmt.Errorf("تعذر إرسال الطلب حالياً، يرجى المحاولة مرة أخرى")
-			}
-
-			// Wait up to 48s per HTTP cycle (safely below Nginx/Cloudflare 60s gateway timeout)
-			res, err := ctrl.workerGuard.WaitForReport(vin, 48*time.Second)
-			if err != nil {
-				// If the report is still in queue or actively being extracted by the worker,
-				// signal 202 Processing continuation instead of failing!
-				if ctrl.workerGuard.IsVinPendingOrActive(vin) && ctrl.workerGuard.IsConnected() {
-					return "", "", "", ErrStillInQueue
-				}
-				return "", "", "", fmt.Errorf("استغرقت عملية البحث وقتاً أطول من المعتاد، يرجى المحاولة بعد قليل")
-			}
-
-			if res != nil && res.ErrorCode != "" {
-				if res.ErrorCode == "VIN_NOT_FOUND_ON_CARFAX" {
-					return "", "", "", fmt.Errorf("لم يتم العثور على سجلات لهذا الرقم، يرجى التأكد من صحة رقم الشاصي")
-				}
-				// If it was a transient browser focus/typing/tab hiccup on attempt 1, retry once silently
-				if attempt == 1 && (res.ErrorCode == "VIN_TYPE_ERROR" || res.ErrorCode == "TAB_LOST" || res.ErrorCode == "VIN_INPUT_NOT_FOUND") {
-					time.Sleep(1500 * time.Millisecond)
-					continue
-				}
-				return "", "", "", fmt.Errorf("الخدمة مشغولة حالياً، يرجى المحاولة مرة أخرى بعد قليل")
-			}
-
-			if res != nil && (res.RawHtmlEn != "" || res.FastSummaryJson != "") {
-				return res.RawHtmlEn, res.VehicleTitle, res.FastSummaryJson, nil
-			}
+	// 2. Dispatch to Queue (persisted in Redis FIFO queue)
+	// Whether worker is currently connected or temporarily disconnected, task MUST be enqueued safely!
+	for attempt := 1; attempt <= 2; attempt++ {
+		if err := ctrl.workerGuard.EnqueueSearchTask(vin); err != nil {
+			return "", "", "", fmt.Errorf("تعذر إرسال الطلب حالياً، يرجى المحاولة مرة أخرى")
 		}
 
-		return "", "", "", fmt.Errorf("تعذر استخراج بيانات التقرير، يرجى المحاولة مرة أخرى")
+		// Wait up to 48s per HTTP cycle (safely below Nginx/Cloudflare 60s gateway timeout)
+		res, err := ctrl.workerGuard.WaitForReport(vin, 48*time.Second)
+		if err != nil {
+			// If the report is still in queue or actively being extracted by the worker,
+			// signal 202 Processing continuation so client continues waiting seamlessly!
+			if ctrl.workerGuard.IsVinPendingOrActive(vin) {
+				return "", "", "", ErrStillInQueue
+			}
+			return "", "", "", fmt.Errorf("استغرقت عملية البحث وقتاً أطول من المعتاد، يرجى المحاولة بعد قليل")
+		}
+
+		if res != nil && res.ErrorCode != "" {
+			if res.ErrorCode == "VIN_NOT_FOUND_ON_CARFAX" {
+				return "", "", "", fmt.Errorf("لم يتم العثور على سجلات لهذا الرقم، يرجى التأكد من صحة رقم الشاصي")
+			}
+			// If it was a transient browser focus/typing/tab hiccup on attempt 1, retry once silently
+			if attempt == 1 && (res.ErrorCode == "VIN_TYPE_ERROR" || res.ErrorCode == "TAB_LOST" || res.ErrorCode == "VIN_INPUT_NOT_FOUND") {
+				time.Sleep(1500 * time.Millisecond)
+				continue
+			}
+			return "", "", "", fmt.Errorf("الخدمة مشغولة حالياً، يرجى المحاولة مرة أخرى بعد قليل")
+		}
+
+		if res != nil && (res.RawHtmlEn != "" || res.FastSummaryJson != "") {
+			return res.RawHtmlEn, res.VehicleTitle, res.FastSummaryJson, nil
+		}
 	}
 
-	// 3. Worker is offline: check if Mock Simulation Fallback is permitted
-	if !ctrl.workerGuard.IsMockFallbackEnabled() {
-		return "", "", "", fmt.Errorf("الخدمة قيد الصيانة اللحظية حالياً، يرجى المحاولة بعد قليل")
-	}
-
-	html, title, err := ctrl.fetchFromMock(vin)
-	return html, title, "", err
+	return "", "", "", fmt.Errorf("تعذر استخراج بيانات التقرير، يرجى المحاولة مرة أخرى")
 }
 
 // fetchFromMock generates a 100% faithful 6-Block Official CARFAX Vehicle History Report™

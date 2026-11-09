@@ -87,8 +87,9 @@ export default function CanadaWorkerCard({ status, onRefresh }) {
                 حاسبة كندا متصلة
               </Badge>
             ) : (
-              <Badge variant="secondary" className="text-muted-foreground font-medium py-1 px-2.5">
-                حاسبة كندا غير متصلة
+              <Badge variant="destructive" className="bg-rose-500 hover:bg-rose-600 text-white font-semibold py-1 px-2.5 animate-pulse gap-1">
+                <AlertCircle className="h-3.5 w-3.5" />
+                حاسبة كندا غير متصلة!
               </Badge>
             )}
 

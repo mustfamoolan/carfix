@@ -145,6 +145,31 @@ export default function AdminQueueView() {
           </div>
         </div>
 
+        {/* 0. Critical Alert Banner if Canada Node is Disconnected while Tasks are in Queue */}
+        {!connected && (
+          <div className="flex items-center gap-3 p-4 rounded-lg border-2 border-rose-500 bg-rose-50 dark:bg-rose-950/40 text-rose-900 dark:text-rose-200 shadow-sm animate-pulse">
+            <AlertTriangle className="h-6 w-6 text-rose-600 dark:text-rose-400 shrink-0" />
+            <div className="flex-1 text-xs">
+              <strong className="block text-sm font-extrabold text-rose-700 dark:text-rose-300">
+                تنبيه عاجل: انقطع اتصال حاسبة كندا بالسيرفر!
+              </strong>
+              <span>
+                {queue.length > 0 || activeVin
+                  ? `توجد (${queue.length + (activeVin ? 1 : 0)}) طلبات محفوظة في الطابور الآن تنتظر الاستئناف فور تشغيل برنامج كندا.`
+                  : 'حاسبة كندا غير متصلة حالياً. يرجى التأكد من تشغيل الحاسبة وبرنامج السحب لمواصلة معالجة الطلبات.'}
+              </span>
+            </div>
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={() => fetchQueue(true)}
+              className="border-rose-400 bg-white dark:bg-rose-900/60 text-rose-800 dark:text-rose-200 hover:bg-rose-100 text-xs shrink-0 cursor-pointer"
+            >
+              فحص الاتصال
+            </Button>
+          </div>
+        )}
+
         {/* 1. Active In-Flight Task (Being pulled by Canada right now) */}
         <Card className="border-border shadow-xs bg-card">
           <CardHeader className="py-3 px-4 sm:px-5 border-b border-border flex flex-row items-center justify-between">
@@ -279,3 +304,4 @@ export default function AdminQueueView() {
     </AuthenticatedLayout>
   )
 }
+
