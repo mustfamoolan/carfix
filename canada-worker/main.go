@@ -113,9 +113,40 @@ func main() {
 	worker.Run(ctx)
 }
 
+// sendHeartbeat pings the server to signal the worker is alive.
+// Called independently of the poll loop so the server never shows "disconnected"
+// during long harvest operations or mandatory cooldown gaps.
+func (w *CanadaWorker) sendHeartbeat() {
+	req, err := http.NewRequest("POST", w.serverURL+"/api/worker/heartbeat", nil)
+	if err != nil {
+		return
+	}
+	req.Header.Set("X-Worker-Secret", w.secretKey)
+	resp, err := w.client.Do(req)
+	if err == nil && resp != nil {
+		resp.Body.Close()
+	}
+}
+
 func (w *CanadaWorker) Run(ctx context.Context) {
 	ticker := time.NewTicker(w.pollInterval)
 	defer ticker.Stop()
+
+	// Independent heartbeat goroutine: fires every 10s regardless of poll/harvest state.
+	// This prevents false "disconnected" alerts during long Carfax harvests or cooldowns.
+	go func() {
+		hbTicker := time.NewTicker(10 * time.Second)
+		defer hbTicker.Stop()
+		w.sendHeartbeat() // immediate first beat on startup
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-hbTicker.C:
+				w.sendHeartbeat()
+			}
+		}
+	}()
 
 	for {
 		select {

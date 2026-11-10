@@ -2,7 +2,7 @@
 ; Generates a clean 1-click installer that updates canada_worker.exe without ever losing Chrome login cookies
 
 #define MyAppName "CarFix Canada Node"
-#define MyAppVersion "2.1.0"
+#define MyAppVersion "2.2.0"
 #define MyAppPublisher "CarFix Platform"
 #define MyAppURL "https://vinreport.tech"
 
