@@ -429,7 +429,11 @@ export default function AdminWorkersView() {
                           {isExpanded && (
                             <div className="rounded-lg overflow-hidden border border-border bg-black/90 p-1">
                               <img
-                                src={`data:image/jpeg;base64,${node.last_screenshot_base64}`}
+                                src={
+                                  node.last_screenshot_base64.startsWith('data:')
+                                    ? node.last_screenshot_base64
+                                    : `data:image/jpeg;base64,${node.last_screenshot_base64}`
+                                }
                                 alt={`Live Screen ${node.worker_id}`}
                                 className="w-full h-auto rounded object-contain max-h-80"
                               />
