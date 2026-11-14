@@ -72,6 +72,7 @@ func RegisterAPIRoutes(app *fiber.App) {
 	admin.Post("/worker-stop", workerController.EmergencyStop)
 	admin.Post("/worker-reset", workerController.ResetCircuitBreaker)
 	admin.Post("/worker-mode", workerController.SetWorkerMode)
+	admin.Delete("/worker/nodes/:id", workerController.DeleteNode)
 
 	// Also allow authenticated dashboard to read worker status
 	api.Get("/worker-status", middleware.AuthMiddleware(), workerController.GetWorkerStatus)

@@ -23,6 +23,19 @@ func (ctrl *WorkerController) verifySecret(c *fiber.Ctx) bool {
 	return ctrl.guard.ValidateSecret(secret)
 }
 
+// extractNodeInfo extracts worker ID and Name from request headers
+func extractNodeInfo(c *fiber.Ctx) (string, string) {
+	nodeID := c.Get("X-Worker-ID")
+	if nodeID == "" {
+		nodeID = c.Query("node_id")
+	}
+	nodeName := c.Get("X-Worker-Name")
+	if nodeName == "" {
+		nodeName = c.Query("node_name")
+	}
+	return nodeID, nodeName
+}
+
 // Poll delivers the next queued VIN or an inspect request to the Canada node
 func (ctrl *WorkerController) Poll(c *fiber.Ctx) error {
 	if !ctrl.verifySecret(c) {
@@ -31,15 +44,17 @@ func (ctrl *WorkerController) Poll(c *fiber.Ctx) error {
 		})
 	}
 
-	inspectRequested := ctrl.guard.ConsumeInspectRequest()
+	nodeID, nodeName := extractNodeInfo(c)
+	inspectRequested := ctrl.guard.ConsumeInspectRequest(nodeID)
 
-	vin, cooldownRemaining, err := ctrl.guard.PollNextTask()
+	vin, cooldownRemaining, err := ctrl.guard.PollNextTask(nodeID, nodeName)
 	if err != nil {
 		if err == services.ErrCooldownActive {
 			return c.JSON(fiber.Map{
 				"has_task":           false,
 				"inspect_requested":  inspectRequested,
 				"cooldown_remaining": cooldownRemaining,
+				"node_id":            nodeID,
 				"message":            "فترة تهدئة لحماية الحساب من الحظر",
 			})
 		}
@@ -47,6 +62,7 @@ func (ctrl *WorkerController) Poll(c *fiber.Ctx) error {
 			return c.JSON(fiber.Map{
 				"has_task":          false,
 				"inspect_requested": inspectRequested,
+				"node_id":           nodeID,
 				"message":           "لا توجد مهام حالياً",
 			})
 		}
@@ -55,6 +71,7 @@ func (ctrl *WorkerController) Poll(c *fiber.Ctx) error {
 				"has_task":          false,
 				"inspect_requested": inspectRequested,
 				"daily_limit_hit":   true,
+				"node_id":           nodeID,
 				"message":           err.Error(),
 			})
 		}
@@ -62,6 +79,7 @@ func (ctrl *WorkerController) Poll(c *fiber.Ctx) error {
 			"has_task":          false,
 			"inspect_requested": inspectRequested,
 			"circuit_breaker":   true,
+			"node_id":           nodeID,
 			"message":           err.Error(),
 		})
 	}
@@ -69,6 +87,7 @@ func (ctrl *WorkerController) Poll(c *fiber.Ctx) error {
 	return c.JSON(fiber.Map{
 		"has_task":          true,
 		"inspect_requested": inspectRequested,
+		"node_id":           nodeID,
 		"vin":               vin,
 	})
 }
@@ -84,8 +103,9 @@ func (ctrl *WorkerController) Telemetry(c *fiber.Ctx) error {
 		return c.Status(400).JSON(fiber.Map{"error": "بيانات الفحص غير صالحة"})
 	}
 
-	ctrl.guard.SaveTelemetry(&payload)
-	return c.JSON(fiber.Map{"status": "ok"})
+	nodeID, nodeName := extractNodeInfo(c)
+	ctrl.guard.SaveTelemetry(&payload, nodeID, nodeName)
+	return c.JSON(fiber.Map{"status": "ok", "node_id": nodeID})
 }
 
 // Progress receives step-by-step live status while Canada node is harvesting a report
@@ -99,8 +119,9 @@ func (ctrl *WorkerController) Progress(c *fiber.Ctx) error {
 		return c.Status(400).JSON(fiber.Map{"error": "بيانات التقدم غير صالحة"})
 	}
 
-	ctrl.guard.SaveProgress(&payload)
-	return c.JSON(fiber.Map{"status": "ok"})
+	nodeID, nodeName := extractNodeInfo(c)
+	ctrl.guard.SaveProgress(&payload, nodeID, nodeName)
+	return c.JSON(fiber.Map{"status": "ok", "node_id": nodeID})
 }
 
 // Complete receives fetched report from Canada node or One-Shot safety freeze alert
@@ -116,6 +137,14 @@ func (ctrl *WorkerController) Complete(c *fiber.Ctx) error {
 		return c.Status(400).JSON(fiber.Map{"error": "بنية البيانات غير صالحة"})
 	}
 
+	nodeID, nodeName := extractNodeInfo(c)
+	if payload.WorkerID == "" {
+		payload.WorkerID = nodeID
+	}
+	if payload.WorkerName == "" {
+		payload.WorkerName = nodeName
+	}
+
 	if payload.VIN == "" {
 		return c.Status(400).JSON(fiber.Map{"error": "رقم الشاصي مطلوب"})
 	}
@@ -123,16 +152,16 @@ func (ctrl *WorkerController) Complete(c *fiber.Ctx) error {
 	// Stage 2 Silent Background Enrichment: Update existing ReportCache with full Carfax HTML + Official PDF
 	if payload.IsBackgroundEnrich && payload.ErrorCode == "" && payload.RawHtmlEn != "" {
 		UpsertReportCache(payload.VIN, payload.VehicleTitle, payload.RawHtmlEn, payload.FastSummaryJson, ctrl.translator)
-		ctrl.guard.TouchCooldownWithJitter()
+		ctrl.guard.TouchNodeCooldownWithJitter(payload.WorkerID)
 
 		return c.JSON(fiber.Map{
 			"status":  "enriched",
+			"node_id": payload.WorkerID,
 			"message": "تم تحديث التقرير بالنسخة الكاملة وملف الطباعة الرسمي بصمت",
 		})
 	}
 
 	// Stage 1 Immediate Worker-Side Persistence: Save completed report directly to PostgreSQL report_caches
-	// BEFORE waking up waiting HTTP requests, guaranteeing zero report loss even if a customer's browser disconnects!
 	if payload.ErrorCode == "" && (payload.RawHtmlEn != "" || payload.FastSummaryJson != "") {
 		UpsertReportCache(payload.VIN, payload.VehicleTitle, payload.RawHtmlEn, payload.FastSummaryJson, ctrl.translator)
 	}
@@ -143,21 +172,22 @@ func (ctrl *WorkerController) Complete(c *fiber.Ctx) error {
 
 	return c.JSON(fiber.Map{
 		"status":  "received",
+		"node_id": payload.WorkerID,
 		"message": "تم استلام النتيجة وتحديث حالة أمان الحساب بنجاح",
 	})
 }
 
 // Heartbeat is a lightweight keep-alive endpoint called by the Canada node every ~10s.
-// It records a heartbeat without triggering any task logic, preventing false "disconnected" alerts
-// during long cooldown gaps or when the queue is empty and the node is idle.
 func (ctrl *WorkerController) Heartbeat(c *fiber.Ctx) error {
 	if !ctrl.verifySecret(c) {
 		return c.Status(401).JSON(fiber.Map{"error": "غير مصرح"})
 	}
-	ctrl.guard.RecordHeartbeat()
+	nodeID, nodeName := extractNodeInfo(c)
+	ctrl.guard.RecordHeartbeat(nodeID, nodeName)
 	return c.JSON(fiber.Map{
-		"status": "ok",
-		"ts":     c.Context().Time().Unix(),
+		"status":  "ok",
+		"node_id": nodeID,
+		"ts":      c.Context().Time().Unix(),
 	})
 }
 
@@ -167,26 +197,73 @@ func (ctrl *WorkerController) GetWorkerStatus(c *fiber.Ctx) error {
 	return c.JSON(status)
 }
 
-// RequestInspect triggers an immediate screenshot + DOM check on the Canada Node
+// RequestInspect triggers an immediate screenshot + DOM check on Canada Node (node-specific or all)
 func (ctrl *WorkerController) RequestInspect(c *fiber.Ctx) error {
-	ctrl.guard.RequestImmediateInspect()
+	nodeID := c.Query("node_id")
+	if nodeID == "" {
+		var body struct {
+			NodeID string `json:"node_id"`
+		}
+		_ = c.BodyParser(&body)
+		nodeID = body.NodeID
+	}
+	ctrl.guard.RequestImmediateInspect(nodeID)
 	return c.JSON(fiber.Map{
 		"status":  "requested",
-		"message": "تم إرسال أمر فحص الشاشة والتقاط Screenshot مضغوط إلى حاسبة كندا",
+		"node_id": nodeID,
+		"message": "تم إرسال أمر فحص الشاشة والتقاط Screenshot مضغوط إلى العقدة",
 	})
 }
 
-// EmergencyStop manually trips the circuit breaker and clears pending tasks
+// EmergencyStop manually trips the circuit breaker for all nodes or a specific node
 func (ctrl *WorkerController) EmergencyStop(c *fiber.Ctx) error {
+	nodeID := c.Query("node_id")
+	if nodeID == "" {
+		var body struct {
+			NodeID string `json:"node_id"`
+		}
+		_ = c.BodyParser(&body)
+		nodeID = body.NodeID
+	}
+
+	if nodeID != "" {
+		_ = ctrl.guard.EmergencyStopNode(nodeID)
+		return c.JSON(fiber.Map{
+			"status":  "stopped",
+			"node_id": nodeID,
+			"message": "تم تفعيل الإيقاف الاحترازي للعقدة " + nodeID,
+		})
+	}
+
 	_ = ctrl.guard.EmergencyStop()
 	return c.JSON(fiber.Map{
 		"status":  "stopped",
-		"message": "تم تفعيل الإيقاف الاحترازي وتفريغ الطابور لحماية حساب كندا",
+		"message": "تم تفعيل الإيقاف الاحترازي وتفريغ الطابور لكافة العقد",
 	})
 }
 
 // ResetCircuitBreaker clears alarm after manual intervention
 func (ctrl *WorkerController) ResetCircuitBreaker(c *fiber.Ctx) error {
+	nodeID := c.Query("node_id")
+	if nodeID == "" {
+		var body struct {
+			NodeID string `json:"node_id"`
+		}
+		_ = c.BodyParser(&body)
+		nodeID = body.NodeID
+	}
+
+	if nodeID != "" {
+		if err := ctrl.guard.ResetNodeCircuitBreaker(nodeID); err != nil {
+			return c.Status(500).JSON(fiber.Map{"error": err.Error()})
+		}
+		return c.JSON(fiber.Map{
+			"status":  "reset",
+			"node_id": nodeID,
+			"message": "تمت إعادة تشغيل قاطع الحماية للعقدة " + nodeID,
+		})
+	}
+
 	if err := ctrl.guard.ResetCircuitBreaker(); err != nil {
 		return c.Status(500).JSON(fiber.Map{"error": err.Error()})
 	}
@@ -194,6 +271,25 @@ func (ctrl *WorkerController) ResetCircuitBreaker(c *fiber.Ctx) error {
 	return c.JSON(fiber.Map{
 		"status":  "reset",
 		"message": "تمت إعادة تفعيل قاطع الحماية واستئناف استقبال المهام بنجاح",
+	})
+}
+
+// DeleteNode removes a dead or decommissioned node from the cluster registry
+func (ctrl *WorkerController) DeleteNode(c *fiber.Ctx) error {
+	nodeID := c.Params("id")
+	if nodeID == "" {
+		nodeID = c.Query("node_id")
+	}
+	if nodeID == "" {
+		return c.Status(400).JSON(fiber.Map{"error": "معرف العقدة مطلوب"})
+	}
+	if err := ctrl.guard.DeleteNode(nodeID); err != nil {
+		return c.Status(500).JSON(fiber.Map{"error": err.Error()})
+	}
+	return c.JSON(fiber.Map{
+		"status":  "deleted",
+		"node_id": nodeID,
+		"message": "تم حذف العقدة من سجل الشبكة بنجاح",
 	})
 }
 

@@ -9,6 +9,7 @@ import {
   Users,
   Activity,
   ListOrdered,
+  Server,
   Shield,
   User as UserIcon,
   LogOut,
@@ -53,6 +54,11 @@ export default function AuthenticatedLayout({ children, title }) {
             path: '/admin/queue',
             label: 'طابور السحب اللحظي',
             icon: ListOrdered,
+          },
+          {
+            path: '/admin/workers',
+            label: 'شبكة حواسيب كندا',
+            icon: Server,
           },
           {
             path: '/admin/copart',

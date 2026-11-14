@@ -29,6 +29,8 @@ type PollResponse struct {
 }
 
 type CompleteRequest struct {
+	WorkerID           string    `json:"worker_id,omitempty"`
+	WorkerName         string    `json:"worker_name,omitempty"`
 	VIN                string    `json:"vin"`
 	VehicleTitle       string    `json:"vehicle_title"`
 	RawHtmlEn          string    `json:"raw_html_en"`
@@ -48,6 +50,8 @@ type ProgressUpdate struct {
 }
 
 type CanadaWorker struct {
+	nodeID       string
+	nodeName     string
 	serverURL    string
 	secretKey    string
 	cdpWsURL     string
@@ -59,6 +63,20 @@ type CanadaWorker struct {
 
 func main() {
 	_ = godotenv.Load()
+
+	nodeID := strings.TrimSpace(os.Getenv("WORKER_ID"))
+	if nodeID == "" {
+		nodeID = "canada-node-1"
+	}
+
+	nodeName := strings.TrimSpace(os.Getenv("WORKER_NAME"))
+	if nodeName == "" {
+		if nodeID == "canada-node-1" {
+			nodeName = "حاسبة كندا 1 (الأساسية)"
+		} else {
+			nodeName = "عقدة كندا (" + nodeID + ")"
+		}
+	}
 
 	serverURL := strings.TrimRight(strings.TrimSpace(os.Getenv("SERVER_BASE_URL")), "/")
 	if serverURL == "" {
@@ -83,6 +101,8 @@ func main() {
 	}
 
 	worker := &CanadaWorker{
+		nodeID:       nodeID,
+		nodeName:     nodeName,
 		serverURL:    serverURL,
 		secretKey:    secretKey,
 		cdpWsURL:     cdpWsURL,
@@ -92,13 +112,15 @@ func main() {
 	}
 
 	fmt.Println("=================================================================")
-	fmt.Println("   🇨🇦 CarFix Stealth Harvester Node (Canada One-Shot Anti-Ban)")
+	fmt.Println("   🇨🇦 CarFix Stealth Harvester Node (Cluster Multi-Node)")
 	fmt.Println("=================================================================")
+	fmt.Printf("[*] Node ID           : %s\n", nodeID)
+	fmt.Printf("[*] Node Name         : %s\n", nodeName)
 	fmt.Printf("[*] Master Server URL : %s\n", serverURL)
 	fmt.Printf("[*] Local Chrome CDP  : %s\n", cdpWsURL)
 	fmt.Printf("[*] Polling Cadence   : %v\n", worker.pollInterval)
 	fmt.Println("[*] Target Portal     : https://www.carfaxonline.com")
-	fmt.Println("[*] Safety Policy     : One-Shot Or Freeze (Zero Auto-Retry)")
+	fmt.Println("[*] Safety Policy     : Isolated One-Shot Freeze Per Node")
 	fmt.Println("=================================================================")
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -122,6 +144,8 @@ func (w *CanadaWorker) sendHeartbeat() {
 		return
 	}
 	req.Header.Set("X-Worker-Secret", w.secretKey)
+	req.Header.Set("X-Worker-ID", w.nodeID)
+	req.Header.Set("X-Worker-Name", w.nodeName)
 	resp, err := w.client.Do(req)
 	if err == nil && resp != nil {
 		resp.Body.Close()
@@ -229,6 +253,8 @@ func (w *CanadaWorker) pollAndExecute(ctx context.Context) {
 	)
 
 	completeReq := CompleteRequest{
+		WorkerID:           w.nodeID,
+		WorkerName:         w.nodeName,
 		VIN:                vin,
 		VehicleTitle:       harvestRes.VehicleTitle,
 		RawHtmlEn:          harvestRes.RawHtmlEn,
@@ -267,6 +293,8 @@ func (w *CanadaWorker) reportTelemetry(ctx context.Context, withScreenshot bool)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Worker-Secret", w.secretKey)
+	req.Header.Set("X-Worker-ID", w.nodeID)
+	req.Header.Set("X-Worker-Name", w.nodeName)
 
 	resp, err := w.client.Do(req)
 	if err == nil && resp != nil {
@@ -286,6 +314,8 @@ func (w *CanadaWorker) sendProgress(prog *ProgressUpdate) error {
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Worker-Secret", w.secretKey)
+	req.Header.Set("X-Worker-ID", w.nodeID)
+	req.Header.Set("X-Worker-Name", w.nodeName)
 
 	resp, err := w.client.Do(req)
 	if err != nil {
@@ -301,6 +331,8 @@ func (w *CanadaWorker) sendPoll() (*PollResponse, error) {
 		return nil, err
 	}
 	req.Header.Set("X-Worker-Secret", w.secretKey)
+	req.Header.Set("X-Worker-ID", w.nodeID)
+	req.Header.Set("X-Worker-Name", w.nodeName)
 
 	resp, err := w.client.Do(req)
 	if err != nil {
@@ -322,6 +354,13 @@ func (w *CanadaWorker) sendPoll() (*PollResponse, error) {
 }
 
 func (w *CanadaWorker) sendComplete(res *CompleteRequest) error {
+	if res.WorkerID == "" {
+		res.WorkerID = w.nodeID
+	}
+	if res.WorkerName == "" {
+		res.WorkerName = w.nodeName
+	}
+
 	payload, err := json.Marshal(res)
 	if err != nil {
 		return err
@@ -333,6 +372,8 @@ func (w *CanadaWorker) sendComplete(res *CompleteRequest) error {
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Worker-Secret", w.secretKey)
+	req.Header.Set("X-Worker-ID", w.nodeID)
+	req.Header.Set("X-Worker-Name", w.nodeName)
 
 	resp, err := w.client.Do(req)
 	if err != nil {

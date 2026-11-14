@@ -245,3 +245,16 @@ export const getAdminQueue = () => api.get('/admin/worker/queue-details')
 export const removeAdminQueueTask = (vin) => api.delete(`/admin/worker/queue/${vin}`)
 export const promoteAdminQueueTask = (vin) => api.post(`/admin/worker/queue/${vin}/promote`, {})
 export const purgeAdminQueue = () => api.post('/admin/worker/queue/purge', {})
+
+// Multi-Node Workers APIs
+export const getAdminWorkerStatus = () => api.get('/admin/worker-status')
+export const requestInspectNode = (nodeId = '') =>
+  api.post('/admin/worker-inspect', { node_id: nodeId })
+export const stopWorkerNode = (nodeId = '') =>
+  api.post('/admin/worker-stop', { node_id: nodeId })
+export const resetWorkerNode = (nodeId = '') =>
+  api.post('/admin/worker-reset', { node_id: nodeId })
+export const deleteWorkerNode = (nodeId) =>
+  api.delete(`/admin/worker/nodes/${nodeId}`)
+export const setWorkerFallbackMode = (enabled) =>
+  api.post('/admin/worker-mode', { use_mock_fallback: enabled })

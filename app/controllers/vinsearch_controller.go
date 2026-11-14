@@ -240,7 +240,7 @@ func (ctrl *VinSearchController) Search(c *fiber.Ctx) error {
 	}
 
 	// ==================== CACHE MISS ====================
-	rawHtmlEn, vehicleTitle, fastSummaryJson, err := ctrl.fetchFromCanadaNode(cleanVin)
+	rawHtmlEn, vehicleTitle, fastSummaryJson, workerID, workerName, err := ctrl.fetchFromCanadaNode(cleanVin)
 	if err != nil {
 		// If the VIN is still waiting in queue or actively being harvested after a 48s HTTP window,
 		// return 202 Processing so the client seamlessly continues waiting without 504/502 timeout or false error logs!
@@ -265,6 +265,9 @@ func (ctrl *VinSearchController) Search(c *fiber.Ctx) error {
 			VehicleTitle: "تعذر استخراج التقرير",
 			ResultStatus: "error",
 			FetchSource:  "live",
+			WorkerID:     workerID,
+			WorkerName:   workerName,
+			ErrorMessage: err.Error(),
 			DurationMs:   duration,
 			IPAddress:    ipAddress,
 			UserAgent:    userAgent,
@@ -292,13 +295,15 @@ func (ctrl *VinSearchController) Search(c *fiber.Ctx) error {
 
 	duration := time.Since(startTime).Milliseconds()
 
-	// Record successful search log
+	// Record successful search log with worker attribution
 	logEntry := models.SearchLog{
 		UserID:       userID,
 		VIN:          cleanVin,
 		VehicleTitle: newReport.VehicleTitle,
 		ResultStatus: "success",
 		FetchSource:  "canada_node",
+		WorkerID:     workerID,
+		WorkerName:   workerName,
 		DurationMs:   duration,
 		IPAddress:    ipAddress,
 		UserAgent:    userAgent,
@@ -581,48 +586,45 @@ func (ctrl *VinSearchController) GetReportPdf(c *fiber.Ctx) error {
 }
 
 // fetchFromCanadaNode communicates with the remote worker or falls back to simulation if permitted
-func (ctrl *VinSearchController) fetchFromCanadaNode(vin string) (string, string, string, error) {
+func (ctrl *VinSearchController) fetchFromCanadaNode(vin string) (string, string, string, string, string, error) {
 	// 1. Always respect Circuit Breaker first
 	if active, _ := ctrl.workerGuard.IsCircuitBreakerActive(); active {
-		return "", "", "", fmt.Errorf("الخدمة مشغولة حالياً أو قيد التحديث اللحظي، يرجى المحاولة بعد قليل")
+		return "", "", "", "", "", fmt.Errorf("الخدمة مشغولة حالياً أو قيد التحديث اللحظي، يرجى المحاولة بعد قليل")
 	}
 
 	// 2. Dispatch to Queue (persisted in Redis FIFO queue)
-	// Whether worker is currently connected or temporarily disconnected, task MUST be enqueued safely!
 	for attempt := 1; attempt <= 2; attempt++ {
 		if err := ctrl.workerGuard.EnqueueSearchTask(vin); err != nil {
-			return "", "", "", fmt.Errorf("تعذر إرسال الطلب حالياً، يرجى المحاولة مرة أخرى")
+			return "", "", "", "", "", fmt.Errorf("تعذر إرسال الطلب حالياً، يرجى المحاولة مرة أخرى")
 		}
 
 		// Wait up to 48s per HTTP cycle (safely below Nginx/Cloudflare 60s gateway timeout)
 		res, err := ctrl.workerGuard.WaitForReport(vin, 48*time.Second)
 		if err != nil {
-			// If the report is still in queue or actively being extracted by the worker,
-			// signal 202 Processing continuation so client continues waiting seamlessly!
 			if ctrl.workerGuard.IsVinPendingOrActive(vin) {
-				return "", "", "", ErrStillInQueue
+				return "", "", "", "", "", ErrStillInQueue
 			}
-			return "", "", "", fmt.Errorf("استغرقت عملية البحث وقتاً أطول من المعتاد، يرجى المحاولة بعد قليل")
+			return "", "", "", "", "", fmt.Errorf("استغرقت عملية البحث وقتاً أطول من المعتاد، يرجى المحاولة بعد قليل")
 		}
 
 		if res != nil && res.ErrorCode != "" {
 			if res.ErrorCode == "VIN_NOT_FOUND_ON_CARFAX" {
-				return "", "", "", fmt.Errorf("لم يتم العثور على سجلات لهذا الرقم، يرجى التأكد من صحة رقم الشاصي")
+				return "", "", "", res.WorkerID, res.WorkerName, fmt.Errorf("لم يتم العثور على سجلات لهذا الرقم، يرجى التأكد من صحة رقم الشاصي")
 			}
 			// If it was a transient browser focus/typing/tab hiccup on attempt 1, retry once silently
 			if attempt == 1 && (res.ErrorCode == "VIN_TYPE_ERROR" || res.ErrorCode == "TAB_LOST" || res.ErrorCode == "VIN_INPUT_NOT_FOUND") {
 				time.Sleep(1500 * time.Millisecond)
 				continue
 			}
-			return "", "", "", fmt.Errorf("الخدمة مشغولة حالياً، يرجى المحاولة مرة أخرى بعد قليل")
+			return "", "", "", res.WorkerID, res.WorkerName, fmt.Errorf("الخدمة مشغولة حالياً، يرجى المحاولة مرة أخرى بعد قليل")
 		}
 
 		if res != nil && (res.RawHtmlEn != "" || res.FastSummaryJson != "") {
-			return res.RawHtmlEn, res.VehicleTitle, res.FastSummaryJson, nil
+			return res.RawHtmlEn, res.VehicleTitle, res.FastSummaryJson, res.WorkerID, res.WorkerName, nil
 		}
 	}
 
-	return "", "", "", fmt.Errorf("تعذر استخراج بيانات التقرير، يرجى المحاولة مرة أخرى")
+	return "", "", "", "", "", fmt.Errorf("تعذر استخراج بيانات التقرير، يرجى المحاولة مرة أخرى")
 }
 
 // fetchFromMock generates a 100% faithful 6-Block Official CARFAX Vehicle History Report™

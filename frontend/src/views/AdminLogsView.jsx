@@ -167,6 +167,7 @@ export default function AdminLogsView() {
                         <TableHead className="text-right text-xs font-semibold">المستخدم</TableHead>
                         <TableHead className="text-right text-xs font-semibold">رقم الشاصي</TableHead>
                         <TableHead className="text-right text-xs font-semibold">المركبة</TableHead>
+                        <TableHead className="text-right text-xs font-semibold">الحاسبة (Node)</TableHead>
                         <TableHead className="text-right text-xs font-semibold">الحالة</TableHead>
                         <TableHead className="text-right text-xs font-semibold">التاريخ</TableHead>
                       </TableRow>
@@ -191,6 +192,17 @@ export default function AdminLogsView() {
                           </TableCell>
                           <TableCell className="text-xs text-foreground">
                             {log.vehicle_title || '—'}
+                          </TableCell>
+                          <TableCell className="text-xs font-mono">
+                            {log.worker_id ? (
+                              <span className="bg-primary/10 text-primary px-1.5 py-0.5 rounded text-[11px]">
+                                {log.worker_name || log.worker_id}
+                              </span>
+                            ) : (
+                              <span className="text-muted-foreground text-[11px]">
+                                {log.fetch_source === 'cache' ? 'Cache' : 'حاسبة 1'}
+                              </span>
+                            )}
                           </TableCell>
                           <TableCell>
                             <Badge
