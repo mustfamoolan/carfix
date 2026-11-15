@@ -102,6 +102,13 @@ export default function DashboardView() {
           const qRes = await getQueueStatus(item.vin)
           const info = qRes?.data || qRes
           if (info) {
+            if (info.is_ready || info.status === 'ready') {
+              markVinUnviewed(item.vin)
+              setPendingSearches((curr) => curr.filter((c) => c.vin !== item.vin))
+              loadSearches(false)
+              refreshUser()
+              continue
+            }
             setPendingSearches((curr) =>
               curr.map((c) => {
                 if (c.vin !== item.vin) return c

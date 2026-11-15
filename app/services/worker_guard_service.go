@@ -239,13 +239,23 @@ func sanitizeNodeID(id, name string) (string, string) {
 	return cleanID, cleanName
 }
 
-// TouchWaiterLease marks that a customer is actively waiting for this VIN right now (TTL 14s, refreshed every 2s by open browser)
+// TouchWaiterLease marks that a customer is actively waiting for this VIN right now (TTL 60s)
 func (s *WorkerGuardService) TouchWaiterLease(vin string) {
 	if bootstrap.Redis == nil || vin == "" {
 		return
 	}
 	cleanVin := strings.ToUpper(strings.TrimSpace(vin))
-	bootstrap.Redis.Set(context.Background(), "canada:waiter:"+cleanVin, "1", 14*time.Second)
+	bootstrap.Redis.Set(context.Background(), "canada:waiter:"+cleanVin, "1", 60*time.Second)
+}
+
+// IsVinCancelled checks if the customer explicitly closed/refreshed their page and cancelled this VIN
+func (s *WorkerGuardService) IsVinCancelled(vin string) bool {
+	if bootstrap.Redis == nil || vin == "" {
+		return false
+	}
+	cleanVin := strings.ToUpper(strings.TrimSpace(vin))
+	val, err := bootstrap.Redis.Get(context.Background(), "canada:cancelled:"+cleanVin).Result()
+	return err == nil && val == "1"
 }
 
 // CancelWaiterAndQueue immediately removes one or more VINs from the waiting queue when a user closes their browser page
@@ -260,6 +270,7 @@ func (s *WorkerGuardService) CancelWaiterAndQueue(vins []string) int {
 		if cleanVin == "" {
 			continue
 		}
+		bootstrap.Redis.Set(ctx, "canada:cancelled:"+cleanVin, "1", 20*time.Second)
 		bootstrap.Redis.Del(ctx, "canada:waiter:"+cleanVin)
 		// Only remove from waiting queue if not already completed
 		if state, _ := bootstrap.Redis.Get(ctx, "canada:task:state:"+cleanVin).Result(); state != "DONE" {
@@ -278,6 +289,9 @@ func (s *WorkerGuardService) HasActiveWaiter(vin string) bool {
 		return true
 	}
 	cleanVin := strings.ToUpper(strings.TrimSpace(vin))
+	if s.IsVinCancelled(cleanVin) {
+		return false
+	}
 	val, err := bootstrap.Redis.Get(context.Background(), "canada:waiter:"+cleanVin).Result()
 	return err == nil && val == "1"
 }
@@ -933,6 +947,9 @@ func (s *WorkerGuardService) EnqueueSearchTask(vin string) error {
 	ctx := context.Background()
 	cleanVin := strings.ToUpper(strings.TrimSpace(vin))
 
+	// Clear any prior tab-close cancellation flag when a fresh search request arrives
+	bootstrap.Redis.Del(ctx, "canada:cancelled:"+cleanVin)
+
 	// Always refresh customer waiter lease so worker knows a live user is waiting right now
 	s.TouchWaiterLease(cleanVin)
 
@@ -1424,15 +1441,20 @@ func (s *WorkerGuardService) WaitForReport(reqCtx context.Context, vin string, t
 			if res := checkCachedResult(); res != nil {
 				return res, nil
 			}
-			// If customer closed browser tab (waiter lease expired or cancelled via pagehide), abort immediately and dequeue!
-			if !s.HasActiveWaiter(cleanVin) {
+			// If customer explicitly closed their browser tab (triggered pagehide/beforeunload cancel), abort and dequeue immediately!
+			if s.IsVinCancelled(cleanVin) {
 				_ = s.RemoveFromQueue(cleanVin)
 				return nil, context.Canceled
 			}
+			// Otherwise keep the waiter lease alive while the HTTP search request is waiting
+			s.TouchWaiterLease(cleanVin)
 
 		case <-deadline:
 			if res := checkCachedResult(); res != nil {
 				return res, nil
+			}
+			if !s.IsVinCancelled(cleanVin) {
+				s.TouchWaiterLease(cleanVin)
 			}
 			return nil, ErrWorkerTimedOut
 		}

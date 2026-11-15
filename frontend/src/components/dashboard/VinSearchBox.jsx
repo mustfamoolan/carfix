@@ -203,7 +203,7 @@ export default function VinSearchBox({ onQueueSearch, activeSearchCount = 0, inp
   }
 
   const localValid = vin.length === 17 && validateVinLocally(vin).valid && !vinCheckError
-  const isReady = localValid && (Boolean(vehicleSpecs) || specsLoading)
+  const isReady = localValid
 
   return (
     <div className="bg-white dark:bg-card rounded-md shadow-md border border-slate-200/90 dark:border-border p-5 sm:p-6 flex flex-col justify-between h-full">
