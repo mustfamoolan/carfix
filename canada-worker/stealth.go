@@ -731,15 +731,25 @@ func (sh *StealthHarvester) HarvestBatchReports(
 	}
 
 	// If Chrome is open (and not on a login/captcha page) but not currently showing the VIN input box
-	// (e.g. left on a report tab or sub-page), navigate once automatically to https://www.carfaxonline.com/
+	// (e.g. briefly showing "Verifying Device" on /landingPage or left on a report tab),
+	// first wait gently if it's on /landingPage so Auth0 device verification can finish undisturbed!
 	if !state.VinInputFound && state.TabID != "" {
-		if navTabCtx, cleanupNav, err := sh.attachExistingTab(parentCtx, cdpEndpoint, state.TabID); err == nil {
-			_ = chromedp.Run(navTabCtx, chromedp.Navigate("https://www.carfaxonline.com/"))
-			cleanupNav()
-			sh.randomDelay(1800, 2500)
+		lowerCurrURL := strings.ToLower(state.CurrentURL)
+		if strings.Contains(lowerCurrURL, "landingpage") || strings.Contains(lowerCurrURL, "auth.") {
+			sh.randomDelay(3500, 4500)
 			sh.setHarvesting(false)
 			state = sh.InspectBrowserState(parentCtx, cdpEndpoint, false)
 			sh.setHarvesting(true)
+		}
+		if !state.VinInputFound && !state.IsLoginPage && !state.HasChallenge {
+			if navTabCtx, cleanupNav, err := sh.attachExistingTab(parentCtx, cdpEndpoint, state.TabID); err == nil {
+				_ = chromedp.Run(navTabCtx, chromedp.Navigate("https://www.carfaxonline.com/"))
+				cleanupNav()
+				sh.randomDelay(2000, 2800)
+				sh.setHarvesting(false)
+				state = sh.InspectBrowserState(parentCtx, cdpEndpoint, false)
+				sh.setHarvesting(true)
+			}
 		}
 	}
 
@@ -949,9 +959,9 @@ func (sh *StealthHarvester) HarvestBatchReports(
 		ticket.ReportTab = reportTab
 		ticket.OpenedNewTab = openedNewTab
 
-		// If there are more VINs in the batch, pause briefly (900ms-1300ms) like a dealer switching back to tab 1
+		// If there are more VINs in the batch, pause 2.0s-2.8s like a real human dealer switching back to tab 1
 		if idx < len(vins)-1 {
-			sh.randomDelay(900, 1300)
+			sh.randomDelay(2000, 2800)
 		}
 	}
 

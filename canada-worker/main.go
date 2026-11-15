@@ -349,7 +349,7 @@ func (w *CanadaWorker) sendProgress(prog *ProgressUpdate) error {
 }
 
 func (w *CanadaWorker) sendPoll() (*PollResponse, error) {
-	req, err := http.NewRequest("GET", w.serverURL+"/api/worker/poll?max_batch=4", nil)
+	req, err := http.NewRequest("GET", w.serverURL+"/api/worker/poll?max_batch=2", nil)
 	if err != nil {
 		return nil, err
 	}

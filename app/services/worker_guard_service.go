@@ -439,6 +439,30 @@ func (s *WorkerGuardService) SaveProgress(p *WorkerProgress, nodeID, nodeName st
 	}
 }
 
+// getNodeTargetCooldown calculates the smart adaptive cooldown for a specific node:
+// - 10s after a single-VIN pull (fast response!)
+// - 15s after a 2-VIN batch pull
+// - Anti-Burst Shield: adds +7s if the same node pulled 6-7 reports in 2 mins, or +14s if >=8 reports in 2 mins
+func (s *WorkerGuardService) getNodeTargetCooldown(ctx context.Context, cleanID string) int {
+	lastBatch, _ := bootstrap.Redis.Get(ctx, "canada:worker:"+cleanID+":last_batch_size").Int()
+	burst2m, _ := bootstrap.Redis.Get(ctx, "canada:worker:"+cleanID+":burst_2m").Int()
+
+	targetCooldown := 10
+	if lastBatch >= 2 {
+		targetCooldown = 15
+	}
+	if s.minCooldownSec > targetCooldown && lastBatch >= 2 {
+		targetCooldown = s.minCooldownSec
+	}
+
+	if burst2m >= 8 {
+		targetCooldown += 14
+	} else if burst2m >= 6 {
+		targetCooldown += 7
+	}
+	return targetCooldown
+}
+
 // GetNodeCooldownRemainingSec returns cooldown seconds left for a specific node
 func (s *WorkerGuardService) GetNodeCooldownRemainingSec(nodeID string) int {
 	if bootstrap.Redis == nil {
@@ -450,9 +474,10 @@ func (s *WorkerGuardService) GetNodeCooldownRemainingSec(nodeID string) int {
 	if err != nil {
 		return 0
 	}
+	targetCooldown := s.getNodeTargetCooldown(ctx, cleanID)
 	elapsed := int(time.Now().Unix() - lastEnd)
-	if elapsed < s.minCooldownSec {
-		return s.minCooldownSec - elapsed
+	if elapsed < targetCooldown {
+		return targetCooldown - elapsed
 	}
 	return 0
 }
@@ -1056,13 +1081,15 @@ func (s *WorkerGuardService) PollBatchTasks(nodeID, nodeName string, maxBatch in
 		return nil, nodeCooldown, ErrCooldownActive
 	}
 
-	// Calculate fair batch size across healthy online nodes so 2 PCs split 2 tasks (1 each),
-	// while 2 PCs facing 6 tasks take 3 each for Multi-Tab Rapid Paste!
+	// Calculate fair batch size across healthy online nodes (max 2 per wave per PC for 100% human safety):
+	// - 1 PC facing 2+ tasks takes 2 VINs with a natural 2.2s gap
+	// - 2 PCs facing 4 tasks take 2 VINs each simultaneously!
+	// - Anti-Burst Shield: if this node already pulled >=6 reports in the last 2 minutes, step down to 1 VIN at a time
 	if maxBatch < 1 {
 		maxBatch = 1
 	}
-	if maxBatch > 4 {
-		maxBatch = 4
+	if maxBatch > 2 {
+		maxBatch = 2
 	}
 	qLen, _ := bootstrap.Redis.LLen(ctx, "canada:tasks:queue").Result()
 	if qLen == 0 {
@@ -1079,6 +1106,9 @@ func (s *WorkerGuardService) PollBatchTasks(nodeID, nodeName string, maxBatch in
 	}
 	if fairBatch > maxBatch {
 		fairBatch = maxBatch
+	}
+	if burst2m, _ := bootstrap.Redis.Get(ctx, "canada:worker:"+cleanID+":burst_2m").Int(); burst2m >= 6 {
+		fairBatch = 1
 	}
 
 	// Gate 4: Pop valid VINs (skipping Zombie tasks where customer closed browser)
@@ -1108,6 +1138,7 @@ func (s *WorkerGuardService) PollBatchTasks(nodeID, nodeName string, maxBatch in
 	joinedVins := strings.Join(batchVins, ",")
 	bootstrap.Redis.Set(ctx, "canada:active_vin", primaryVin, 90*time.Second)
 	bootstrap.Redis.Set(ctx, "canada:worker:"+cleanID+":active_vin", joinedVins, 90*time.Second)
+	bootstrap.Redis.Set(ctx, "canada:worker:"+cleanID+":last_batch_size", len(batchVins), 10*time.Minute)
 
 	now := time.Now()
 	for _, v := range batchVins {
@@ -1266,9 +1297,17 @@ func (s *WorkerGuardService) CompleteTask(res *WorkerTaskResult) error {
 		}
 		bootstrap.Redis.Set(ctx, "canada:task:state:"+res.VIN, "DONE", 10*time.Minute)
 
-		// Increment daily counter & set cooldown ONLY ONCE per VIN (using SetNX lock per VIN per 2 minutes)
+		// Increment daily counter, 2-min burst shield counter, & set cooldown ONLY ONCE per VIN (using SetNX lock per VIN per 2 minutes)
 		if counted, _ := bootstrap.Redis.SetNX(ctx, "canada:counted:"+res.VIN, cleanID, 2*time.Minute).Result(); counted {
-			jitter := int64(rand.Intn(4))
+			jitter := int64(rand.Intn(3))
+			burstKey := "canada:worker:" + cleanID + ":burst_2m"
+			burstCount, _ := bootstrap.Redis.Incr(ctx, burstKey).Result()
+			if burstCount <= 1 {
+				bootstrap.Redis.Expire(ctx, burstKey, 120*time.Second)
+			} else if ttl, err := bootstrap.Redis.TTL(ctx, burstKey).Result(); err == nil && ttl < 0 {
+				bootstrap.Redis.Expire(ctx, burstKey, 120*time.Second)
+			}
+
 			pipe := bootstrap.Redis.Pipeline()
 
 			globalDailyKey := s.getDailyKey()

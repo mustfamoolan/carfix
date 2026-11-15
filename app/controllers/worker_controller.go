@@ -59,8 +59,8 @@ func (ctrl *WorkerController) Poll(c *fiber.Ctx) error {
 	if maxBatch < 1 {
 		maxBatch = 1
 	}
-	if maxBatch > 4 {
-		maxBatch = 4
+	if maxBatch > 2 {
+		maxBatch = 2
 	}
 
 	vins, cooldownRemaining, err := ctrl.guard.PollBatchTasks(nodeID, nodeName, maxBatch)
