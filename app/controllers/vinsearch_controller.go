@@ -301,7 +301,16 @@ func (ctrl *VinSearchController) Search(c *fiber.Ctx) error {
 	// ==================== CACHE MISS ====================
 	rawHtmlEn, vehicleTitle, fastSummaryJson, workerID, workerName, err := ctrl.fetchFromCanadaNode(c.UserContext(), cleanVin)
 	if err != nil {
-		// If the VIN is still waiting in queue or actively being harvested after a 48s HTTP window,
+		// If customer closed browser tab and cancelled the request, exit cleanly without logging a false error!
+		if errors.Is(err, context.Canceled) {
+			return c.Status(499).JSON(fiber.Map{
+				"status":  "cancelled",
+				"vin":     cleanVin,
+				"message": "تم إلغاء الطلب من الطابور لإغلاق الصفحة",
+			})
+		}
+
+		// If the VIN is still waiting in queue or actively being harvested after a 35s HTTP window,
 		// return 202 Processing so the client seamlessly continues waiting without 504/502 timeout or false error logs!
 		if errors.Is(err, ErrStillInQueue) {
 			pos, estSec := ctrl.workerGuard.GetQueuePosition(cleanVin)
@@ -507,6 +516,24 @@ func (ctrl *VinSearchController) GetQueueStatus(c *fiber.Ctx) error {
 	})
 }
 
+// CancelQueuedSearches removes pending VINs from the waiting queue immediately when the user closes or refreshes their browser tab
+func (ctrl *VinSearchController) CancelQueuedSearches(c *fiber.Ctx) error {
+	var body struct {
+		VIN  string   `json:"vin"`
+		VINs []string `json:"vins"`
+	}
+	_ = c.BodyParser(&body)
+	vins := body.VINs
+	if body.VIN != "" {
+		vins = append(vins, body.VIN)
+	}
+	removed := ctrl.workerGuard.CancelWaiterAndQueue(vins)
+	return c.JSON(fiber.Map{
+		"status":  "cancelled",
+		"removed": removed,
+	})
+}
+
 // GetUserSearchHistory returns the authenticated user's own search history with fast pagination and filtering
 func (ctrl *VinSearchController) GetUserSearchHistory(c *fiber.Ctx) error {
 	userID, err := extractUserID(c)
@@ -644,7 +671,7 @@ func (ctrl *VinSearchController) GetReportPdf(c *fiber.Ctx) error {
 	return c.Send(pdfBytes)
 }
 
-// fetchFromCanadaNode communicates with the remote worker cluster with automatic failover & 48s boundary check
+// fetchFromCanadaNode communicates with the remote worker cluster with automatic failover & 35s HTTP cycle
 func (ctrl *VinSearchController) fetchFromCanadaNode(reqCtx context.Context, vin string) (string, string, string, string, string, error) {
 	// 1. Always respect Global Circuit Breaker first
 	if active, _ := ctrl.workerGuard.IsCircuitBreakerActive(); active {
@@ -652,45 +679,50 @@ func (ctrl *VinSearchController) fetchFromCanadaNode(reqCtx context.Context, vin
 	}
 
 	// 2. Dispatch to Queue (persisted in Redis FIFO queue)
-	for attempt := 1; attempt <= 2; attempt++ {
-		if err := ctrl.workerGuard.EnqueueSearchTask(vin); err != nil {
-			return "", "", "", "", "", fmt.Errorf("تعذر إرسال الطلب حالياً، يرجى المحاولة مرة أخرى")
-		}
+	if err := ctrl.workerGuard.EnqueueSearchTask(vin); err != nil {
+		return "", "", "", "", "", fmt.Errorf("تعذر إرسال الطلب حالياً، يرجى المحاولة مرة أخرى")
+	}
 
-		// Wait up to 48s per HTTP cycle (safely below Nginx/Cloudflare 60s gateway timeout)
-		res, err := ctrl.workerGuard.WaitForReport(reqCtx, vin, 48*time.Second)
-		if err != nil {
-			// Check if the report actually finished right at the 48s boundary!
-			if fastReport, dbErr := ctrl.getOrBuildFastReport(vin); dbErr == nil && fastReport != nil {
-				vTitle, _ := fastReport["vehicle_title"].(string)
-				sJson, _ := fastReport["summary_json"].(string)
-				attrID, attrName := ConsumeRecentLiveAttribution(vin)
-				return "", vTitle, sJson, attrID, attrName, nil
-			}
-			if errors.Is(err, context.Canceled) {
-				return "", "", "", "", "", ErrStillInQueue
-			}
-			if ctrl.workerGuard.IsVinPendingOrActive(vin) {
-				return "", "", "", "", "", ErrStillInQueue
-			}
-			return "", "", "", "", "", fmt.Errorf("استغرقت عملية البحث وقتاً أطول من المعتاد، يرجى المحاولة بعد قليل")
+	// Wait up to 35s per HTTP cycle (safely below Nginx/Cloudflare 60s gateway timeout; returns 202 Processing if still queued)
+	res, err := ctrl.workerGuard.WaitForReport(reqCtx, vin, 35*time.Second)
+	if err != nil {
+		// Check if the report actually finished right at the boundary!
+		if fastReport, dbErr := ctrl.getOrBuildFastReport(vin); dbErr == nil && fastReport != nil {
+			vTitle, _ := fastReport["vehicle_title"].(string)
+			sJson, _ := fastReport["summary_json"].(string)
+			attrID, attrName := ConsumeRecentLiveAttribution(vin)
+			return "", vTitle, sJson, attrID, attrName, nil
 		}
+		// If customer closed browser tab and cancelled the request, abort and remove from queue!
+		if errors.Is(err, context.Canceled) || !ctrl.workerGuard.HasActiveWaiter(vin) {
+			_ = ctrl.workerGuard.RemoveFromQueue(vin)
+			return "", "", "", "", "", context.Canceled
+		}
+		if ctrl.workerGuard.IsVinPendingOrActive(vin) {
+			return "", "", "", "", "", ErrStillInQueue
+		}
+		// If customer's browser is still open and waiting, keep it in the queue so the 5th+ report NEVER fails!
+		if ctrl.workerGuard.HasActiveWaiter(vin) {
+			_ = ctrl.workerGuard.EnqueueSearchTask(vin)
+			return "", "", "", "", "", ErrStillInQueue
+		}
+		return "", "", "", "", "", fmt.Errorf("استغرقت عملية البحث وقتاً أطول من المعتاد، يرجى المحاولة بعد قليل")
+	}
 
-		if res != nil && res.ErrorCode != "" {
-			if res.ErrorCode == "VIN_NOT_FOUND_ON_CARFAX" {
-				return "", "", "", res.WorkerID, res.WorkerName, fmt.Errorf("لم يتم العثور على سجلات لهذا الرقم، يرجى التأكد من صحة رقم الشاصي")
-			}
-			// If it was a transient browser focus/typing/tab/load hiccup on attempt 1, retry once silently
-			if attempt == 1 && (res.ErrorCode == "VIN_TYPE_ERROR" || res.ErrorCode == "TAB_LOST" || res.ErrorCode == "VIN_INPUT_NOT_FOUND" || res.ErrorCode == "REPORT_LOAD_TIMEOUT") {
-				time.Sleep(1000 * time.Millisecond)
-				continue
-			}
-			return "", "", "", res.WorkerID, res.WorkerName, fmt.Errorf("الخدمة مشغولة حالياً، يرجى المحاولة مرة أخرى بعد قليل")
+	if res != nil && res.ErrorCode != "" {
+		if res.ErrorCode == "VIN_NOT_FOUND_ON_CARFAX" {
+			return "", "", "", res.WorkerID, res.WorkerName, fmt.Errorf("لم يتم العثور على سجلات لهذا الرقم، يرجى التأكد من صحة رقم الشاصي")
 		}
+		// If it was a transient browser focus/typing/tab/load hiccup while customer is still waiting, re-enqueue and return 202 Processing!
+		if ctrl.workerGuard.HasActiveWaiter(vin) && (res.ErrorCode == "VIN_TYPE_ERROR" || res.ErrorCode == "TAB_LOST" || res.ErrorCode == "VIN_INPUT_NOT_FOUND" || res.ErrorCode == "REPORT_LOAD_TIMEOUT") {
+			_ = ctrl.workerGuard.EnqueueSearchTask(vin)
+			return "", "", "", "", "", ErrStillInQueue
+		}
+		return "", "", "", res.WorkerID, res.WorkerName, fmt.Errorf("الخدمة مشغولة حالياً، يرجى المحاولة مرة أخرى بعد قليل")
+	}
 
-		if res != nil && (res.RawHtmlEn != "" || res.FastSummaryJson != "") {
-			return res.RawHtmlEn, res.VehicleTitle, res.FastSummaryJson, res.WorkerID, res.WorkerName, nil
-		}
+	if res != nil && (res.RawHtmlEn != "" || res.FastSummaryJson != "") {
+		return res.RawHtmlEn, res.VehicleTitle, res.FastSummaryJson, res.WorkerID, res.WorkerName, nil
 	}
 
 	return "", "", "", "", "", fmt.Errorf("تعذر استخراج بيانات التقرير، يرجى المحاولة مرة أخرى")

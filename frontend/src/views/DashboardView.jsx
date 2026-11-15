@@ -10,6 +10,7 @@ import {
   getCachedData,
   searchVin,
   getQueueStatus,
+  cancelQueuedSearches,
   markVinUnviewed,
   api,
 } from '@/lib/api'
@@ -28,6 +29,27 @@ export default function DashboardView() {
 
   const vinInputRef = useRef(null)
   const historySectionRef = useRef(null)
+  const pendingSearchesRef = useRef([])
+
+  useEffect(() => {
+    pendingSearchesRef.current = pendingSearches
+  }, [pendingSearches])
+
+  // Immediately cancel any waiting tasks in the server queue if the user closes or refreshes their browser tab
+  useEffect(() => {
+    const handleUnloadCancel = () => {
+      const activeVins = pendingSearchesRef.current.map((p) => p.vin).filter(Boolean)
+      if (activeVins.length > 0) {
+        cancelQueuedSearches(activeVins)
+      }
+    }
+    window.addEventListener('pagehide', handleUnloadCancel)
+    window.addEventListener('beforeunload', handleUnloadCancel)
+    return () => {
+      window.removeEventListener('pagehide', handleUnloadCancel)
+      window.removeEventListener('beforeunload', handleUnloadCancel)
+    }
+  }, [])
 
   const loadSearches = async (showSpinner = false) => {
     if (showSpinner || searches.length === 0) setLoadingSearches(true)
@@ -72,40 +94,40 @@ export default function DashboardView() {
     }, 1000)
 
     const statusTimer = setInterval(async () => {
-      setPendingSearches((prev) => {
-        prev.forEach(async (item) => {
-          try {
-            const qRes = await getQueueStatus(item.vin)
-            const info = qRes?.data || qRes
-            if (info) {
-              setPendingSearches((curr) =>
-                curr.map((c) => {
-                  if (c.vin !== item.vin) return c
-                  let stepAr = c.step_ar
-                  if (info.is_active) {
-                    stepAr = 'جاري سحب التقرير الآن...'
-                  } else if (info.queue_position > 0) {
-                    stepAr = `في الطابور (#${info.queue_position})`
-                  }
-                  const est =
-                    info.estimated_seconds > 0 &&
-                    (c.estimated_seconds === 0 || Math.abs(c.estimated_seconds - info.estimated_seconds) > 4)
-                      ? info.estimated_seconds
-                      : c.estimated_seconds
-                  return {
-                    ...c,
-                    step_ar: stepAr,
-                    estimated_seconds: est,
-                  }
-                })
-              )
-            }
-          } catch {
-            // ignore poll error
+      const currentItems = pendingSearchesRef.current
+      if (!currentItems || currentItems.length === 0) return
+
+      for (const item of currentItems) {
+        try {
+          const qRes = await getQueueStatus(item.vin)
+          const info = qRes?.data || qRes
+          if (info) {
+            setPendingSearches((curr) =>
+              curr.map((c) => {
+                if (c.vin !== item.vin) return c
+                let stepAr = c.step_ar
+                if (info.is_active) {
+                  stepAr = 'جاري سحب التقرير الآن...'
+                } else if (info.queue_position > 0) {
+                  stepAr = `في الطابور (#${info.queue_position})`
+                }
+                const est =
+                  info.estimated_seconds > 0 &&
+                  (c.estimated_seconds === 0 || Math.abs(c.estimated_seconds - info.estimated_seconds) > 4)
+                    ? info.estimated_seconds
+                    : c.estimated_seconds
+                return {
+                  ...c,
+                  step_ar: stepAr,
+                  estimated_seconds: est,
+                }
+              })
+            )
           }
-        })
-        return prev
-      })
+        } catch {
+          // ignore poll error
+        }
+      }
     }, 2000)
 
     return () => {
@@ -156,6 +178,7 @@ export default function DashboardView() {
 
     try {
       const res = await searchVin(cleanVin)
+      if (res?.status === 'cancelled') return
       markVinUnviewed(cleanVin)
       await Promise.all([refreshUser(), fetchWorkerStatus(), loadSearches(false)])
       toast.success(

@@ -188,6 +188,9 @@ export const searchVin = async (vin) => {
       }
       break
     } catch (err) {
+      if (err?.status === 499) {
+        return { status: 'cancelled' }
+      }
       // Do not retry on explicit client/auth/quota/validation errors (400, 401, 403, 404)
       if (err?.status === 400 || err?.status === 401 || err?.status === 403 || err?.status === 404) {
         throw err
@@ -231,6 +234,35 @@ export const searchVin = async (vin) => {
 }
 
 export const getQueueStatus = (vin) => api.get(`/search/queue-status/${vin}`)
+
+export const cancelQueuedSearches = (vins = []) => {
+  const cleanVins = (Array.isArray(vins) ? vins : [vins])
+    .map((v) => String(v || '').trim().toUpperCase())
+    .filter(Boolean)
+  if (cleanVins.length === 0) return
+
+  const payload = JSON.stringify({ vins: cleanVins })
+  try {
+    if (typeof navigator !== 'undefined' && typeof navigator.sendBeacon === 'function') {
+      const blob = new Blob([payload], { type: 'application/json' })
+      if (navigator.sendBeacon('/api/search/cancel-queued', blob)) {
+        return
+      }
+    }
+  } catch {
+    // Fallback to fetch with keepalive
+  }
+  try {
+    fetch('/api/search/cancel-queued', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: payload,
+      keepalive: true,
+    }).catch(() => {})
+  } catch {
+    // Ignore unload network error
+  }
+}
 
 export const getReport = async (vin) => {
   const key = `report:${String(vin).toUpperCase()}`

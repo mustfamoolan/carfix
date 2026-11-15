@@ -239,13 +239,37 @@ func sanitizeNodeID(id, name string) (string, string) {
 	return cleanID, cleanName
 }
 
-// TouchWaiterLease marks that a customer is actively waiting for this VIN right now (TTL 45s)
+// TouchWaiterLease marks that a customer is actively waiting for this VIN right now (TTL 14s, refreshed every 2s by open browser)
 func (s *WorkerGuardService) TouchWaiterLease(vin string) {
 	if bootstrap.Redis == nil || vin == "" {
 		return
 	}
 	cleanVin := strings.ToUpper(strings.TrimSpace(vin))
-	bootstrap.Redis.Set(context.Background(), "canada:waiter:"+cleanVin, "1", 45*time.Second)
+	bootstrap.Redis.Set(context.Background(), "canada:waiter:"+cleanVin, "1", 14*time.Second)
+}
+
+// CancelWaiterAndQueue immediately removes one or more VINs from the waiting queue when a user closes their browser page
+func (s *WorkerGuardService) CancelWaiterAndQueue(vins []string) int {
+	if bootstrap.Redis == nil || len(vins) == 0 {
+		return 0
+	}
+	ctx := context.Background()
+	removed := 0
+	for _, rawVin := range vins {
+		cleanVin := strings.ToUpper(strings.TrimSpace(rawVin))
+		if cleanVin == "" {
+			continue
+		}
+		bootstrap.Redis.Del(ctx, "canada:waiter:"+cleanVin)
+		// Only remove from waiting queue if not already completed
+		if state, _ := bootstrap.Redis.Get(ctx, "canada:task:state:"+cleanVin).Result(); state != "DONE" {
+			bootstrap.Redis.Del(ctx, "canada:task:state:"+cleanVin)
+		}
+		if n, err := bootstrap.Redis.LRem(ctx, "canada:tasks:queue", 0, cleanVin).Result(); err == nil && n > 0 {
+			removed += int(n)
+		}
+	}
+	return removed
 }
 
 // HasActiveWaiter returns true if a customer browser or active HTTP request is still waiting for this VIN
@@ -1397,13 +1421,16 @@ func (s *WorkerGuardService) WaitForReport(reqCtx context.Context, vin string, t
 			return &res, nil
 
 		case <-ticker.C:
-			s.TouchWaiterLease(cleanVin)
 			if res := checkCachedResult(); res != nil {
 				return res, nil
 			}
+			// If customer closed browser tab (waiter lease expired or cancelled via pagehide), abort immediately and dequeue!
+			if !s.HasActiveWaiter(cleanVin) {
+				_ = s.RemoveFromQueue(cleanVin)
+				return nil, context.Canceled
+			}
 
 		case <-deadline:
-			s.TouchWaiterLease(cleanVin)
 			if res := checkCachedResult(); res != nil {
 				return res, nil
 			}

@@ -1069,6 +1069,18 @@ func (sh *StealthHarvester) HarvestBatchReports(
 		finalReportCtx, cleanupPrintTab, printPopupTabID := sh.prepareOfficialPrintModal(parentCtx, cdpEndpoint, activeReportCtx)
 		officialPdfBase64 := sh.captureOfficialPrintPDF(finalReportCtx, vin)
 
+		var fullPageHtml string
+		_ = chromedp.Run(finalReportCtx, chromedp.Evaluate(`
+(() => {
+    const baseTag = '<base href="https://www.carfaxonline.com/">';
+    let html = document.documentElement ? document.documentElement.outerHTML : '';
+    if (html && !html.includes('<base ')) {
+        html = html.replace(/<head([^>]*)>/i, '<head$1>' + baseTag);
+    }
+    return html;
+})()
+`, &fullPageHtml))
+
 		if cleanupPrintTab != nil {
 			cleanupPrintTab()
 		}
@@ -1094,9 +1106,9 @@ func (sh *StealthHarvester) HarvestBatchReports(
 			}
 		}
 
-		rawHtmlWithPdf := ""
+		rawHtmlWithPdf := fullPageHtml
 		if officialPdfBase64 != "" {
-			rawHtmlWithPdf = `<script id="carfix-official-pdf" type="application/pdf-base64">` + officialPdfBase64 + `</script>`
+			rawHtmlWithPdf += `<script id="carfix-official-pdf" type="application/pdf-base64">` + officialPdfBase64 + `</script>`
 		}
 
 		if onComplete != nil {
@@ -1647,9 +1659,9 @@ func (sh *StealthHarvester) prepareOfficialPrintModal(
 		return activeReportCtx, nil, ""
 	}
 
-	// 3. Event-Driven Modal Poll (every 120ms, up to 20 attempts = 2.4s):
-	// As soon as "Printing Options" modal is visible, select all 4 checkboxes and click the modal "Print" button immediately!
-	selectAndPrintModalJS := `
+	// 3. Two-Step Visible & React-Safe Modal Handling:
+	// Step 3A: Wait for "Printing Options" modal to open, then check all 4 checkboxes (without clicking Print yet!)
+	checkAllFourBoxesJS := `
 (() => {
     const allContainers = Array.from(document.querySelectorAll('[role="dialog"], [class*="modal" i], [class*="dialog" i], div'));
     let modal = null;
@@ -1661,7 +1673,7 @@ func (sh *StealthHarvester) prepareOfficialPrintModal(
         }
     }
     if (!modal) {
-        return { ready: false, checked: 0, printed: false };
+        return { ready: false, checked: 0 };
     }
 
     // Click "Select All" if present and visible
@@ -1690,8 +1702,47 @@ func (sh *StealthHarvester) prepareOfficialPrintModal(
         }
     }
 
-    // Click the modal's "Print" button
-    const buttons = Array.from(modal.querySelectorAll('button, input[type="button"], input[type="submit"], a[role="button"]'));
+    return { ready: true, checked: checkedCount };
+})();
+`
+	modalReady := false
+	for i := 0; i < 20; i++ {
+		time.Sleep(150 * time.Millisecond)
+		var mOut struct {
+			Ready   bool `json:"ready"`
+			Checked int  `json:"checked"`
+		}
+		if err := chromedp.Run(activeReportCtx, chromedp.Evaluate(checkAllFourBoxesJS, &mOut)); err == nil && mOut.Ready {
+			modalReady = true
+			break
+		}
+	}
+
+	// Step 3B: Pause 750ms-950ms while the 4 checkboxes are visibly checked on screen!
+	// This makes the action clearly visible to the human eye AND lets Carfax's React state mount all 4 sections cleanly!
+	sh.randomDelay(750, 950)
+
+	// Step 3C: Now click the modal's "Print" button (with a second pass on checkboxes just in case React re-rendered)
+	clickModalPrintBtnJS := `
+(() => {
+    const checkboxes = Array.from(document.querySelectorAll('input[type="checkbox"]'));
+    for (const cb of checkboxes) {
+        const labelText = ((cb.closest('label') ? cb.closest('label').innerText : '') || (cb.parentElement ? cb.parentElement.innerText : '') || '').toLowerCase();
+        if (labelText.includes('display carfax in online listings')) continue;
+        if (!cb.checked) cb.click();
+    }
+
+    const allContainers = Array.from(document.querySelectorAll('[role="dialog"], [class*="modal" i], [class*="dialog" i], div'));
+    let modal = null;
+    for (const d of allContainers) {
+        if (d.offsetParent === null) continue;
+        const t = (d.innerText || '');
+        if ((t.includes('Printing Options') || t.includes('Print Selected Reports')) && t.includes('Cancel')) {
+            modal = d;
+        }
+    }
+    const root = modal || document;
+    const buttons = Array.from(root.querySelectorAll('button, input[type="button"], input[type="submit"], a[role="button"]'));
     let targetBtn = null;
     for (const b of buttons) {
         if (b.offsetParent === null) continue;
@@ -1702,44 +1753,14 @@ func (sh *StealthHarvester) prepareOfficialPrintModal(
     }
     if (targetBtn) {
         targetBtn.click();
-        return { ready: true, checked: checkedCount, printed: true };
+        return true;
     }
-    return { ready: true, checked: checkedCount, printed: false };
+    return false;
 })();
 `
-	modalPrinted := false
-	for i := 0; i < 20; i++ {
-		time.Sleep(120 * time.Millisecond)
-		var mOut struct {
-			Ready   bool `json:"ready"`
-			Checked int  `json:"checked"`
-			Printed bool `json:"printed"`
-		}
-		if err := chromedp.Run(activeReportCtx, chromedp.Evaluate(selectAndPrintModalJS, &mOut)); err == nil && mOut.Printed {
-			modalPrinted = true
-			break
-		}
-	}
-
-	// Fallback if modal class structure differed: run legacy document-wide checkbox + Print click once
-	if !modalPrinted {
-		_ = chromedp.Run(activeReportCtx, chromedp.Evaluate(`
-(() => {
-    const checkboxes = Array.from(document.querySelectorAll('input[type="checkbox"]'));
-    for (const cb of checkboxes) {
-        const labelText = ((cb.closest('label') ? cb.closest('label').innerText : '') || (cb.parentElement ? cb.parentElement.innerText : '') || '').toLowerCase();
-        if (labelText.includes('display carfax in online listings')) continue;
-        if (!cb.checked) cb.click();
-    }
-    const buttons = Array.from(document.querySelectorAll('button, input[type="button"], input[type="submit"], a[role="button"]'));
-    for (const b of buttons) {
-        if (b.offsetParent !== null && (b.innerText || b.value || '').trim() === 'Print') {
-            b.click();
-        }
-    }
-})();
-`, nil))
-	}
+	var modalPrinted bool
+	_ = chromedp.Run(activeReportCtx, chromedp.Evaluate(clickModalPrintBtnJS, &modalPrinted))
+	_ = modalReady
 
 	// 4. Event-Driven Print Readiness Poll (every 150ms, up to 24 attempts = 3.6s max):
 	// Return as soon as window.__carfaxPrintTriggered is true OR a new print popup tab opens!
@@ -1754,7 +1775,7 @@ func (sh *StealthHarvester) prepareOfficialPrintModal(
 				sh.markTabActive(t.ID)
 				if pCtx, pCleanup, pErr := sh.attachExistingTab(parentCtx, cdpEndpoint, t.ID); pErr == nil {
 					_ = chromedp.Run(pCtx, chromedp.Evaluate(overridePrintJS, nil))
-					sh.randomDelay(400, 650)
+					sh.randomDelay(850, 1150)
 					return pCtx, pCleanup, t.ID
 				}
 			}
@@ -1767,6 +1788,9 @@ func (sh *StealthHarvester) prepareOfficialPrintModal(
 			break
 		}
 	}
+
+	// Give the 4 mounted sections (History-Based Value, Warranty Check, Buyback Guarantee) 850ms-1100ms to finish rendering images/SVGs
+	sh.randomDelay(850, 1100)
 
 	// 5. Hide any remaining "Printing Options" modal dialog / backdrop so the report & PDF are 100% unobstructed
 	hideModalJS := `
@@ -1786,7 +1810,7 @@ func (sh *StealthHarvester) prepareOfficialPrintModal(
 })();
 `
 	_ = chromedp.Run(activeReportCtx, chromedp.Evaluate(hideModalJS, nil))
-	sh.randomDelay(120, 220)
+	sh.randomDelay(180, 280)
 
 	return activeReportCtx, nil, ""
 }
