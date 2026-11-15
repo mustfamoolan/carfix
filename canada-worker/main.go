@@ -193,6 +193,12 @@ func (w *CanadaWorker) pollAndExecute(ctx context.Context) {
 		w.reportTelemetry(ctx, false)
 	}
 
+	// Every 600th poll (~10 minutes), perform a silent session keep-alive on carfaxonline.com
+	// so the dealer session & 2FA trust cookie never expire during idle periods!
+	if w.pollCounter%600 == 0 {
+		w.stealth.KeepAliveSession(ctx, w.cdpWsURL)
+	}
+
 	pollRes, err := w.sendPoll()
 	if err != nil {
 		log.Printf("⚠️ [POLL FAILED] Unable to reach master server: %v", err)

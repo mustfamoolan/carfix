@@ -19,12 +19,10 @@ if %errorlevel% equ 0 (
     exit /b 0
 )
 
-rem Only seed C:\CarfaxDealerProfile from Main Chrome on first-time setup when Local State does not exist yet
-if not exist "C:\CarfaxDealerProfile\Local State" (
-    if exist "%LOCALAPPDATA%\Google\Chrome\User Data" (
-        robocopy "%LOCALAPPDATA%\Google\Chrome\User Data" "C:\CarfaxDealerProfile" /E /XO /R:1 /W:1 /XD "Cache" "Code Cache" "GPUCache" "ShaderCache" "GrShaderCache" "DawnCache" "Crashpad" "SwReporter" "Safe Browsing" "OptimizationGuidePredictionModels" "BrowserMetrics" "ComponentCRXCache" /XF "*.tmp" "lockfile" "Singleton*" >nul 2>&1
-    )
+rem Dedicated, isolated Chrome profile (never overwritten by Main Chrome so login cookies & 2FA trust are preserved forever)
+if not exist "C:\CarfaxDealerProfile" (
+    mkdir "C:\CarfaxDealerProfile" >nul 2>&1
 )
 
-start "" "%CHROME_PATH%" --remote-debugging-port=9222 --remote-allow-origins=* --user-data-dir="C:\CarfaxDealerProfile" --disable-blink-features=AutomationControlled --no-first-run --no-default-browser-check https://www.carfaxonline.com
+start "" "%CHROME_PATH%" --remote-debugging-port=9222 --remote-allow-origins=* --user-data-dir="C:\CarfaxDealerProfile" --profile-directory="Default" --restore-last-session --disable-blink-features=AutomationControlled --no-first-run --no-default-browser-check https://www.carfaxonline.com
 exit /b 0

@@ -192,156 +192,18 @@ func (sh *StealthHarvester) CloseTabByID(cdpEndpoint, tabID string) {
 	}
 }
 
-// findCookiesFile locates the Chrome Cookies SQLite file inside a User Data directory.
-func findCookiesFile(userDataDir string) (string, os.FileInfo, bool) {
-	candidates := []string{
-		filepath.Join(userDataDir, `Default\Network\Cookies`),
-		filepath.Join(userDataDir, `Default\Cookies`),
-	}
-	for _, p := range candidates {
-		if info, err := os.Stat(p); err == nil && info.Size() > 0 {
-			return p, info, true
-		}
-	}
-	return "", nil, false
-}
-
-// isFileUnlocked verifies that a file can be opened for reading without a Windows sharing violation lock.
-func isFileUnlocked(filePath string) bool {
-	f, err := os.Open(filePath)
-	if err != nil {
-		return false
-	}
-	_ = f.Close()
-	return true
-}
-
-// dealerProfileExists returns true if C:\CarfaxDealerProfile already has a valid Local State and Cookies database.
-func dealerProfileExists() bool {
-	dst := `C:\CarfaxDealerProfile`
-	if _, err := os.Stat(filepath.Join(dst, "Local State")); err != nil {
-		return false
-	}
-	_, _, ok := findCookiesFile(dst)
-	return ok
-}
-
-// SyncProfileFromMainChrome safely copies the session cookies, preferences, and login state
-// from the Canada user's default Chrome (%LOCALAPPDATA%\Google\Chrome\User Data)
-// into C:\CarfaxDealerProfile WITHOUT ever overwriting newer worker cookies or corrupting Local State.
-func SyncProfileFromMainChrome(requireNewerAndUnlocked bool) error {
-	localAppData := os.Getenv("LOCALAPPDATA")
-	if localAppData == "" {
-		localAppData = filepath.Join(os.Getenv("USERPROFILE"), "AppData", "Local")
-	}
-	src := filepath.Join(localAppData, `Google\Chrome\User Data`)
-	dst := `C:\CarfaxDealerProfile`
-
-	if _, err := os.Stat(src); err != nil {
-		log.Printf("⚠️ Main Chrome User Data not found at %s: %v", src, err)
-		return err
-	}
-
-	srcCookiesPath, srcInfo, srcOk := findCookiesFile(src)
-	if !srcOk {
-		return fmt.Errorf("main Chrome cookies file not found")
-	}
-
-	// Never copy Local State if Main Chrome's Cookies file is locked by a running Main Chrome process,
-	// because overwriting Local State without Cookies mismatches the DPAPI encryption key!
-	if !isFileUnlocked(srcCookiesPath) {
-		log.Printf("ℹ️ [PROFILE-SYNC] Main Chrome Cookies file is currently locked by an open Chrome window; keeping existing C:\\CarfaxDealerProfile session intact.")
-		return fmt.Errorf("main Chrome cookies file is locked")
-	}
-
-	if requireNewerAndUnlocked {
-		if _, dstInfo, dstOk := findCookiesFile(dst); dstOk {
-			if !srcInfo.ModTime().After(dstInfo.ModTime()) {
-				log.Printf("ℹ️ [PROFILE-SYNC] C:\\CarfaxDealerProfile cookies are already newer than or equal to Main Chrome; preserving worker session.")
-				return fmt.Errorf("worker profile is already up to date")
-			}
-		}
-	}
-
-	log.Printf("🔄 [PROFILE-SYNC] Syncing newer unlocked cookies & login session from Main Chrome to %s...", dst)
-
-	// Use /XO (Exclude Older) instead of /IS /IT so we NEVER overwrite newer files in C:\CarfaxDealerProfile
-	cmd := exec.Command("robocopy",
-		src,
-		dst,
-		"/E", "/XO", "/R:1", "/W:1",
-		"/XD", "Cache", "Code Cache", "GPUCache", "ShaderCache", "GrShaderCache", "DawnCache", "Crashpad", "SwReporter", "Safe Browsing", "OptimizationGuidePredictionModels", "BrowserMetrics", "ComponentCRXCache",
-		"/XF", "*.tmp", "lockfile", "Singleton*",
-	)
-	cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: 0x08000000} // CREATE_NO_WINDOW: never flash terminal
-	_ = cmd.Run()
-	log.Printf("✅ [PROFILE-SYNC] Safe session & cookies sync completed!")
-	return nil
-}
-
-// killWorkerChromeOnly terminates only the Chrome instance bound to port 9222 without disturbing user's own Chrome.
-func killWorkerChromeOnly() {
-	cmdNetstat := exec.Command("cmd", "/c", "netstat -a -n -o | findstr 127.0.0.1:9222 | findstr LISTENING")
-	cmdNetstat.SysProcAttr = &syscall.SysProcAttr{CreationFlags: 0x08000000} // CREATE_NO_WINDOW
-	out, err := cmdNetstat.Output()
-	if err == nil {
-		lines := strings.Split(string(out), "\n")
-		for _, line := range lines {
-			fields := strings.Fields(line)
-			if len(fields) >= 5 {
-				pid := fields[len(fields)-1]
-				log.Printf("🛑 Terminating existing worker Chrome process (PID %s)...", pid)
-				cmdKill := exec.Command("taskkill", "/PID", pid, "/T")
-				cmdKill.SysProcAttr = &syscall.SysProcAttr{CreationFlags: 0x08000000}
-				_ = cmdKill.Run()
-			}
-		}
-	}
-}
-
-// RestartChromeWithFreshSync only syncs from Main Chrome if Chrome on 9222 is NOT currently open
-// and Main Chrome has a newer, unlocked login session.
-// It NEVER kills an already-open worker Chrome so an operator logging in is never interrupted!
-func (sh *StealthHarvester) RestartChromeWithFreshSync(cdpEndpoint string) error {
-	if _, err := sh.ListOpenTabs(cdpEndpoint); err == nil {
-		// Worker Chrome is already open on 9222 — never kill it while operator may be logging in!
-		return fmt.Errorf("worker Chrome is already open on 9222; preserving open window")
-	}
-
-	localAppData := os.Getenv("LOCALAPPDATA")
-	if localAppData == "" {
-		localAppData = filepath.Join(os.Getenv("USERPROFILE"), "AppData", "Local")
-	}
-	src := filepath.Join(localAppData, `Google\Chrome\User Data`)
-	dst := `C:\CarfaxDealerProfile`
-
-	srcCookiesPath, srcInfo, srcOk := findCookiesFile(src)
-	if !srcOk || !isFileUnlocked(srcCookiesPath) {
-		return fmt.Errorf("main Chrome session not unlocked for sync")
-	}
-	if _, dstInfo, dstOk := findCookiesFile(dst); dstOk {
-		if !srcInfo.ModTime().After(dstInfo.ModTime()) {
-			return fmt.Errorf("worker profile cookies are already newer")
-		}
-	}
-
-	_ = SyncProfileFromMainChrome(true)
-	return sh.EnsureChromeRunning(cdpEndpoint)
-}
-
-// EnsureChromeRunning checks if Chrome CDP port 9222 is alive; if closed or crashed, it auto-launches it!
+// EnsureChromeRunning checks if Chrome CDP port 9222 is alive; if closed or crashed, it auto-launches it
+// using the dedicated, isolated C:\CarfaxDealerProfile directory (NEVER copying or overwriting from Main Chrome
+// so Chrome 127+ App-Bound Encryption keys and CARFAX login cookies + 2FA device trust remain 100% permanent).
 func (sh *StealthHarvester) EnsureChromeRunning(cdpEndpoint string) error {
 	_, err := sh.ListOpenTabs(cdpEndpoint)
 	if err == nil {
 		return nil // Already running and healthy
 	}
 
-	log.Printf("⚠️ [AUTO-RECOVERY] Chrome is closed or disconnected on 9222. Respawning Chrome host automatically...")
+	log.Printf("⚠️ [AUTO-RECOVERY] Chrome is closed or disconnected on 9222. Launching dedicated Chrome profile automatically...")
 
-	// Preserve existing C:\CarfaxDealerProfile login & cookies! Only seed from Main Chrome if profile does not exist yet.
-	if !dealerProfileExists() {
-		_ = SyncProfileFromMainChrome(false)
-	}
+	_ = os.MkdirAll(`C:\CarfaxDealerProfile`, 0755)
 
 	chromePaths := []string{
 		`C:\Program Files\Google\Chrome\Application\chrome.exe`,
@@ -355,6 +217,8 @@ func (sh *StealthHarvester) EnsureChromeRunning(cdpEndpoint string) error {
 				"--remote-debugging-port=9222",
 				"--remote-allow-origins=*",
 				"--user-data-dir=C:\\CarfaxDealerProfile",
+				"--profile-directory=Default",
+				"--restore-last-session",
 				"--disable-blink-features=AutomationControlled",
 				"--no-first-run",
 				"--no-default-browser-check",
@@ -371,12 +235,54 @@ func (sh *StealthHarvester) EnsureChromeRunning(cdpEndpoint string) error {
 	for i := 0; i < 20; i++ {
 		time.Sleep(500 * time.Millisecond)
 		if _, checkErr := sh.ListOpenTabs(cdpEndpoint); checkErr == nil {
-			log.Printf("✅ [AUTO-RECOVERY SUCCESS] Chrome host respawned and connected on 9222!")
+			log.Printf("✅ [AUTO-RECOVERY SUCCESS] Chrome host connected on 9222 (C:\\CarfaxDealerProfile)!")
 			return nil
 		}
 	}
 
 	return fmt.Errorf("تعذر إعادة تشغيل كروم تلقائياً")
+}
+
+// KeepAliveSession gently refreshes the active carfaxonline.com dealer session in the background
+// when the worker is idle so CARFAX server-side session cookies & 2FA trust never expire due to inactivity.
+// It NEVER touches the browser if a harvest is running or if the page is on a login screen.
+func (sh *StealthHarvester) KeepAliveSession(parentCtx context.Context, cdpEndpoint string) {
+	if sh.IsHarvesting() {
+		return
+	}
+
+	tab, isCarfax, err := sh.FindCarfaxSearchTab(cdpEndpoint)
+	if err != nil || tab == nil || !isCarfax {
+		return
+	}
+
+	u := strings.ToLower(tab.URL)
+	if strings.Contains(u, "/login") || strings.Contains(u, "/signin") {
+		return
+	}
+
+	tabCtx, cleanup, attachErr := sh.attachExistingTab(parentCtx, cdpEndpoint, tab.ID)
+	if attachErr != nil {
+		return
+	}
+	defer cleanup()
+
+	keepAliveJS := `
+(() => {
+    const passInput = document.querySelector('input[type="password"]');
+    if (passInput && passInput.offsetParent !== null) {
+        return 'login_page_skipped';
+    }
+    // Dispatch subtle activity and background credentialed ping to keep CARFAX rolling session cookie fresh
+    document.dispatchEvent(new MouseEvent('mousemove', { clientX: 120, clientY: 120, bubbles: true }));
+    fetch('https://www.carfaxonline.com/', { method: 'GET', credentials: 'include', cache: 'no-store' }).catch(() => {});
+    return 'kept_alive';
+})();
+`
+	var status string
+	if err := chromedp.Run(tabCtx, chromedp.Evaluate(keepAliveJS, &status)); err == nil && status == "kept_alive" {
+		log.Printf("🔄 [SESSION KEEP-ALIVE] Refreshed carfaxonline.com dealer session cookies silently to prevent idle logout.")
+	}
 }
 
 // FindCarfaxSearchTab finds the open carfaxonline.com tab, or falls back to the first visible page tab.
@@ -778,28 +684,17 @@ func (sh *StealthHarvester) HarvestBatchReports(
 	}
 
 	if state.IsLoginPage {
-		log.Printf("🔒 [LOGIN DETECTED] Checking if Main Chrome has a newer unlocked session...")
-		if onProgress != nil {
-			onProgress(firstVin, "sync_session", "التحقق من جلسة تسجيل الدخول في متصفح كندا...", "")
-		}
-		if err := sh.RestartChromeWithFreshSync(cdpEndpoint); err == nil {
-			sh.randomDelay(1500, 2200)
-			sh.setHarvesting(false)
-			state = sh.InspectBrowserState(parentCtx, cdpEndpoint, false)
-			sh.setHarvesting(true)
-		}
-		if state.IsLoginPage {
-			sh.setHarvesting(false)
-			snapState := sh.InspectBrowserState(parentCtx, cdpEndpoint, true)
-			sh.setHarvesting(true)
-			failAll(&HarvestResult{
-				Success:          false,
-				ErrorCode:        "SESSION_EXPIRED",
-				ErrorMessage:     "🔒 حساب carfaxonline.com يحتاج لتسجيل الدخول مرة واحدة في متصفح كروم على حاسبة كندا",
-				ScreenshotBase64: snapState.ScreenshotBase64,
-			})
-			return
-		}
+		log.Printf("🔒 [LOGIN REQUIRED] Browser is on login screen; leaving Chrome untouched for manual operator login + 2FA.")
+		sh.setHarvesting(false)
+		snapState := sh.InspectBrowserState(parentCtx, cdpEndpoint, true)
+		sh.setHarvesting(true)
+		failAll(&HarvestResult{
+			Success:          false,
+			ErrorCode:        "SESSION_EXPIRED",
+			ErrorMessage:     "🔒 حساب carfaxonline.com يحتاج لتسجيل الدخول يدوياً في متصفح كروم على حاسبة كندا",
+			ScreenshotBase64: snapState.ScreenshotBase64,
+		})
+		return
 	}
 
 	// If Chrome is open (and not on a login/captcha page) but not currently showing the VIN input box
