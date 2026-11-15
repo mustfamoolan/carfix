@@ -24,5 +24,5 @@ if not exist "C:\CarfaxDealerProfile" (
     mkdir "C:\CarfaxDealerProfile" >nul 2>&1
 )
 
-start "" "%CHROME_PATH%" --remote-debugging-port=9222 --remote-allow-origins=* --user-data-dir="C:\CarfaxDealerProfile" --profile-directory="Default" --restore-last-session --disable-blink-features=AutomationControlled --no-first-run --no-default-browser-check https://www.carfaxonline.com
+start "" "%CHROME_PATH%" --remote-debugging-port=9222 --remote-allow-origins=* --user-data-dir="C:\CarfaxDealerProfile" --profile-directory="Default" --disable-popup-blocking --disable-session-crashed-bubble --disable-blink-features=AutomationControlled --no-first-run --no-default-browser-check https://www.carfaxonline.com
 exit /b 0

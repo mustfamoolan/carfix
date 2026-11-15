@@ -196,9 +196,13 @@ func (sh *StealthHarvester) CloseTabByID(cdpEndpoint, tabID string) {
 // using the dedicated, isolated C:\CarfaxDealerProfile directory (NEVER copying or overwriting from Main Chrome
 // so Chrome 127+ App-Bound Encryption keys and CARFAX login cookies + 2FA device trust remain 100% permanent).
 func (sh *StealthHarvester) EnsureChromeRunning(cdpEndpoint string) error {
-	_, err := sh.ListOpenTabs(cdpEndpoint)
-	if err == nil {
-		return nil // Already running and healthy
+	// Wait briefly if Chrome is in the middle of starting up (up to 2s) before spawning a new window
+	for w := 0; w < 4; w++ {
+		if _, err := sh.ListOpenTabs(cdpEndpoint); err == nil {
+			sh.deduplicateSearchTabs(cdpEndpoint)
+			return nil // Already running and healthy
+		}
+		time.Sleep(400 * time.Millisecond)
 	}
 
 	log.Printf("⚠️ [AUTO-RECOVERY] Chrome is closed or disconnected on 9222. Launching dedicated Chrome profile automatically...")
@@ -218,7 +222,8 @@ func (sh *StealthHarvester) EnsureChromeRunning(cdpEndpoint string) error {
 				"--remote-allow-origins=*",
 				"--user-data-dir=C:\\CarfaxDealerProfile",
 				"--profile-directory=Default",
-				"--restore-last-session",
+				"--disable-popup-blocking",
+				"--disable-session-crashed-bubble",
 				"--disable-blink-features=AutomationControlled",
 				"--no-first-run",
 				"--no-default-browser-check",
@@ -235,12 +240,40 @@ func (sh *StealthHarvester) EnsureChromeRunning(cdpEndpoint string) error {
 	for i := 0; i < 20; i++ {
 		time.Sleep(500 * time.Millisecond)
 		if _, checkErr := sh.ListOpenTabs(cdpEndpoint); checkErr == nil {
+			sh.deduplicateSearchTabs(cdpEndpoint)
 			log.Printf("✅ [AUTO-RECOVERY SUCCESS] Chrome host connected on 9222 (C:\\CarfaxDealerProfile)!")
 			return nil
 		}
 	}
 
 	return fmt.Errorf("تعذر إعادة تشغيل كروم تلقائياً")
+}
+
+// deduplicateSearchTabs closes any duplicate carfaxonline.com home/search tabs (or extra New Tabs)
+// so Chrome always keeps just ONE clean search tab open!
+func (sh *StealthHarvester) deduplicateSearchTabs(cdpEndpoint string) {
+	if sh.IsHarvesting() {
+		return
+	}
+	tabs, err := sh.ListOpenTabs(cdpEndpoint)
+	if err != nil || len(tabs) <= 1 {
+		return
+	}
+
+	keptSearchTabID := ""
+	for _, t := range tabs {
+		u := strings.ToLower(t.URL)
+		if (strings.Contains(u, "carfaxonline.com") || strings.Contains(u, "carfax.ca") || strings.Contains(u, "carfax.com")) &&
+			!strings.Contains(u, "/vhr/") && !strings.Contains(u, "/cfm/") {
+			if keptSearchTabID == "" {
+				keptSearchTabID = t.ID
+			} else if !sh.isTabActive(t.ID) {
+				sh.CloseTabByID(cdpEndpoint, t.ID)
+			}
+		} else if keptSearchTabID != "" && (strings.HasPrefix(u, "chrome://newtab") || u == "about:blank") {
+			sh.CloseTabByID(cdpEndpoint, t.ID)
+		}
+	}
 }
 
 // KeepAliveSession gently refreshes the active carfaxonline.com dealer session in the background
@@ -858,6 +891,54 @@ func (sh *StealthHarvester) HarvestBatchReports(
 				break
 			}
 
+			// 3. Check if CARFAX showed "Popup Blocked — View Your Report" modal!
+			// If so, extract the report URL (or click "View Your Report"), open it via CDP target.CreateTarget, and close the modal!
+			var popupBlockedInfo struct {
+				Found bool   `json:"found"`
+				Href  string `json:"href"`
+			}
+			_ = chromedp.Run(searchTabCtx, chromedp.Evaluate(`
+(() => {
+    const links = Array.from(document.querySelectorAll('a, button, [role="button"]'));
+    let viewLink = null;
+    for (const el of links) {
+        if (el.offsetParent === null) continue;
+        const txt = (el.innerText || el.textContent || '').trim().toLowerCase();
+        const href = el.href || el.getAttribute('href') || '';
+        if (txt === 'view your report' || txt.includes('view your report') || (href && href.toLowerCase().includes('/vhr/'))) {
+            viewLink = el;
+            break;
+        }
+    }
+    if (!viewLink) return { found: false, href: '' };
+
+    const rawHref = viewLink.href || viewLink.getAttribute('href') || '';
+    // Also click the link in case it uses an onClick handler
+    viewLink.click();
+
+    // Dismiss the "Popup Blocked" modal close button (×) so the search page stays clean for the next VIN
+    const closeBtns = Array.from(document.querySelectorAll('button, span, a, [role="button"], [aria-label*="close" i]'));
+    for (const cb of closeBtns) {
+        if (cb.offsetParent === null) continue;
+        const t = (cb.innerText || cb.textContent || '').trim();
+        const aria = (cb.getAttribute('aria-label') || '').toLowerCase();
+        if (t === '×' || t === '✕' || t === 'X' || aria.includes('close')) {
+            cb.click();
+            break;
+        }
+    }
+
+    return { found: true, href: rawHref };
+})()
+`, &popupBlockedInfo))
+
+			if popupBlockedInfo.Found && popupBlockedInfo.Href != "" && !strings.HasPrefix(strings.ToLower(popupBlockedInfo.Href), "javascript:") {
+				_ = chromedp.Run(searchTabCtx, chromedp.ActionFunc(func(ctx context.Context) error {
+					_, err := target.CreateTarget(popupBlockedInfo.Href).Do(ctx)
+					return err
+				}))
+			}
+
 			// Automatic retry click at ~3.0s if no tab opened yet
 			if attempt == 12 {
 				_ = sh.pasteVinInstantly(searchTabCtx, state.VinInputSelector, vin)
@@ -1360,13 +1441,61 @@ func (sh *StealthHarvester) extractFastReportData(tabCtx context.Context, vin st
 	return out.SummaryJson, out.LightHtml, out.Title, "", "", nil
 }
 
-// pasteVinInstantly mimics a dealer pressing Ctrl+V into the CARFAX VIN box (~0.15s instead of 3.5s)
-// using the native HTMLInputElement value setter + InputEvent('insertFromPaste') so React/Angular state updates immediately.
+// pasteVinInstantly mimics a dealer pressing Ctrl+V into the CARFAX VIN box (~0.18s instead of 3.5s)
+// using the native HTMLInputElement value setter for the first 16 chars + a real trusted CDP KeyEvent for the 17th char
+// so Chrome grants Transient User Activation (preventing Chrome's Popup Blocker from blocking window.open!)
 func (sh *StealthHarvester) pasteVinInstantly(tabCtx context.Context, selector, vin string) error {
 	cleanVin := strings.ToUpper(strings.TrimSpace(vin))
-	sh.randomDelay(60, 130)
+	if len(cleanVin) < 17 {
+		return fmt.Errorf("invalid VIN length: %s", cleanVin)
+	}
+	sh.randomDelay(50, 100)
 
-	pasteJS := fmt.Sprintf(`
+	prefix16 := cleanVin[:16]
+	lastChar := cleanVin[16:]
+
+	// 1. Focus and paste the first 16 characters instantly
+	pastePrefixJS := fmt.Sprintf(`
+(() => {
+    // Dismiss any leftover "Popup Blocked" modal if open
+    const closeBtns = Array.from(document.querySelectorAll('button, span, a, [role="button"], [aria-label*="close" i]'));
+    for (const cb of closeBtns) {
+        if (cb.offsetParent === null) continue;
+        const t = (cb.innerText || cb.textContent || '').trim();
+        const aria = (cb.getAttribute('aria-label') || '').toLowerCase();
+        if (t === '×' || t === '✕' || aria.includes('close')) {
+            cb.click();
+        }
+    }
+
+    const el = document.querySelector(%q) ||
+        document.querySelector('input[name="VIN"]') ||
+        document.querySelector('input[name="vin"]') ||
+        document.querySelector('input[placeholder*="VIN" i]') ||
+        document.querySelector('input[id*="vin" i]');
+    if (!el) return false;
+    el.focus();
+    const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
+    if (setter) {
+        setter.call(el, %q);
+    } else {
+        el.value = %q;
+    }
+    el.dispatchEvent(new InputEvent('input', { bubbles: true, cancelable: true, inputType: 'insertFromPaste', data: %q }));
+    return true;
+})();
+`, selector, prefix16, prefix16, prefix16)
+
+	var okPrefix bool
+	if err := chromedp.Run(tabCtx, chromedp.Evaluate(pastePrefixJS, &okPrefix)); err != nil || !okPrefix {
+		return fmt.Errorf("لم يتم العثور على حقل الشاصي (%s)", selector)
+	}
+
+	// 2. Send the 17th character via a real trusted CDP KeyEvent (event.isTrusted = true -> grants Chrome User Activation for popups!)
+	_ = chromedp.Run(tabCtx, chromedp.KeyEvent(lastChar))
+
+	// 3. Verify all 17 characters are in the input box
+	verifyJS := fmt.Sprintf(`
 (() => {
     const el = document.querySelector(%q) ||
         document.querySelector('input[name="VIN"]') ||
@@ -1375,41 +1504,50 @@ func (sh *StealthHarvester) pasteVinInstantly(tabCtx context.Context, selector, 
         document.querySelector('input[id*="vin" i]');
     if (!el) return '';
     el.focus();
-    const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
-    if (setter) {
-        setter.call(el, '');
-    } else {
-        el.value = '';
+    if ((el.value || '').trim().toUpperCase() !== %q) {
+        const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
+        if (setter) {
+            setter.call(el, %q);
+        } else {
+            el.value = %q;
+        }
+        el.dispatchEvent(new InputEvent('input', { bubbles: true, cancelable: true, inputType: 'insertFromPaste', data: %q }));
+        el.dispatchEvent(new Event('change', { bubbles: true }));
     }
-    el.dispatchEvent(new Event('input', { bubbles: true }));
-
-    if (setter) {
-        setter.call(el, %q);
-    } else {
-        el.value = %q;
-    }
-    el.dispatchEvent(new InputEvent('input', { bubbles: true, cancelable: true, inputType: 'insertFromPaste', data: %q }));
-    el.dispatchEvent(new Event('change', { bubbles: true }));
-    el.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true, key: 'v', code: 'KeyV', ctrlKey: true }));
     return (el.value || '').trim().toUpperCase();
 })();
-`, selector, cleanVin, cleanVin, cleanVin)
+`, selector, cleanVin, cleanVin, cleanVin, cleanVin)
 
 	var finalVal string
-	if err := chromedp.Run(tabCtx, chromedp.Evaluate(pasteJS, &finalVal)); err != nil {
+	if err := chromedp.Run(tabCtx, chromedp.Evaluate(verifyJS, &finalVal)); err != nil {
 		return err
 	}
 	if finalVal != cleanVin {
 		return fmt.Errorf("القيمة الملصقة (%s) لا تطابق الشاصي المطلوب (%s)", finalVal, cleanVin)
 	}
 
-	sh.randomDelay(80, 160)
+	sh.randomDelay(60, 120)
 	return nil
 }
 
-// submitVinSearch clicks the specific Run Report / Search button associated with the VIN input box
-// (or falls back to submitting the form / pressing Enter).
+// submitVinSearch submits the VIN using a real trusted CDP Enter KeyEvent first (preserving Chrome User Activation
+// so window.open popup tabs are NEVER blocked), and also clicks the Run Report button if still on the form.
 func (sh *StealthHarvester) submitVinSearch(tabCtx context.Context, selector string) {
+	// 1. Focus the VIN input and press a trusted CDP Enter key (event.isTrusted = true allows popups!)
+	_ = chromedp.Run(tabCtx,
+		chromedp.Evaluate(fmt.Sprintf(`
+(() => {
+    const input = document.querySelector(%q) ||
+        document.querySelector('input[name="VIN"]') ||
+        document.querySelector('input[name="vin"]') ||
+        document.querySelector('input[placeholder*="VIN" i]');
+    if (input) input.focus();
+})()
+`, selector), nil),
+		chromedp.KeyEvent("\r"),
+	)
+
+	// 2. Also click the explicit Run Report button if needed
 	submitJS := fmt.Sprintf(`
 (() => {
     const input = document.querySelector(%q) ||
@@ -1417,7 +1555,6 @@ func (sh *StealthHarvester) submitVinSearch(tabCtx context.Context, selector str
         document.querySelector('input[name="vin"]') ||
         document.querySelector('input[placeholder*="VIN" i]');
 
-    // 1. Prefer a submit button inside the same form as the VIN input
     if (input && input.form) {
         const formBtn = input.form.querySelector('button[type="submit"], input[type="submit"], button:not([type="button"]):not([type="reset"])');
         if (formBtn && formBtn.offsetParent !== null && !formBtn.disabled) {
@@ -1426,7 +1563,6 @@ func (sh *StealthHarvester) submitVinSearch(tabCtx context.Context, selector str
         }
     }
 
-    // 2. Match explicit CARFAX Run Report / Search buttons
     const allBtns = Array.from(document.querySelectorAll('button, input[type="submit"], input[type="button"], a[role="button"]'));
     for (const b of allBtns) {
         if (b.offsetParent === null || b.disabled) continue;
@@ -1439,42 +1575,12 @@ func (sh *StealthHarvester) submitVinSearch(tabCtx context.Context, selector str
             return 'clicked_named_btn';
         }
     }
-
-    // 3. Fallback to standard submit selectors
-    const btnSelectors = [
-        'button[type="submit"]',
-        'input[type="submit"]',
-        'button[id*="search" i]',
-        'button[class*="search" i]',
-        'button[class*="submit" i]'
-    ];
-    for (const sel of btnSelectors) {
-        const b = document.querySelector(sel);
-        if (b && b.offsetParent !== null && !b.disabled) {
-            b.click();
-            return 'clicked_selector_btn';
-        }
-    }
-
-    if (input) {
-        input.focus();
-        input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }));
-        input.dispatchEvent(new KeyboardEvent('keypress', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }));
-        input.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }));
-    }
-    if (input && input.form) {
-        input.form.submit();
-        return 'submitted_form';
-    }
-    return 'enter_fallback';
+    return 'enter_sent';
 })();
 `, selector)
 
 	var submitMethod string
 	_ = chromedp.Run(tabCtx, chromedp.Evaluate(submitJS, &submitMethod))
-	if submitMethod == "enter_fallback" {
-		_ = chromedp.Run(tabCtx, chromedp.KeyEvent("\r"))
-	}
 }
 
 // prepareOfficialPrintModal clicks the top "Print" button on the Carfax report page,
