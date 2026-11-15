@@ -8,14 +8,12 @@ import { useAuth } from '@/context/AuthContext'
 import {
   getUserSearches,
   getCachedData,
-  searchVin,
-  getQueueStatus,
-  cancelQueuedSearches,
-  markVinUnviewed,
+  getPendingSearches,
+  subscribePendingSearches,
+  enqueueGlobalVinSearch,
   api,
 } from '@/lib/api'
 import { MapPin, CheckCircle2, Circle, Info, ChevronRight } from 'lucide-react'
-import { toast } from 'sonner'
 
 export default function DashboardView() {
   const navigate = useNavigate()
@@ -23,33 +21,12 @@ export default function DashboardView() {
   const cachedSearches = getCachedData('user:searches:')
   const initialLogs = cachedSearches?.logs || cachedSearches?.data?.logs || null
   const [searches, setSearches] = useState(initialLogs || [])
-  const [pendingSearches, setPendingSearches] = useState([])
+  const [pendingSearches, setPendingSearches] = useState(() => getPendingSearches())
   const [loadingSearches, setLoadingSearches] = useState(!initialLogs)
   const [workerStatus, setWorkerStatus] = useState(getCachedData('worker:status') || null)
 
   const vinInputRef = useRef(null)
   const historySectionRef = useRef(null)
-  const pendingSearchesRef = useRef([])
-
-  useEffect(() => {
-    pendingSearchesRef.current = pendingSearches
-  }, [pendingSearches])
-
-  // Immediately cancel any waiting tasks in the server queue if the user closes or refreshes their browser tab
-  useEffect(() => {
-    const handleUnloadCancel = () => {
-      const activeVins = pendingSearchesRef.current.map((p) => p.vin).filter(Boolean)
-      if (activeVins.length > 0) {
-        cancelQueuedSearches(activeVins)
-      }
-    }
-    window.addEventListener('pagehide', handleUnloadCancel)
-    window.addEventListener('beforeunload', handleUnloadCancel)
-    return () => {
-      window.removeEventListener('pagehide', handleUnloadCancel)
-      window.removeEventListener('beforeunload', handleUnloadCancel)
-    }
-  }, [])
 
   const loadSearches = async (showSpinner = false) => {
     if (showSpinner || searches.length === 0) setLoadingSearches(true)
@@ -80,128 +57,22 @@ export default function DashboardView() {
     return () => clearInterval(timer)
   }, [])
 
-  // Live Queue & Countdown Ticker for all active in-progress searches in the table
+  // Subscribe to global persistent pendingSearches store so yellow rows stay visible
+  // even when navigating to another page and returning!
   useEffect(() => {
-    if (pendingSearches.length === 0) return
-
-    const tickTimer = setInterval(() => {
-      setPendingSearches((prev) =>
-        prev.map((item) => ({
-          ...item,
-          estimated_seconds: item.estimated_seconds > 2 ? item.estimated_seconds - 1 : item.estimated_seconds,
-        }))
-      )
-    }, 1000)
-
-    const statusTimer = setInterval(async () => {
-      const currentItems = pendingSearchesRef.current
-      if (!currentItems || currentItems.length === 0) return
-
-      for (const item of currentItems) {
-        try {
-          const qRes = await getQueueStatus(item.vin)
-          const info = qRes?.data || qRes
-          if (info) {
-            if (info.is_ready || info.status === 'ready') {
-              markVinUnviewed(item.vin)
-              setPendingSearches((curr) => curr.filter((c) => c.vin !== item.vin))
-              loadSearches(false)
-              refreshUser()
-              continue
-            }
-            setPendingSearches((curr) =>
-              curr.map((c) => {
-                if (c.vin !== item.vin) return c
-                let stepAr = c.step_ar
-                if (info.is_active) {
-                  stepAr = 'جاري سحب التقرير الآن...'
-                } else if (info.queue_position > 0) {
-                  stepAr = `في الطابور (#${info.queue_position})`
-                }
-                const est =
-                  info.estimated_seconds > 0 &&
-                  (c.estimated_seconds === 0 || Math.abs(c.estimated_seconds - info.estimated_seconds) > 4)
-                    ? info.estimated_seconds
-                    : c.estimated_seconds
-                return {
-                  ...c,
-                  step_ar: stepAr,
-                  estimated_seconds: est,
-                }
-              })
-            )
-          }
-        } catch {
-          // ignore poll error
-        }
+    const unsubscribe = subscribePendingSearches((items, event) => {
+      setPendingSearches(items)
+      if (event?.type === 'completed' || event?.type === 'settled') {
+        loadSearches(false)
+        refreshUser()
+        fetchWorkerStatus()
       }
-    }, 2000)
-
-    return () => {
-      clearInterval(tickTimer)
-      clearInterval(statusTimer)
-    }
-  }, [pendingSearches.length])
+    })
+    return unsubscribe
+  }, [])
 
   const handleQueueSearch = async (vin, initialTitle = '') => {
-    const cleanVin = String(vin).trim().toUpperCase()
-
-    // Prevent duplicate concurrent clicks for the exact same VIN
-    if (pendingSearches.some((p) => p.vin === cleanVin)) {
-      toast.info(`الشاصي (${cleanVin}) قيد الجلب حالياً في الجدول أدناه`)
-      return
-    }
-
-    const pendingItem = {
-      id: `pending-${cleanVin}-${Date.now()}`,
-      vin: cleanVin,
-      vehicle_title: initialTitle || 'جاري جلب بيانات المركبة...',
-      result_status: 'processing',
-      status: 'processing',
-      step_ar: 'جاري طلب وسحب التقرير...',
-      estimated_seconds: 12 + pendingSearches.length * 6,
-      created_at: new Date().toISOString(),
-    }
-
-    setPendingSearches((prev) => [pendingItem, ...prev])
-
-    // If user submitted before NHTSA decoded the title, fetch vehicle title in background for display
-    if (!initialTitle) {
-      fetch(`https://vpic.nhtsa.dot.gov/api/vehicles/DecodeVinValues/${cleanVin}?format=json`)
-        .then((r) => r.json())
-        .then((data) => {
-          const item = data?.Results?.[0]
-          if (item?.Make && item?.ModelYear) {
-            const decodedTitle = `${item.ModelYear} ${item.Make} ${item.Model || item.Series || ''}`
-              .replace(/\s+/g, ' ')
-              .trim()
-            setPendingSearches((curr) =>
-              curr.map((c) => (c.vin === cleanVin ? { ...c, vehicle_title: decodedTitle } : c))
-            )
-          }
-        })
-        .catch(() => {})
-    }
-
-    try {
-      const res = await searchVin(cleanVin)
-      if (res?.status === 'cancelled') return
-      markVinUnviewed(cleanVin)
-      await Promise.all([refreshUser(), fetchWorkerStatus(), loadSearches(false)])
-      toast.success(
-        res?.message || `اكتمل جلب تقرير (${cleanVin}) بنجاح — اضغط "عرض التقرير" من الجدول أدناه`
-      )
-    } catch (err) {
-      const msg =
-        err.response?.data?.message ||
-        err.data?.message ||
-        err.response?.data?.error ||
-        err.message ||
-        `تعذر استخراج التقرير للشاصي (${cleanVin})`
-      toast.error(msg)
-    } finally {
-      setPendingSearches((prev) => prev.filter((p) => p.vin !== cleanVin))
-    }
+    enqueueGlobalVinSearch(vin, initialTitle)
   }
 
   const focusVinInput = () => {

@@ -1,3 +1,5 @@
+import { toast } from 'sonner'
+
 // Lightweight API client with JWT bearer token + Fast In-Memory Stale-While-Revalidate Cache
 
 const memoryCache = new Map()
@@ -262,6 +264,286 @@ export const cancelQueuedSearches = (vins = []) => {
   } catch {
     // Ignore unload network error
   }
+}
+
+// ============================================================================
+// Global Persistent Pending Searches Store & Background Queue Runner
+// Keeps yellow in-progress rows ("جاري السحب...") alive across SPA route navigation!
+// ============================================================================
+const PENDING_SEARCHES_KEY = 'carfix_pending_searches'
+let globalPendingSearches = []
+const pendingSearchListeners = new Set()
+const activeSearchPromises = new Map()
+let globalTickerInterval = null
+let globalStatusPollInterval = null
+let unloadListenerRegistered = false
+
+function loadPersistedPendingSearches() {
+  try {
+    const raw = sessionStorage.getItem(PENDING_SEARCHES_KEY)
+    if (!raw) return []
+    const parsed = JSON.parse(raw)
+    if (!Array.isArray(parsed)) return []
+    // Discard stale items older than 15 minutes
+    const now = Date.now()
+    return parsed.filter((item) => {
+      if (!item?.vin) return false
+      const createdMs = item.created_at ? new Date(item.created_at).getTime() : now
+      return Number.isNaN(createdMs) || now - createdMs < 15 * 60 * 1000
+    })
+  } catch {
+    return []
+  }
+}
+
+function savePersistedPendingSearches() {
+  try {
+    sessionStorage.setItem(PENDING_SEARCHES_KEY, JSON.stringify(globalPendingSearches))
+  } catch {
+    // ignore storage errors
+  }
+}
+
+function notifyPendingListeners(event = null) {
+  savePersistedPendingSearches()
+  const snapshot = [...globalPendingSearches]
+  for (const listener of pendingSearchListeners) {
+    try {
+      listener(snapshot, event)
+    } catch {
+      // ignore subscriber error
+    }
+  }
+}
+
+function ensureGlobalUnloadHandler() {
+  if (unloadListenerRegistered || typeof window === 'undefined') return
+  unloadListenerRegistered = true
+
+  const handleBrowserClose = () => {
+    const activeVins = globalPendingSearches.map((p) => p.vin).filter(Boolean)
+    if (activeVins.length > 0) {
+      cancelQueuedSearches(activeVins)
+    }
+  }
+
+  window.addEventListener('pagehide', handleBrowserClose)
+  window.addEventListener('beforeunload', handleBrowserClose)
+}
+
+function ensureGlobalPendingTimers() {
+  ensureGlobalUnloadHandler()
+
+  if (globalPendingSearches.length === 0) {
+    if (globalTickerInterval) {
+      clearInterval(globalTickerInterval)
+      globalTickerInterval = null
+    }
+    if (globalStatusPollInterval) {
+      clearInterval(globalStatusPollInterval)
+      globalStatusPollInterval = null
+    }
+    return
+  }
+
+  if (!globalTickerInterval) {
+    globalTickerInterval = setInterval(() => {
+      if (globalPendingSearches.length === 0) {
+        ensureGlobalPendingTimers()
+        return
+      }
+      globalPendingSearches = globalPendingSearches.map((item) => ({
+        ...item,
+        estimated_seconds:
+          item.estimated_seconds > 2 ? item.estimated_seconds - 1 : item.estimated_seconds,
+      }))
+      notifyPendingListeners()
+    }, 1000)
+  }
+
+  if (!globalStatusPollInterval) {
+    globalStatusPollInterval = setInterval(async () => {
+      if (globalPendingSearches.length === 0) {
+        ensureGlobalPendingTimers()
+        return
+      }
+      const itemsSnapshot = [...globalPendingSearches]
+      for (const item of itemsSnapshot) {
+        try {
+          const qRes = await getQueueStatus(item.vin)
+          const info = qRes?.data || qRes
+          if (!info) continue
+
+          if (info.is_ready || info.status === 'ready') {
+            markVinUnviewed(item.vin)
+            invalidateCache('user:searches')
+            invalidateCache('admin:logs')
+            invalidateCache('admin:users')
+            globalPendingSearches = globalPendingSearches.filter((c) => c.vin !== item.vin)
+            ensureGlobalPendingTimers()
+            notifyPendingListeners({ type: 'completed', vin: item.vin })
+            continue
+          }
+
+          let changed = false
+          globalPendingSearches = globalPendingSearches.map((c) => {
+            if (c.vin !== item.vin) return c
+            let stepAr = c.step_ar
+            if (info.is_active) {
+              stepAr = 'جاري سحب التقرير الآن...'
+            } else if (info.queue_position > 0) {
+              stepAr = `في الطابور (#${info.queue_position})`
+            }
+            const est =
+              info.estimated_seconds > 0 &&
+              (c.estimated_seconds === 0 ||
+                Math.abs(c.estimated_seconds - info.estimated_seconds) > 4)
+                ? info.estimated_seconds
+                : c.estimated_seconds
+            if (stepAr !== c.step_ar || est !== c.estimated_seconds) {
+              changed = true
+            }
+            return {
+              ...c,
+              step_ar: stepAr,
+              estimated_seconds: est,
+            }
+          })
+          if (changed) {
+            notifyPendingListeners()
+          }
+        } catch {
+          // ignore poll blip
+        }
+      }
+    }, 2000)
+  }
+}
+
+export function getPendingSearches() {
+  if (globalPendingSearches.length === 0) {
+    const persisted = loadPersistedPendingSearches()
+    if (persisted.length > 0) {
+      globalPendingSearches = persisted
+      ensureGlobalPendingTimers()
+      // Resume background search promises if page was soft-reloaded
+      for (const item of globalPendingSearches) {
+        if (!activeSearchPromises.has(item.vin)) {
+          runBackgroundSearchWorker(item.vin)
+        }
+      }
+    }
+  }
+  return [...globalPendingSearches]
+}
+
+export function subscribePendingSearches(listener) {
+  pendingSearchListeners.add(listener)
+  // Immediately invoke with current state
+  try {
+    listener(getPendingSearches(), null)
+  } catch {
+    // ignore
+  }
+  return () => {
+    pendingSearchListeners.delete(listener)
+  }
+}
+
+async function runBackgroundSearchWorker(cleanVin) {
+  if (activeSearchPromises.has(cleanVin)) {
+    return activeSearchPromises.get(cleanVin)
+  }
+
+  const taskPromise = (async () => {
+    try {
+      const res = await searchVin(cleanVin)
+      if (res?.status === 'cancelled') return res
+      markVinUnviewed(cleanVin)
+      invalidateCache('user:searches')
+      invalidateCache('admin:logs')
+      invalidateCache('admin:users')
+      toast.success(
+        res?.message || `اكتمل جلب تقرير (${cleanVin}) بنجاح — اضغط "عرض التقرير" من الجدول`
+      )
+      notifyPendingListeners({ type: 'completed', vin: cleanVin, response: res })
+      return res
+    } catch (err) {
+      const msg =
+        err?.response?.data?.message ||
+        err?.data?.message ||
+        err?.response?.data?.error ||
+        err?.message ||
+        `تعذر استخراج التقرير للشاصي (${cleanVin})`
+      toast.error(msg)
+      notifyPendingListeners({ type: 'error', vin: cleanVin, error: err })
+      throw err
+    } finally {
+      activeSearchPromises.delete(cleanVin)
+      globalPendingSearches = globalPendingSearches.filter((p) => p.vin !== cleanVin)
+      ensureGlobalPendingTimers()
+      notifyPendingListeners({ type: 'settled', vin: cleanVin })
+    }
+  })()
+
+  activeSearchPromises.set(cleanVin, taskPromise)
+  return taskPromise
+}
+
+export function enqueueGlobalVinSearch(vin, initialTitle = '') {
+  const cleanVin = String(vin || '').trim().toUpperCase()
+  if (!cleanVin) return
+
+  // Ensure loaded
+  getPendingSearches()
+
+  if (globalPendingSearches.some((p) => p.vin === cleanVin)) {
+    toast.info(`الشاصي (${cleanVin}) قيد الجلب حالياً في الجدول أدناه`)
+    return
+  }
+
+  const pendingItem = {
+    id: `pending-${cleanVin}-${Date.now()}`,
+    vin: cleanVin,
+    vehicle_title: initialTitle || 'جاري جلب بيانات المركبة...',
+    result_status: 'processing',
+    status: 'processing',
+    step_ar: 'جاري طلب وسحب التقرير...',
+    estimated_seconds: 12 + globalPendingSearches.length * 6,
+    created_at: new Date().toISOString(),
+  }
+
+  globalPendingSearches = [pendingItem, ...globalPendingSearches]
+  ensureGlobalPendingTimers()
+  notifyPendingListeners({ type: 'added', vin: cleanVin })
+
+  if (!initialTitle) {
+    const cachedSpecs = getCachedVinSpecs(cleanVin)
+    if (cachedSpecs?.title) {
+      globalPendingSearches = globalPendingSearches.map((c) =>
+        c.vin === cleanVin ? { ...c, vehicle_title: cachedSpecs.title } : c
+      )
+      notifyPendingListeners()
+    } else {
+      fetch(`https://vpic.nhtsa.dot.gov/api/vehicles/DecodeVinValues/${cleanVin}?format=json`)
+        .then((r) => r.json())
+        .then((data) => {
+          const item = data?.Results?.[0]
+          if (item?.Make && item?.ModelYear) {
+            const decodedTitle = `${item.ModelYear} ${item.Make} ${item.Model || item.Series || ''}`
+              .replace(/\s+/g, ' ')
+              .trim()
+            globalPendingSearches = globalPendingSearches.map((c) =>
+              c.vin === cleanVin ? { ...c, vehicle_title: decodedTitle } : c
+            )
+            notifyPendingListeners()
+          }
+        })
+        .catch(() => {})
+    }
+  }
+
+  runBackgroundSearchWorker(cleanVin).catch(() => {})
 }
 
 export const getReport = async (vin) => {
