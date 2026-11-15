@@ -13,7 +13,7 @@ import { RefreshCw, Camera, Loader2, CheckCircle2, AlertCircle, RotateCcw } from
 import { toast } from 'sonner'
 import { api } from '@/lib/api'
 
-export default function CanadaWorkerCard({ status, onRefresh }) {
+export default function CanadaWorkerCard({ status, userQuota, onRefresh }) {
   const [inspecting, setInspecting] = useState(false)
   const [resetting, setResetting] = useState(false)
   const [previewOpen, setPreviewOpen] = useState(false)
@@ -27,7 +27,7 @@ export default function CanadaWorkerCard({ status, onRefresh }) {
     circuit_breaker_active,
     circuit_breaker_reason,
     daily_pulls = 0,
-    max_daily_pulls = 45,
+    max_daily_pulls,
     cooldown_remaining_sec = 0,
     inspect_pending = false,
     telemetry,
@@ -35,6 +35,13 @@ export default function CanadaWorkerCard({ status, onRefresh }) {
     last_screenshot_base64,
     last_screenshot_at,
   } = status
+
+  const effectiveDailyLimit =
+    userQuota?.daily_limit > 0
+      ? userQuota.daily_limit
+      : userQuota?.total_limit > 0
+      ? userQuota.total_limit
+      : max_daily_pulls || 0
 
   const handleRequestInspect = async () => {
     setInspecting(true)
@@ -96,7 +103,7 @@ export default function CanadaWorkerCard({ status, onRefresh }) {
             <span className="text-muted-foreground">
               السحب اليومي:{' '}
               <strong className="text-foreground font-mono">
-                {daily_pulls} / {max_daily_pulls}
+                {effectiveDailyLimit > 0 ? `${daily_pulls} / ${effectiveDailyLimit}` : `${daily_pulls} (مفتوح)`}
               </strong>
             </span>
 

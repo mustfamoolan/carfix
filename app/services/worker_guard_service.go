@@ -14,6 +14,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"carfix/app/models"
 	"carfix/bootstrap"
 )
 
@@ -125,7 +126,7 @@ func NewWorkerGuardService() *WorkerGuardService {
 			secretKey = "almoq3-canada-secret-2026"
 		}
 
-		maxDaily := 45
+		maxDaily := 1000000
 		if val := os.Getenv("CANADA_MAX_DAILY_PULLS"); val != "" {
 			if parsed, err := strconv.Atoi(val); err == nil && parsed > 0 {
 				maxDaily = parsed
@@ -528,6 +529,28 @@ func (s *WorkerGuardService) CountHealthyOnlineNodes(excludeNodeID string) int {
 		count++
 	}
 	return count
+}
+
+// GetAdminMaxDailyPulls returns the Admin user's configured daily limit (or total limit) from UserQuota in DB
+func (s *WorkerGuardService) GetAdminMaxDailyPulls() int {
+	if bootstrap.DB != nil {
+		var quota models.UserQuota
+		err := bootstrap.DB.Table("user_quotas").
+			Select("user_quotas.daily_limit, user_quotas.total_limit").
+			Joins("JOIN users ON users.id = user_quotas.user_id").
+			Where("users.role = ?", "admin").
+			Order("users.id ASC").
+			First(&quota).Error
+		if err == nil {
+			if quota.DailyLimit > 0 {
+				return quota.DailyLimit
+			}
+			if quota.TotalLimit > 0 {
+				return quota.TotalLimit
+			}
+		}
+	}
+	return s.maxDailyPulls
 }
 
 // GetDailyPulls returns count of reports fetched today (globally)
@@ -1025,15 +1048,7 @@ func (s *WorkerGuardService) PollBatchTasks(nodeID, nodeName string, maxBatch in
 		return nil, 0, fmt.Errorf("قاطع الحماية مفعل لهذه العقدة (%s): %s", cleanName, reason)
 	}
 
-	// Gate 2: Check Daily Limit (Global + Node)
-	dailyPulls := s.GetDailyPulls()
-	if dailyPulls >= s.maxDailyPulls*5 { // cluster max capacity
-		return nil, 0, ErrDailyLimit
-	}
-	nodeDailyPulls := s.GetNodeDailyPulls(cleanID)
-	if nodeDailyPulls >= s.maxDailyPulls {
-		return nil, 0, fmt.Errorf("تم بلوغ الحد الأقصى للسحب اليومي لهذه العقدة (%d فحص)", s.maxDailyPulls)
-	}
+	// Gate 2: Daily limit is governed by each user's / Admin's UserQuota in PostgreSQL (no artificial 45 node lock!)
 
 	// Gate 3: Check Node-Specific Mandatory Cooldown
 	nodeCooldown := s.GetNodeCooldownRemainingSec(cleanID)
@@ -1064,10 +1079,6 @@ func (s *WorkerGuardService) PollBatchTasks(nodeID, nodeName string, maxBatch in
 	}
 	if fairBatch > maxBatch {
 		fairBatch = maxBatch
-	}
-	remainingQuota := s.maxDailyPulls - nodeDailyPulls
-	if fairBatch > remainingQuota && remainingQuota > 0 {
-		fairBatch = remainingQuota
 	}
 
 	// Gate 4: Pop valid VINs (skipping Zombie tasks where customer closed browser)
@@ -1532,7 +1543,7 @@ func (s *WorkerGuardService) GetStatus() *WorkerStatus {
 		CircuitBreakerActive: cbActive,
 		CircuitBreakerReason: cbReason,
 		DailyPulls:           s.GetDailyPulls(),
-		MaxDailyPulls:        s.maxDailyPulls,
+		MaxDailyPulls:        s.GetAdminMaxDailyPulls(),
 		CooldownRemainingSec: s.GetCooldownRemainingSec(),
 		QueueLength:          qLen,
 		LastHeartbeat:        lastHb,

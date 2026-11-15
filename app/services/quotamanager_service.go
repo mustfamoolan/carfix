@@ -74,7 +74,7 @@ func (s *QuotaManagerService) CheckAndPrepareQuota(userID uint) (*models.UserQuo
 // ConsumeQuota atomically increments used_total and used_today
 func (s *QuotaManagerService) ConsumeQuota(userID uint) error {
 	res := s.db.Model(&models.UserQuota{}).
-		Where("user_id = ? AND used_total < total_limit AND used_today < daily_limit", userID).
+		Where("user_id = ? AND (total_limit <= 0 OR used_total < total_limit) AND (daily_limit <= 0 OR used_today < daily_limit)", userID).
 		Updates(map[string]interface{}{
 			"used_total": gorm.Expr("used_total + 1"),
 			"used_today": gorm.Expr("used_today + 1"),

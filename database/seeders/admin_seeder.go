@@ -40,9 +40,9 @@ func (s *AdminSeeder) Run(db *gorm.DB) error {
 
 	quota := models.UserQuota{
 		UserID:        admin.ID,
-		TotalLimit:    100000,
+		TotalLimit:    100000000,
 		UsedTotal:     0,
-		DailyLimit:    1000,
+		DailyLimit:    100000000,
 		UsedToday:     0,
 		LastResetDate: time.Now(),
 	}

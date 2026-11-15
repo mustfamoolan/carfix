@@ -210,7 +210,7 @@ export default function DashboardView() {
         {/* Admin Only: Canada Worker Status & Controls Bar */}
         {isAdmin && (
           <div dir="rtl">
-            <CanadaWorkerCard status={workerStatus} onRefresh={fetchWorkerStatus} />
+            <CanadaWorkerCard status={workerStatus} userQuota={user?.quota} onRefresh={fetchWorkerStatus} />
           </div>
         )}
 
