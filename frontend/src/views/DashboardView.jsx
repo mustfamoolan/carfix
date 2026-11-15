@@ -5,8 +5,16 @@ import CanadaWorkerCard from '@/components/admin/CanadaWorkerCard'
 import VinSearchBox from '@/components/dashboard/VinSearchBox'
 import RecentSearchesTable from '@/components/dashboard/RecentSearchesTable'
 import { useAuth } from '@/context/AuthContext'
-import { getUserSearches, getCachedData, api } from '@/lib/api'
+import {
+  getUserSearches,
+  getCachedData,
+  searchVin,
+  getQueueStatus,
+  markVinUnviewed,
+  api,
+} from '@/lib/api'
 import { MapPin, CheckCircle2, Circle, Info, ChevronRight } from 'lucide-react'
+import { toast } from 'sonner'
 
 export default function DashboardView() {
   const navigate = useNavigate()
@@ -14,6 +22,7 @@ export default function DashboardView() {
   const cachedSearches = getCachedData('user:searches:')
   const initialLogs = cachedSearches?.logs || cachedSearches?.data?.logs || null
   const [searches, setSearches] = useState(initialLogs || [])
+  const [pendingSearches, setPendingSearches] = useState([])
   const [loadingSearches, setLoadingSearches] = useState(!initialLogs)
   const [workerStatus, setWorkerStatus] = useState(getCachedData('worker:status') || null)
 
@@ -49,9 +58,120 @@ export default function DashboardView() {
     return () => clearInterval(timer)
   }, [])
 
-  const handleSuccessSearch = async (reportData, vin) => {
-    await Promise.all([refreshUser(), fetchWorkerStatus(), loadSearches()])
-    navigate(`/report/${vin}`, { state: { report: reportData } })
+  // Live Queue & Countdown Ticker for all active in-progress searches in the table
+  useEffect(() => {
+    if (pendingSearches.length === 0) return
+
+    const tickTimer = setInterval(() => {
+      setPendingSearches((prev) =>
+        prev.map((item) => ({
+          ...item,
+          estimated_seconds: item.estimated_seconds > 2 ? item.estimated_seconds - 1 : item.estimated_seconds,
+        }))
+      )
+    }, 1000)
+
+    const statusTimer = setInterval(async () => {
+      setPendingSearches((prev) => {
+        prev.forEach(async (item) => {
+          try {
+            const qRes = await getQueueStatus(item.vin)
+            const info = qRes?.data || qRes
+            if (info) {
+              setPendingSearches((curr) =>
+                curr.map((c) => {
+                  if (c.vin !== item.vin) return c
+                  let stepAr = c.step_ar
+                  if (info.is_active) {
+                    stepAr = 'جاري سحب التقرير الآن...'
+                  } else if (info.queue_position > 0) {
+                    stepAr = `في الطابور (#${info.queue_position})`
+                  }
+                  const est =
+                    info.estimated_seconds > 0 &&
+                    (c.estimated_seconds === 0 || Math.abs(c.estimated_seconds - info.estimated_seconds) > 4)
+                      ? info.estimated_seconds
+                      : c.estimated_seconds
+                  return {
+                    ...c,
+                    step_ar: stepAr,
+                    estimated_seconds: est,
+                  }
+                })
+              )
+            }
+          } catch {
+            // ignore poll error
+          }
+        })
+        return prev
+      })
+    }, 2000)
+
+    return () => {
+      clearInterval(tickTimer)
+      clearInterval(statusTimer)
+    }
+  }, [pendingSearches.length])
+
+  const handleQueueSearch = async (vin, initialTitle = '') => {
+    const cleanVin = String(vin).trim().toUpperCase()
+
+    // Prevent duplicate concurrent clicks for the exact same VIN
+    if (pendingSearches.some((p) => p.vin === cleanVin)) {
+      toast.info(`الشاصي (${cleanVin}) قيد الجلب حالياً في الجدول أدناه`)
+      return
+    }
+
+    const pendingItem = {
+      id: `pending-${cleanVin}-${Date.now()}`,
+      vin: cleanVin,
+      vehicle_title: initialTitle || 'جاري جلب بيانات المركبة...',
+      result_status: 'processing',
+      status: 'processing',
+      step_ar: 'جاري طلب وسحب التقرير...',
+      estimated_seconds: 12 + pendingSearches.length * 6,
+      created_at: new Date().toISOString(),
+    }
+
+    setPendingSearches((prev) => [pendingItem, ...prev])
+
+    // If user submitted before NHTSA decoded the title, fetch vehicle title in background for display
+    if (!initialTitle) {
+      fetch(`https://vpic.nhtsa.dot.gov/api/vehicles/DecodeVinValues/${cleanVin}?format=json`)
+        .then((r) => r.json())
+        .then((data) => {
+          const item = data?.Results?.[0]
+          if (item?.Make && item?.ModelYear) {
+            const decodedTitle = `${item.ModelYear} ${item.Make} ${item.Model || item.Series || ''}`
+              .replace(/\s+/g, ' ')
+              .trim()
+            setPendingSearches((curr) =>
+              curr.map((c) => (c.vin === cleanVin ? { ...c, vehicle_title: decodedTitle } : c))
+            )
+          }
+        })
+        .catch(() => {})
+    }
+
+    try {
+      const res = await searchVin(cleanVin)
+      markVinUnviewed(cleanVin)
+      await Promise.all([refreshUser(), fetchWorkerStatus(), loadSearches(false)])
+      toast.success(
+        res?.message || `اكتمل جلب تقرير (${cleanVin}) بنجاح — اضغط "عرض التقرير" من الجدول أدناه`
+      )
+    } catch (err) {
+      const msg =
+        err.response?.data?.message ||
+        err.data?.message ||
+        err.response?.data?.error ||
+        err.message ||
+        `تعذر استخراج التقرير للشاصي (${cleanVin})`
+      toast.error(msg)
+    } finally {
+      setPendingSearches((prev) => prev.filter((p) => p.vin !== cleanVin))
+    }
   }
 
   const focusVinInput = () => {
@@ -252,7 +372,11 @@ export default function DashboardView() {
             <div className="max-w-5xl mx-auto grid grid-cols-1 lg:grid-cols-12 gap-6" dir="ltr">
               {/* Left Card (7 cols): Run CARFAX Report */}
               <div className="lg:col-span-7">
-                <VinSearchBox onSuccessSearch={handleSuccessSearch} inputRef={vinInputRef} />
+                <VinSearchBox
+                  onQueueSearch={handleQueueSearch}
+                  activeSearchCount={pendingSearches.length}
+                  inputRef={vinInputRef}
+                />
               </div>
 
               {/* Right Card (5 cols): Take Action */}
@@ -300,6 +424,7 @@ export default function DashboardView() {
         <div ref={historySectionRef} className="text-right" dir="rtl">
           <RecentSearchesTable
             searches={searches}
+            pendingSearches={pendingSearches}
             loading={loadingSearches}
             onRefresh={loadSearches}
             onSelectReport={(vin) => navigate(`/report/${vin}`)}

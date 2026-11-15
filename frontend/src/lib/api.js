@@ -103,6 +103,75 @@ export const api = {
   delete: (url, options) => apiRequest(url, { ...options, method: 'DELETE' }),
 }
 
+// Viewed / Unread Report Tracking (persisted in localStorage)
+const VIEWED_VINS_KEY = 'carfix_viewed_vins'
+const UNVIEWED_VINS_KEY = 'carfix_unviewed_vins'
+
+function readJsonStorage(key) {
+  try {
+    const raw = localStorage.getItem(key)
+    return raw ? JSON.parse(raw) : {}
+  } catch {
+    return {}
+  }
+}
+
+function writeJsonStorage(key, val) {
+  try {
+    localStorage.setItem(key, JSON.stringify(val))
+  } catch {
+    // Ignore storage quota errors
+  }
+}
+
+export function markVinUnviewed(vin) {
+  if (!vin) return
+  const clean = String(vin).trim().toUpperCase()
+  const unviewed = readJsonStorage(UNVIEWED_VINS_KEY)
+  unviewed[clean] = Date.now()
+  writeJsonStorage(UNVIEWED_VINS_KEY, unviewed)
+
+  const viewed = readJsonStorage(VIEWED_VINS_KEY)
+  if (viewed[clean]) {
+    delete viewed[clean]
+    writeJsonStorage(VIEWED_VINS_KEY, viewed)
+  }
+}
+
+export function markVinViewed(vin) {
+  if (!vin) return
+  const clean = String(vin).trim().toUpperCase()
+  const viewed = readJsonStorage(VIEWED_VINS_KEY)
+  viewed[clean] = Date.now()
+  writeJsonStorage(VIEWED_VINS_KEY, viewed)
+
+  const unviewed = readJsonStorage(UNVIEWED_VINS_KEY)
+  if (unviewed[clean]) {
+    delete unviewed[clean]
+    writeJsonStorage(UNVIEWED_VINS_KEY, unviewed)
+  }
+}
+
+export function isVinUnread(itemOrVin) {
+  const vin = typeof itemOrVin === 'string' ? itemOrVin : itemOrVin?.vin
+  if (!vin) return false
+  const clean = String(vin).trim().toUpperCase()
+  const unviewed = readJsonStorage(UNVIEWED_VINS_KEY)
+  if (unviewed[clean]) return true
+
+  const viewed = readJsonStorage(VIEWED_VINS_KEY)
+  if (viewed[clean]) return false
+
+  // If item has a recent created_at (within last 12 hours) and was never opened in this browser, treat as new
+  if (typeof itemOrVin === 'object' && itemOrVin?.created_at) {
+    const createdMs = new Date(itemOrVin.created_at).getTime()
+    if (!Number.isNaN(createdMs) && Date.now() - createdMs < 12 * 60 * 60 * 1000) {
+      return true
+    }
+  }
+  return false
+}
+
 // User / Search APIs with automatic cache population & invalidation
 export const searchVin = async (vin) => {
   const cleanVin = String(vin).trim().toUpperCase()
@@ -133,9 +202,9 @@ export const searchVin = async (vin) => {
           data?.is_active ||
           (data?.status === 'queued' && (data?.queue_position > 0 || data?.worker_online))
         ) {
-          if (data?.is_ready && data?.report) {
-            res = data.report
-            break
+          if (data?.is_ready) {
+            // Re-run POST /search on the next loop iteration so quota is properly deducted and SearchLog is recorded!
+            continue
           }
           await new Promise((r) => setTimeout(r, 2000))
           continue
@@ -151,6 +220,7 @@ export const searchVin = async (vin) => {
     throw new Error('الطلب لا يزال في قائمة الانتظار، يرجى الاستمرار في الانتظار أو مراجعة السجل بعد قليل')
   }
 
+  markVinUnviewed(cleanVin)
   invalidateCache('user:searches')
   invalidateCache('admin:logs')
   invalidateCache('admin:users')

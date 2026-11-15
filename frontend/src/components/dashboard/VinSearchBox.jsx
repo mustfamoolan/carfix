@@ -1,28 +1,71 @@
 import React, { useState, useEffect } from 'react'
 import { Badge } from '@/components/ui/badge'
-import { Loader2, CheckCircle2, Clock, Sparkles, AlertTriangle, Car } from 'lucide-react'
+import { Loader2, CheckCircle2, Sparkles, AlertTriangle, Car, Zap } from 'lucide-react'
 import { toast } from 'sonner'
 import {
-  searchVin,
-  getQueueStatus,
   api,
   getCachedVinSpecs,
   setCachedVinSpecs,
 } from '@/lib/api'
 
-export default function VinSearchBox({ onSuccessSearch, inputRef }) {
+// Instant 0ms ISO 3779 / NHTSA VIN Check-Digit & Structure Validator
+function validateVinLocally(vinStr) {
+  const clean = String(vinStr || '').trim().toUpperCase()
+  if (clean.length !== 17) {
+    return { valid: false, error: 'رقم الشاصي (VIN) يجب أن يتكون من 17 رمزاً' }
+  }
+  if (!/^[A-HJ-NPR-Z0-9]{17}$/.test(clean)) {
+    return { valid: false, error: 'رقم الشاصي يحتوي على رموز غير مسموحة' }
+  }
+  // Reject trivial fake patterns (e.g. 11111111111111111)
+  if (/^(.)\1{10,}$/.test(clean) || /^.{3}(.)\1{11,}$/.test(clean)) {
+    return { valid: false, error: 'رقم الشاصي غير صحيح (نمط متكرر غير صالح)' }
+  }
+  const translit = {
+    A: 1, B: 2, C: 3, D: 4, E: 5, F: 6, G: 7, H: 8,
+    J: 1, K: 2, L: 3, M: 4, N: 5, P: 7, R: 9,
+    S: 2, T: 3, U: 4, V: 5, W: 6, X: 7, Y: 8, Z: 9,
+    0: 0, 1: 1, 2: 2, 3: 3, 4: 4, 5: 5, 6: 6, 7: 7, 8: 8, 9: 9,
+  }
+  const weights = [8, 7, 6, 5, 4, 3, 2, 10, 0, 9, 8, 7, 6, 5, 4, 3, 2]
+  let sum = 0
+  for (let i = 0; i < 17; i++) {
+    const val = translit[clean[i]]
+    if (val === undefined) {
+      return { valid: false, error: 'رقم الشاصي غير صحيح' }
+    }
+    sum += val * weights[i]
+  }
+  const rem = sum % 11
+  const expectedCheck = rem === 10 ? 'X' : String(rem)
+  if (clean[8] !== expectedCheck) {
+    return {
+      valid: false,
+      error: 'رقم الشاصي غير صحيح: يوجد خطأ في أحد الأرقام أو الحروف (Check Digit غير مطابق)',
+    }
+  }
+  return { valid: true, error: '' }
+}
+
+export default function VinSearchBox({ onQueueSearch, activeSearchCount = 0, inputRef }) {
   const [vin, setVin] = useState('')
   const [activeTab, setActiveTab] = useState('vin')
-  const [searching, setSearching] = useState(false)
-  const [queueInfo, setQueueInfo] = useState(null)
-  const [displaySeconds, setDisplaySeconds] = useState(0)
   const [specsLoading, setSpecsLoading] = useState(false)
   const [vehicleSpecs, setVehicleSpecs] = useState(null)
   const [vinCheckError, setVinCheckError] = useState('')
+  const [lastQueuedVin, setLastQueuedVin] = useState('')
 
   // Instant pre-search VIN validation + Factory Specs lookup as soon as 17 chars are entered
   useEffect(() => {
     if (vin.length === 17) {
+      const localCheck = validateVinLocally(vin)
+      if (!localCheck.valid) {
+        setVehicleSpecs(null)
+        setVinCheckError(localCheck.error)
+        setSpecsLoading(false)
+        return
+      }
+      setVinCheckError('')
       verifyAndDecodeVin(vin)
     } else {
       setVehicleSpecs(null)
@@ -31,49 +74,7 @@ export default function VinSearchBox({ onSuccessSearch, inputRef }) {
     }
   }, [vin])
 
-  // Poll live status while searching
-  useEffect(() => {
-    if (!searching || vin.length !== 17) {
-      setQueueInfo(null)
-      setDisplaySeconds(0)
-      return
-    }
-
-    let active = true
-    const poll = async () => {
-      try {
-        const qRes = await getQueueStatus(vin)
-        const info = qRes?.data || qRes
-        if (active && info) {
-          setQueueInfo(info)
-          if (info.estimated_seconds > 0) {
-            setDisplaySeconds((prev) =>
-              prev === 0 || Math.abs(prev - info.estimated_seconds) > 4
-                ? info.estimated_seconds
-                : prev
-            )
-          }
-        }
-      } catch {
-        // Ignore poll error
-      }
-    }
-
-    poll()
-    const pollTimer = setInterval(poll, 2000)
-    const tickTimer = setInterval(() => {
-      setDisplaySeconds((prev) => (prev > 2 ? prev - 1 : prev))
-    }, 1000)
-
-    return () => {
-      active = false
-      clearInterval(pollTimer)
-      clearInterval(tickTimer)
-    }
-  }, [searching, vin])
-
   const verifyAndDecodeVin = async (vinCode) => {
-    // 0. Check In-Memory VIN Specs Cache first (0ms instant response)
     const cached = getCachedVinSpecs(vinCode)
     if (cached) {
       setVehicleSpecs(cached.specs)
@@ -84,7 +85,6 @@ export default function VinSearchBox({ onSuccessSearch, inputRef }) {
 
     setSpecsLoading(true)
     setVinCheckError('')
-    setVehicleSpecs(null)
     try {
       // 1. Strict Backend VIN Check Digit & Structure Verification
       try {
@@ -103,7 +103,7 @@ export default function VinSearchBox({ onSuccessSearch, inputRef }) {
         // Continue to factory lookup if local check endpoint had a transient network blip
       }
 
-      // 2. Vehicle Factory Specifications Lookup (Strict Real Make & Check Digit verification)
+      // 2. Vehicle Factory Specifications Lookup
       const res = await fetch(
         `https://vpic.nhtsa.dot.gov/api/vehicles/DecodeVinValues/${vinCode}?format=json`
       )
@@ -152,10 +152,6 @@ export default function VinSearchBox({ onSuccessSearch, inputRef }) {
           setVinCheckError(errMsg)
           setCachedVinSpecs(vinCode, { specs: null, error: errMsg })
         }
-      } else {
-        const errMsg = 'تعذر التحقق من رقم الشاصي، يرجى التأكد من صحة الرقم'
-        setVehicleSpecs(null)
-        setVinCheckError(errMsg)
       }
     } catch {
       // Ignore network error
@@ -166,7 +162,6 @@ export default function VinSearchBox({ onSuccessSearch, inputRef }) {
 
   const handleVinChange = (e) => {
     let val = e.target.value.toUpperCase().replace(/[\s\-_]/g, '')
-    // Filter out forbidden VIN characters: I, O, Q
     val = val.replace(/[IOQ]/g, '')
     if (val.length <= 17) {
       setVin(val)
@@ -175,44 +170,40 @@ export default function VinSearchBox({ onSuccessSearch, inputRef }) {
 
   const handleSearchSubmit = async (e) => {
     e.preventDefault()
-    if (vin.length !== 17) {
+    const cleanVin = vin.trim().toUpperCase()
+    if (cleanVin.length !== 17) {
       toast.error('رقم الشاصي (VIN) يجب أن يتكون من 17 رمزاً')
       return
     }
-    if (specsLoading) {
-      toast.info('يرجى الانتظار لحظة ريثما يكتمل التحقق المبدئي من صحة رقم الشاصي')
-      return
-    }
-    if (vinCheckError || !vehicleSpecs) {
+
+    const localCheck = validateVinLocally(cleanVin)
+    if (!localCheck.valid || vinCheckError) {
       toast.error(
-        vinCheckError || 'رقم الشاصي غير صحيح، لا يمكن إرسال طلب فحص لرقم خاطئ'
+        vinCheckError || localCheck.error || 'رقم الشاصي غير صحيح، لا يمكن إرسال طلب فحص لرقم خاطئ'
       )
       return
     }
 
-    setSearching(true)
-    try {
-      const res = await searchVin(vin)
-      toast.success(res?.message || 'تم استخراج التقرير بنجاح')
-      if (onSuccessSearch) {
-        onSuccessSearch(res?.report || res, vin)
-      }
-    } catch (err) {
-      const msg =
-        err.response?.data?.message ||
-        err.data?.message ||
-        err.response?.data?.error ||
-        err.message ||
-        'تعذر استخراج التقرير حالياً، يرجى المحاولة مرة أخرى'
-      toast.error(msg)
-    } finally {
-      setSearching(false)
-      setQueueInfo(null)
+    const submittedTitle = vehicleSpecs?.title || ''
+
+    // Immediately clear input field & re-focus so user can paste the next VIN without waiting!
+    setVin('')
+    setVehicleSpecs(null)
+    setVinCheckError('')
+    setSpecsLoading(false)
+    setLastQueuedVin(cleanVin)
+
+    if (inputRef?.current) {
+      inputRef.current.focus()
+    }
+
+    if (onQueueSearch) {
+      onQueueSearch(cleanVin, submittedTitle)
     }
   }
 
-  const isReady =
-    vin.length === 17 && !specsLoading && Boolean(vehicleSpecs) && !vinCheckError
+  const localValid = vin.length === 17 && validateVinLocally(vin).valid && !vinCheckError
+  const isReady = localValid && (Boolean(vehicleSpecs) || specsLoading)
 
   return (
     <div className="bg-white dark:bg-card rounded-md shadow-md border border-slate-200/90 dark:border-border p-5 sm:p-6 flex flex-col justify-between h-full">
@@ -222,7 +213,15 @@ export default function VinSearchBox({ onSuccessSearch, inputRef }) {
           <h3 className="text-xl font-extrabold text-slate-900 dark:text-foreground tracking-tight">
             Run CARFAX Report
           </h3>
-          <span className="text-xs font-semibold text-slate-500">فحص الشاصي الفوري</span>
+          <div className="flex items-center gap-2">
+            {activeSearchCount > 0 && (
+              <Badge className="bg-amber-500/15 text-amber-700 dark:text-amber-300 border border-amber-500/30 text-[11px] gap-1 font-bold" dir="rtl">
+                <Loader2 className="h-3 w-3 animate-spin" />
+                جاري سحب ({activeSearchCount}) في السجل
+              </Badge>
+            )}
+            <span className="text-xs font-semibold text-slate-500">فحص الشاصي الفوري المتعدد</span>
+          </div>
         </div>
 
         {/* CARFAX Tabs */}
@@ -255,7 +254,7 @@ export default function VinSearchBox({ onSuccessSearch, inputRef }) {
         <form onSubmit={handleSearchSubmit} className="space-y-3">
           <div className="flex items-center justify-between flex-wrap gap-1.5">
             <label className="text-xs font-bold text-slate-800 dark:text-slate-200 uppercase tracking-wider">
-              VIN (رقم الشاصي)
+              VIN (ألصق الشاصي واضغط Run Report لإرساله للسجل فوراً)
             </label>
             <div className="flex items-center gap-2">
               {vehicleSpecs?.title && (
@@ -285,28 +284,20 @@ export default function VinSearchBox({ onSuccessSearch, inputRef }) {
               placeholder="Enter VIN (e.g. 1GKS1DRLXSR219688)"
               value={vin}
               onChange={handleVinChange}
-              disabled={searching}
               required
               className="flex-1 h-11 px-3.5 rounded border border-slate-400 dark:border-input bg-white dark:bg-background text-sm font-mono tracking-wider uppercase text-slate-900 dark:text-foreground placeholder:text-slate-400 placeholder:tracking-normal placeholder:font-sans focus:outline-none focus:ring-2 focus:ring-[#00599c] focus:border-[#00599c]"
             />
 
             <button
               type="submit"
-              disabled={searching || !isReady}
+              disabled={!isReady}
               className={`h-11 px-6 rounded text-sm font-bold transition-all flex items-center justify-center gap-2 shrink-0 ${
-                searching || !isReady
+                !isReady
                   ? 'bg-[#e0e0e0] text-[#757575] cursor-not-allowed'
                   : 'bg-[#00599c] hover:bg-[#004478] text-white shadow-sm cursor-pointer'
               }`}
             >
-              {searching ? (
-                <>
-                  <Loader2 className="h-4 w-4 animate-spin" />
-                  <span>Running...</span>
-                </>
-              ) : (
-                <span>Run Report</span>
-              )}
+              <span>Run Report</span>
             </button>
           </div>
         </form>
@@ -320,7 +311,7 @@ export default function VinSearchBox({ onSuccessSearch, inputRef }) {
         >
           <Loader2 className="h-4 w-4 animate-spin shrink-0 text-[#00599c]" />
           <span className="font-semibold">
-            جاري التحقق من رقم الشاصي وجلب مواصفات المركبة...
+            الشاصي مطابق قياسياً — يمكنك الضغط على Run Report فوراً أو انتظار مواصفات المركبة...
           </span>
         </div>
       )}
@@ -336,7 +327,7 @@ export default function VinSearchBox({ onSuccessSearch, inputRef }) {
         </div>
       )}
 
-      {/* 3. Factory Specs Card (Appears immediately before sending & stays visible while report is being prepared) */}
+      {/* 3. Factory Specs Card */}
       {vehicleSpecs && !specsLoading && (
         <div
           className="mt-4 rounded-lg border border-[#b9d8f2] bg-[#f0f7fc]/90 dark:bg-sky-950/20 p-3.5 transition-all"
@@ -392,21 +383,17 @@ export default function VinSearchBox({ onSuccessSearch, inputRef }) {
         </div>
       )}
 
-      {/* 4. Clean Waiting Banner (No technical or internal terms) */}
-      {searching && (
-        <div className="mt-3 rounded-md bg-[#003478] text-white p-3 text-right shadow-xs" dir="rtl">
-          <div className="flex items-center justify-between gap-2 flex-wrap">
-            <div className="flex items-center gap-2">
-              <Loader2 className="h-4 w-4 animate-spin text-sky-300 shrink-0" />
-              <span className="text-xs font-bold">
-                {`جاري استخراج وتجهيز التقرير للمركبة (${vehicleSpecs?.title || vin}) يرجى الانتظار لحظات...`}
-              </span>
-            </div>
-            {displaySeconds > 0 && (
-              <span className="inline-flex items-center gap-1 text-[11px] font-mono font-semibold text-sky-200 bg-white/10 px-2 py-0.5 rounded border border-white/20">
-                <Clock className="h-3 w-3" />~{displaySeconds} ثانية
-              </span>
-            )}
+      {/* 4. Instant Queue Confirmation Strip */}
+      {!vin && lastQueuedVin && (
+        <div
+          className="mt-3 rounded-md bg-emerald-50 dark:bg-emerald-950/30 border border-emerald-200 dark:border-emerald-800/50 text-emerald-900 dark:text-emerald-200 px-3.5 py-2.5 text-right flex items-center justify-between gap-2 text-xs"
+          dir="rtl"
+        >
+          <div className="flex items-center gap-2">
+            <Zap className="h-4 w-4 text-emerald-600 dark:text-emerald-400 shrink-0" />
+            <span className="font-semibold">
+              تمت إضافة الشاصي <strong className="font-mono" dir="ltr">{lastQueuedVin}</strong> إلى جدول التقارير أدناه — الحقل جاهز لإدخال شاصي جديد فوراً!
+            </span>
           </div>
         </div>
       )}

@@ -100,6 +100,7 @@ export default function AdminQueueView() {
 
   const activeVin = data?.active_vin || ''
   const activeProg = data?.active_progress
+  const activeTasks = Array.isArray(data?.active_tasks) ? data.active_tasks : []
   const queue = data?.queue || []
   const connected = data?.connected
 
@@ -189,7 +190,49 @@ export default function AdminQueueView() {
             )}
           </CardHeader>
           <CardContent className="p-4">
-            {activeVin ? (
+            {activeTasks.length > 0 ? (
+              <div className="space-y-2.5">
+                {activeTasks.map((task) => (
+                  <div
+                    key={task.vin}
+                    className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 p-3.5 rounded-md bg-amber-500/10 border border-amber-500/20"
+                  >
+                    <div className="flex items-center gap-3">
+                      <div className="p-2 rounded bg-amber-500/20 text-amber-600 dark:text-amber-400">
+                        <Loader2 className="h-5 w-5 animate-spin" />
+                      </div>
+                      <div>
+                        <div className="flex flex-wrap items-center gap-2">
+                          <span className="font-mono text-sm font-extrabold text-foreground" dir="ltr">
+                            {task.vin}
+                          </span>
+                          <Badge className="bg-amber-600 hover:bg-amber-600 text-white text-[10px]">
+                            جاري السحب اللحظي
+                          </Badge>
+                          {(task.worker_name || task.worker_id) && (
+                            <Badge variant="outline" className="text-[10px] border-primary/30 text-primary">
+                              {task.worker_name || task.worker_id}
+                            </Badge>
+                          )}
+                        </div>
+                        <p className="text-xs text-muted-foreground mt-1">
+                          المرحلة:{' '}
+                          <span className="font-semibold text-foreground">
+                            {task.step_ar || task.step || 'قيد المعالجة'}
+                          </span>
+                        </p>
+                      </div>
+                    </div>
+                    {task.elapsed_sec > 0 && (
+                      <div className="flex items-center gap-1.5 text-xs text-muted-foreground font-mono bg-background/80 px-2.5 py-1 rounded border border-border">
+                        <Clock className="h-3.5 w-3.5 text-amber-500" />
+                        منذ {task.elapsed_sec}s
+                      </div>
+                    )}
+                  </div>
+                ))}
+              </div>
+            ) : activeVin ? (
               <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 p-3.5 rounded-md bg-amber-500/10 border border-amber-500/20">
                 <div className="flex items-center gap-3">
                   <div className="p-2 rounded bg-amber-500/20 text-amber-600 dark:text-amber-400">

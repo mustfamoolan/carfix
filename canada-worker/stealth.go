@@ -61,11 +61,14 @@ type HarvestResult struct {
 }
 
 type StealthHarvester struct {
-	rnd         *rand.Rand
-	httpClient  *http.Client
-	assetCache  sync.Map
-	recentModes []int
-	mu          sync.Mutex
+	rnd               *rand.Rand
+	httpClient        *http.Client
+	assetCache        sync.Map
+	recentModes       []int
+	mu                sync.Mutex
+	activeTabs        map[string]time.Time
+	isHarvesting      bool
+	lastInspectResult *InspectResult
 }
 
 func NewStealthHarvester() *StealthHarvester {
@@ -73,7 +76,55 @@ func NewStealthHarvester() *StealthHarvester {
 		rnd:         rand.New(rand.NewSource(time.Now().UnixNano())),
 		httpClient:  &http.Client{Timeout: 8 * time.Second},
 		recentModes: make([]int, 0, 5),
+		activeTabs:  make(map[string]time.Time),
 	}
+}
+
+func (sh *StealthHarvester) setHarvesting(active bool) {
+	sh.mu.Lock()
+	sh.isHarvesting = active
+	sh.mu.Unlock()
+}
+
+func (sh *StealthHarvester) IsHarvesting() bool {
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+	return sh.isHarvesting
+}
+
+func (sh *StealthHarvester) markTabActive(tabID string) {
+	if tabID == "" {
+		return
+	}
+	sh.mu.Lock()
+	sh.activeTabs[tabID] = time.Now()
+	sh.mu.Unlock()
+}
+
+func (sh *StealthHarvester) unmarkTabActive(tabID string) {
+	if tabID == "" {
+		return
+	}
+	sh.mu.Lock()
+	delete(sh.activeTabs, tabID)
+	sh.mu.Unlock()
+}
+
+func (sh *StealthHarvester) isTabActive(tabID string) bool {
+	if tabID == "" {
+		return false
+	}
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+	ts, ok := sh.activeTabs[tabID]
+	if !ok {
+		return false
+	}
+	if time.Since(ts) > 2*time.Minute {
+		delete(sh.activeTabs, tabID)
+		return false
+	}
+	return true
 }
 
 func (sh *StealthHarvester) randomDelay(minMs, maxMs int) {
@@ -248,9 +299,15 @@ func killWorkerChromeOnly() {
 	}
 }
 
-// RestartChromeWithFreshSync only restarts worker Chrome if Main Chrome has a newer, unlocked login session.
-// Otherwise it leaves the worker Chrome open so the user's login in C:\CarfaxDealerProfile is never lost!
+// RestartChromeWithFreshSync only syncs from Main Chrome if Chrome on 9222 is NOT currently open
+// and Main Chrome has a newer, unlocked login session.
+// It NEVER kills an already-open worker Chrome so an operator logging in is never interrupted!
 func (sh *StealthHarvester) RestartChromeWithFreshSync(cdpEndpoint string) error {
+	if _, err := sh.ListOpenTabs(cdpEndpoint); err == nil {
+		// Worker Chrome is already open on 9222 — never kill it while operator may be logging in!
+		return fmt.Errorf("worker Chrome is already open on 9222; preserving open window")
+	}
+
 	localAppData := os.Getenv("LOCALAPPDATA")
 	if localAppData == "" {
 		localAppData = filepath.Join(os.Getenv("USERPROFILE"), "AppData", "Local")
@@ -268,8 +325,6 @@ func (sh *StealthHarvester) RestartChromeWithFreshSync(cdpEndpoint string) error
 		}
 	}
 
-	killWorkerChromeOnly()
-	time.Sleep(1 * time.Second)
 	_ = SyncProfileFromMainChrome(true)
 	return sh.EnsureChromeRunning(cdpEndpoint)
 }
@@ -427,6 +482,20 @@ func (sh *StealthHarvester) captureCompressedJPEG(tabCtx context.Context) string
 
 // InspectBrowserState performs a 100% passive, read-only inspection of Chrome + takes an optimized JPEG screenshot
 func (sh *StealthHarvester) InspectBrowserState(parentCtx context.Context, cdpEndpoint string, takeScreenshot bool) *InspectResult {
+	// Never interfere with active tab focus during an ongoing VIN harvest unless an explicit screenshot was requested
+	if !takeScreenshot && sh.IsHarvesting() {
+		sh.mu.Lock()
+		cached := sh.lastInspectResult
+		sh.mu.Unlock()
+		if cached != nil {
+			copyRes := *cached
+			copyRes.InspectedAt = time.Now()
+			copyRes.SessionActive = true
+			copyRes.StatusMessage = "⚡ جاري سحب ومعالجة تقارير كارفاكس حالياً..."
+			return &copyRes
+		}
+	}
+
 	res := &InspectResult{
 		InspectedAt: time.Now(),
 	}
@@ -460,23 +529,14 @@ func (sh *StealthHarvester) InspectBrowserState(parentCtx context.Context, cdpEn
 	inspectJS := `
 (() => {
     const url = (window.location.href || '').toLowerCase();
+    const titleLower = (document.title || '').toLowerCase();
     const bodyText = (document.body ? document.body.innerText : '').toLowerCase();
 
-    // 1. Check for bot/captcha challenges
-    const challengeWords = ['verify you are human', 'cloudflare', 'cf-chl', 'datadome', 'recaptcha', 'access denied', 'unusual traffic'];
-    let hasChallenge = false;
-    for (const w of challengeWords) {
-        if (url.includes(w) || bodyText.includes(w)) {
-            hasChallenge = true;
-            break;
-        }
-    }
-
-    // 2. Check if we are on a login screen
+    // 1. Check if we are on a login screen
     const passInput = document.querySelector('input[type="password"]');
     const isLogin = Boolean(passInput && passInput.offsetParent !== null) || url.includes('/login') || url.includes('/signin');
 
-    // 3. Locate VIN input box on carfaxonline.com
+    // 2. Locate VIN input box on carfaxonline.com
     const vinCandidates = [
         'input[name="vin"]',
         'input[name="VIN"]',
@@ -501,6 +561,20 @@ func (sh *StealthHarvester) InspectBrowserState(parentCtx context.Context, cdpEn
         if (el && el.offsetParent !== null && !el.disabled && el.type !== 'hidden') {
             matchedVinSelector = sel;
             break;
+        }
+    }
+
+    const isReportPage = url.includes('/vhr/') || bodyText.includes('ownership history') || bodyText.includes('detailed history');
+
+    // 3. Check for bot/captcha challenges (only if VIN box and report content are absent)
+    let hasChallenge = false;
+    if (!matchedVinSelector && !isReportPage && !isLogin) {
+        const challengeWords = ['verify you are human', 'cf-chl', 'datadome', 'access denied', 'unusual traffic'];
+        for (const w of challengeWords) {
+            if (url.includes(w) || titleLower.includes(w) || bodyText.includes(w)) {
+                hasChallenge = true;
+                break;
+            }
         }
     }
 
@@ -537,13 +611,13 @@ func (sh *StealthHarvester) InspectBrowserState(parentCtx context.Context, cdpEn
 })();
 `
 	var domState struct {
-		URL         string `json:"url"`
-		Title       string `json:"title"`
-		VinFound    bool   `json:"vinFound"`
-		VinSelector string `json:"vinSelector"`
-		SubmitFound bool   `json:"submitFound"`
-		IsLogin     bool   `json:"isLogin"`
-		HasChallenge bool  `json:"hasChallenge"`
+		URL          string `json:"url"`
+		Title        string `json:"title"`
+		VinFound     bool   `json:"vinFound"`
+		VinSelector  string `json:"vinSelector"`
+		SubmitFound  bool   `json:"submitFound"`
+		IsLogin      bool   `json:"isLogin"`
+		HasChallenge bool   `json:"hasChallenge"`
 	}
 
 	if err := chromedp.Run(tabCtx, chromedp.Evaluate(inspectJS, &domState)); err == nil {
@@ -579,15 +653,30 @@ func (sh *StealthHarvester) InspectBrowserState(parentCtx context.Context, cdpEn
 		res.SessionActive = true
 		res.StatusMessage = "✅ متصفح كندا متصل وجاهز على صفحة البحث (حقل الـ VIN متاح)"
 	default:
-		res.SessionActive = false
-		res.StatusMessage = "ℹ️ صفحة carfaxonline.com مفتوحة ولكن لم يتم رصد حقل إدخال الـ VIN في هذه الشاشة"
+		// Logged in on a Carfax report tab (/vhr/) or sub-page — session is active!
+		res.SessionActive = true
+		res.StatusMessage = "✅ متصفح كندا متصل وجلسة كارفاكس فعالة (جاهز للبحث)"
 	}
+
+	sh.mu.Lock()
+	sh.lastInspectResult = res
+	sh.mu.Unlock()
 
 	return res
 }
 
-// HarvestReport executes the strict One-Shot Or Freeze protocol on carfaxonline.com
-// with pure structured JSON extraction and adaptive human reading simulation.
+// BatchTabTicket tracks an opened report tab bound to a specific VIN during a single or multi-tab harvest
+type BatchTabTicket struct {
+	VIN           string
+	ReportTab     *CDPTab
+	OpenedNewTab  bool
+	FastTitle     string
+	FastSummary   string
+	Stage1Success bool
+	FailedResult  *HarvestResult
+}
+
+// HarvestReport executes a single-VIN harvest by delegating to the unified HarvestBatchReports pipeline.
 func (sh *StealthHarvester) HarvestReport(
 	parentCtx context.Context,
 	cdpEndpoint string,
@@ -595,325 +684,495 @@ func (sh *StealthHarvester) HarvestReport(
 	onProgress func(step, stepAr string, screenshot string),
 	onFastData func(fastRes *HarvestResult),
 ) *HarvestResult {
+	var finalOut *HarvestResult
+	sh.HarvestBatchReports(
+		parentCtx,
+		cdpEndpoint,
+		[]string{vin},
+		func(v, step, stepAr, screenshot string) {
+			if onProgress != nil {
+				onProgress(step, stepAr, screenshot)
+			}
+		},
+		func(v string, fastRes *HarvestResult) {
+			if onFastData != nil {
+				onFastData(fastRes)
+			}
+		},
+		func(v string, finalRes *HarvestResult) {
+			finalOut = finalRes
+		},
+	)
+	if finalOut == nil {
+		return &HarvestResult{
+			Success:      false,
+			ErrorCode:    "REPORT_LOAD_TIMEOUT",
+			ErrorMessage: "انتهت مهلة معالجة التقرير وسيتم إعادة المحاولة تلقائياً.",
+		}
+	}
+	return finalOut
+}
+
+// HarvestBatchReports executes the Multi-Tab Rapid Paste & Harvest Pipeline:
+// - If 1 VIN is passed, it pastes the VIN instantly (~0.15s), opens the report tab, delivers Stage-1 JSON in ~3-5s,
+//   and captures the 4-Checkbox Official PDF in ~2s via event-driven polling.
+// - If 2..4 VINs are passed (when queue builds up), it mimics a real CARFAX dealer:
+//   pastes VIN #1 -> Run Report (new tab opens) -> switches back to search tab -> pastes VIN #2 -> Run Report, etc.,
+//   then harvests Stage-1 JSON for all open tabs immediately, followed by Stage-2 4-Checkbox Official PDF for each tab!
+func (sh *StealthHarvester) HarvestBatchReports(
+	parentCtx context.Context,
+	cdpEndpoint string,
+	vins []string,
+	onProgress func(vin, step, stepAr, screenshot string),
+	onFastData func(vin string, fastRes *HarvestResult),
+	onComplete func(vin string, finalRes *HarvestResult),
+) {
+	if len(vins) == 0 {
+		return
+	}
+
+	sh.setHarvesting(true)
+	defer sh.setHarvesting(false)
+
 	// Auto-Recovery: Respawn Chrome if someone closed it before task arrived
 	_ = sh.EnsureChromeRunning(cdpEndpoint)
 
-	// 1. Pre-Flight Silent Inspection (lightweight DOM check only, zero screenshot overhead on normal path)
+	firstVin := vins[0]
 	if onProgress != nil {
-		onProgress("pre_flight", "1/4 فحص أمان وجاهزية متصفح كندا (Pre-Flight Check)...", "")
+		onProgress(firstVin, "pre_flight", "1/4 فحص أمان وجاهزية متصفح كندا (Pre-Flight Check)...", "")
 	}
 
+	// Temporarily allow InspectBrowserState to run real check for pre-flight
+	sh.setHarvesting(false)
 	state := sh.InspectBrowserState(parentCtx, cdpEndpoint, false)
+	sh.setHarvesting(true)
 
-	if !state.ChromeConnected {
-		return &HarvestResult{
-			Success:      false,
-			ErrorCode:    "CHROME_NOT_CONNECTED",
-			ErrorMessage: state.StatusMessage,
+	failAll := func(res *HarvestResult) {
+		for _, v := range vins {
+			if onComplete != nil {
+				onComplete(v, res)
+			}
 		}
 	}
 
+	if !state.ChromeConnected {
+		failAll(&HarvestResult{
+			Success:      false,
+			ErrorCode:    "CHROME_NOT_CONNECTED",
+			ErrorMessage: state.StatusMessage,
+		})
+		return
+	}
+
 	if state.HasChallenge {
+		sh.setHarvesting(false)
 		snapState := sh.InspectBrowserState(parentCtx, cdpEndpoint, true)
-		return &HarvestResult{
+		sh.setHarvesting(true)
+		failAll(&HarvestResult{
 			Success:          false,
 			ErrorCode:        "CAPTCHA_DETECTED",
 			ErrorMessage:     state.StatusMessage,
 			ScreenshotBase64: snapState.ScreenshotBase64,
-		}
+		})
+		return
 	}
 
 	if state.IsLoginPage {
 		log.Printf("🔒 [LOGIN DETECTED] Checking if Main Chrome has a newer unlocked session...")
 		if onProgress != nil {
-			onProgress("sync_session", "التحقق من جلسة تسجيل الدخول في متصفح كندا...", "")
+			onProgress(firstVin, "sync_session", "التحقق من جلسة تسجيل الدخول في متصفح كندا...", "")
 		}
 		if err := sh.RestartChromeWithFreshSync(cdpEndpoint); err == nil {
-			sh.randomDelay(2000, 3000)
+			sh.randomDelay(1500, 2200)
+			sh.setHarvesting(false)
 			state = sh.InspectBrowserState(parentCtx, cdpEndpoint, false)
+			sh.setHarvesting(true)
 		}
 		if state.IsLoginPage {
+			sh.setHarvesting(false)
 			snapState := sh.InspectBrowserState(parentCtx, cdpEndpoint, true)
-			return &HarvestResult{
+			sh.setHarvesting(true)
+			failAll(&HarvestResult{
 				Success:          false,
 				ErrorCode:        "SESSION_EXPIRED",
 				ErrorMessage:     "🔒 حساب carfaxonline.com يحتاج لتسجيل الدخول مرة واحدة في متصفح كروم على حاسبة كندا",
 				ScreenshotBase64: snapState.ScreenshotBase64,
-			}
+			})
+			return
 		}
 	}
 
 	// If Chrome is open (and not on a login/captcha page) but not currently showing the VIN input box
-	// (e.g. user left it on a sub-page or New Tab), navigate once automatically to https://www.carfaxonline.com/
+	// (e.g. left on a report tab or sub-page), navigate once automatically to https://www.carfaxonline.com/
 	if !state.VinInputFound && state.TabID != "" {
 		if navTabCtx, cleanupNav, err := sh.attachExistingTab(parentCtx, cdpEndpoint, state.TabID); err == nil {
 			_ = chromedp.Run(navTabCtx, chromedp.Navigate("https://www.carfaxonline.com/"))
 			cleanupNav()
-			sh.randomDelay(2500, 3500)
+			sh.randomDelay(1800, 2500)
+			sh.setHarvesting(false)
 			state = sh.InspectBrowserState(parentCtx, cdpEndpoint, false)
+			sh.setHarvesting(true)
 		}
 	}
 
 	if !state.CarfaxTabFound || state.IsLoginPage {
-		if state.IsLoginPage {
-			_ = sh.RestartChromeWithFreshSync(cdpEndpoint)
-			state = sh.InspectBrowserState(parentCtx, cdpEndpoint, false)
-		}
-		if !state.CarfaxTabFound || state.IsLoginPage {
-			snapState := sh.InspectBrowserState(parentCtx, cdpEndpoint, true)
-			return &HarvestResult{
-				Success:          false,
-				ErrorCode:        "SESSION_EXPIRED",
-				ErrorMessage:     state.StatusMessage,
-				ScreenshotBase64: snapState.ScreenshotBase64,
-			}
-		}
+		sh.setHarvesting(false)
+		snapState := sh.InspectBrowserState(parentCtx, cdpEndpoint, true)
+		sh.setHarvesting(true)
+		failAll(&HarvestResult{
+			Success:          false,
+			ErrorCode:        "SESSION_EXPIRED",
+			ErrorMessage:     state.StatusMessage,
+			ScreenshotBase64: snapState.ScreenshotBase64,
+		})
+		return
 	}
 
 	if !state.VinInputFound || state.VinInputSelector == "" {
+		sh.setHarvesting(false)
 		snapState := sh.InspectBrowserState(parentCtx, cdpEndpoint, true)
-		return &HarvestResult{
+		sh.setHarvesting(true)
+		failAll(&HarvestResult{
 			Success:          false,
 			ErrorCode:        "VIN_INPUT_NOT_FOUND",
-			ErrorMessage:     "توقف احترازي (One-Shot Protection): حقل إدخال الشاصي غير ظاهر في الصفحة الحالية داخل حاسبة كندا.",
+			ErrorMessage:     "توقف احترازي: حقل إدخال الشاصي غير ظاهر في الصفحة الحالية داخل حاسبة كندا.",
 			ScreenshotBase64: snapState.ScreenshotBase64,
-		}
+		})
+		return
 	}
 
-	// Connect to the search tab without closing it on disconnect
 	searchTab, _, err := sh.FindCarfaxSearchTab(cdpEndpoint)
 	if err != nil || searchTab == nil {
-		return &HarvestResult{
+		failAll(&HarvestResult{
 			Success:      false,
 			ErrorCode:    "TAB_LOST",
 			ErrorMessage: "فقد الاتصال بتبويب البحث قبل البدء مباشرة.",
-		}
+		})
+		return
 	}
+	sh.markTabActive(searchTab.ID)
+	defer sh.unmarkTabActive(searchTab.ID)
 
-	// Clean up any leftover /vhr/ popup tabs from previous searches (except the main search tab)
-	// so there is zero chance of reading an older VIN's popup tab
+	// Safely clean up only stale /vhr/ popup tabs that are NOT currently tracked in activeTabs
 	tabsBefore, _ := sh.ListOpenTabs(cdpEndpoint)
 	knownTabIDs := make(map[string]bool)
-	upperTargetVin := strings.ToUpper(strings.TrimSpace(vin))
+	targetVinSet := make(map[string]bool)
+	for _, v := range vins {
+		targetVinSet[strings.ToUpper(strings.TrimSpace(v))] = true
+	}
+
 	for _, t := range tabsBefore {
-		if t.ID != searchTab.ID && strings.Contains(strings.ToLower(t.URL), "/vhr/") && !strings.Contains(strings.ToUpper(t.URL), upperTargetVin) {
-			sh.CloseTabByID(cdpEndpoint, t.ID)
-			continue
+		if t.ID != searchTab.ID && strings.Contains(strings.ToLower(t.URL), "/vhr/") && !sh.isTabActive(t.ID) {
+			matchesTarget := false
+			upperURL := strings.ToUpper(t.URL)
+			for tv := range targetVinSet {
+				if tv != "" && strings.Contains(upperURL, tv) {
+					matchesTarget = true
+					break
+				}
+			}
+			if !matchesTarget {
+				sh.CloseTabByID(cdpEndpoint, t.ID)
+				continue
+			}
 		}
 		knownTabIDs[t.ID] = true
 	}
 
-	tabCtx, cleanupSearchTab, attachErr := sh.attachExistingTab(parentCtx, cdpEndpoint, searchTab.ID)
+	searchTabCtx, cleanupSearchTab, attachErr := sh.attachExistingTab(parentCtx, cdpEndpoint, searchTab.ID)
 	if attachErr != nil {
-		return &HarvestResult{
+		failAll(&HarvestResult{
 			Success:      false,
 			ErrorCode:    "TAB_LOST",
 			ErrorMessage: fmt.Sprintf("تعذر الارتباط بتبويب البحث: %v", attachErr),
-		}
+		})
+		return
 	}
 	defer cleanupSearchTab()
 
-	// 2. Human VIN Typing (zero screenshot overhead on normal path)
-	if onProgress != nil {
-		onProgress("typing_vin", fmt.Sprintf("2/4 جاري كتابة رقم الشاصي (%s) بمحاكاة بشرية...", vin), "")
-	}
+	// =========================================================================
+	// ⚡ PHASE 1: RAPID CLIPBOARD PASTE & MULTI-TAB SPAWNING
+	// =========================================================================
+	tickets := make([]*BatchTabTicket, 0, len(vins))
 
-	if err := sh.typeVinHumanly(tabCtx, state.VinInputSelector, vin); err != nil {
-		snap := sh.captureCompressedJPEG(tabCtx)
-		return &HarvestResult{
-			Success:          false,
-			ErrorCode:        "VIN_TYPE_ERROR",
-			ErrorMessage:     fmt.Sprintf("توقف احترازي: تعذر الكتابة في حقل الشاصي (%v)", err),
-			ScreenshotBase64: snap,
-		}
-	}
+	for idx, rawVin := range vins {
+		vin := strings.ToUpper(strings.TrimSpace(rawVin))
+		ticket := &BatchTabTicket{VIN: vin}
+		tickets = append(tickets, ticket)
 
-	// 3. Submit Search (Click button or press Enter)
-	if onProgress != nil {
-		onProgress("submitting_search", "3/4 تم إدخال الشاصي، جاري طلب التقرير من carfaxonline.com...", "")
-	}
-
-	submitJS := fmt.Sprintf(`
-(() => {
-    const input = document.querySelector(%q);
-    const btnSelectors = [
-        'button[type="submit"]',
-        'input[type="submit"]',
-        'button[id*="run" i]',
-        'button[id*="search" i]',
-        'button[id*="vhr" i]',
-        'button[class*="search" i]',
-        'button[class*="submit" i]'
-    ];
-    for (const sel of btnSelectors) {
-        const b = document.querySelector(sel);
-        if (b && b.offsetParent !== null && !b.disabled) {
-            b.click();
-            return 'clicked_button';
-        }
-    }
-    if (input && input.form) {
-        input.form.submit();
-        return 'submitted_form';
-    }
-    return 'enter_fallback';
-})();
-`, state.VinInputSelector)
-
-	var submitMethod string
-	_ = chromedp.Run(tabCtx, chromedp.Evaluate(submitJS, &submitMethod))
-	if submitMethod == "enter_fallback" {
-		_ = chromedp.Run(tabCtx, chromedp.KeyEvent("\r"))
-	}
-
-	// Smart Tab Detection: Poll local CDP every 350ms (up to 4.2s max) instead of sleeping blindly for 4.2s
-	sh.randomDelay(750, 1050)
-	var reportTab *CDPTab
-	openedNewTab := false
-
-	for attempt := 0; attempt < 11; attempt++ {
-		tabsAfter, _ := sh.ListOpenTabs(cdpEndpoint)
-		for i := range tabsAfter {
-			t := tabsAfter[i]
-			if !knownTabIDs[t.ID] && t.URL != "about:blank" {
-				reportTab = &t
-				openedNewTab = true
-				break
+		if onProgress != nil {
+			if len(vins) > 1 {
+				onProgress(vin, "typing_vin", fmt.Sprintf("2/4 لصق فوري للشاصي (%s) [تقرير %d من %d]...", vin, idx+1, len(vins)), "")
+			} else {
+				onProgress(vin, "typing_vin", fmt.Sprintf("2/4 لصق فوري لرقم الشاصي (%s) وطلب التقرير...", vin), "")
 			}
 		}
-		if reportTab == nil {
+
+		if err := sh.pasteVinInstantly(searchTabCtx, state.VinInputSelector, vin); err != nil {
+			snap := sh.captureCompressedJPEG(searchTabCtx)
+			ticket.FailedResult = &HarvestResult{
+				Success:          false,
+				ErrorCode:        "VIN_TYPE_ERROR",
+				ErrorMessage:     fmt.Sprintf("تعذر لصق رقم الشاصي في حقل البحث (%v)", err),
+				ScreenshotBase64: snap,
+			}
+			continue
+		}
+
+		if onProgress != nil {
+			onProgress(vin, "submitting_search", fmt.Sprintf("3/4 جاري فتح تبويب تقرير كارفاكس للشاصي (%s)...", vin), "")
+		}
+
+		sh.submitVinSearch(searchTabCtx, state.VinInputSelector)
+
+		// Poll local CDP every 250ms (up to 10s = 40 attempts) for the new report tab to open,
+		// with an automatic retry click at 3.0s (attempt 12) if React missed the first click.
+		var reportTab *CDPTab
+		openedNewTab := false
+
+		for attempt := 0; attempt < 40; attempt++ {
+			time.Sleep(250 * time.Millisecond)
+			tabsAfter, _ := sh.ListOpenTabs(cdpEndpoint)
+
+			// 1. Prefer a brand-new tab ID not seen before
 			for i := range tabsAfter {
 				t := tabsAfter[i]
-				if t.ID != searchTab.ID && (strings.Contains(strings.ToUpper(t.URL), upperTargetVin) || strings.Contains(strings.ToUpper(t.Title), upperTargetVin)) {
+				if !knownTabIDs[t.ID] && t.URL != "about:blank" && t.ID != searchTab.ID {
 					reportTab = &t
 					openedNewTab = true
 					break
 				}
 			}
-		}
-		if reportTab != nil {
-			break
-		}
-		time.Sleep(350 * time.Millisecond)
-	}
 
-	// If no new tab opened, the report is in the current searchTab
-	activeReportCtx := tabCtx
-	if openedNewTab && reportTab != nil {
-		if rTabCtx, cleanupReportTab, rErr := sh.attachExistingTab(parentCtx, cdpEndpoint, reportTab.ID); rErr == nil {
-			defer cleanupReportTab()
-			activeReportCtx = rTabCtx
-			// Smart DOM Readiness Polling: wait only until report tables/text render in DOM (up to 3s max)
-			for domWait := 0; domWait < 10; domWait++ {
-				var domReady bool
-				_ = chromedp.Run(activeReportCtx, chromedp.Evaluate(`
-					(() => {
-						const txt = (document.body ? document.body.innerText : '').toLowerCase();
-						return (txt.includes('ownership history') || txt.includes('detailed history') || txt.includes('history-based value') || txt.includes('invalid vin') || txt.includes('no records found'));
-					})()
-				`, &domReady))
-				if domReady {
-					break
+			// 2. Fallback: tab whose URL or Title explicitly contains this VIN
+			if reportTab == nil {
+				for i := range tabsAfter {
+					t := tabsAfter[i]
+					if t.ID != searchTab.ID && !sh.isTabActive(t.ID) &&
+						(strings.Contains(strings.ToUpper(t.URL), vin) || strings.Contains(strings.ToUpper(t.Title), vin)) {
+						reportTab = &t
+						openedNewTab = true
+						break
+					}
 				}
-				time.Sleep(300 * time.Millisecond)
 			}
-			sh.randomDelay(500, 800)
+
+			if reportTab != nil {
+				knownTabIDs[reportTab.ID] = true
+				sh.markTabActive(reportTab.ID)
+				break
+			}
+
+			// Automatic retry click at ~3.0s if no tab opened yet
+			if attempt == 12 {
+				_ = sh.pasteVinInstantly(searchTabCtx, state.VinInputSelector, vin)
+				sh.submitVinSearch(searchTabCtx, state.VinInputSelector)
+			}
+		}
+
+		ticket.ReportTab = reportTab
+		ticket.OpenedNewTab = openedNewTab
+
+		// If there are more VINs in the batch, pause briefly (900ms-1300ms) like a dealer switching back to tab 1
+		if idx < len(vins)-1 {
+			sh.randomDelay(900, 1300)
 		}
 	}
 
 	// =========================================================================
-	// ⚡ STAGE 1: INSTANT STRUCTURED DATA EXTRACTION (<25ms) & IMMEDIATE DELIVERY
+	// ⚡ PHASE 2: STAGE-1 INSTANT STRUCTURED EXTRACTION ACROSS OPEN TABS
 	// =========================================================================
-	if onProgress != nil {
-		onProgress("extracting_data", "4/4 تم فتح التقرير! جاري استخراج بيانات الفحص وقراءة الجداول...", "")
-	}
-
-	fastSummaryJson, _, fastTitle, isFastErr, fastErrMsg, fastErr := sh.extractFastReportData(activeReportCtx, vin)
-
-	if fastErr != nil || isFastErr {
-		// Capture screenshot ONLY on failure/challenge for diagnostics
-		errScreenshot := sh.captureCompressedJPEG(activeReportCtx)
-		if openedNewTab && reportTab != nil {
-			sh.CloseTabByID(cdpEndpoint, reportTab.ID)
+	for _, ticket := range tickets {
+		if ticket.FailedResult != nil {
+			continue
 		}
-		errMsg := fastErrMsg
-		if errMsg == "" && fastErr != nil {
-			errMsg = fmt.Sprintf("تعذر قراءة بيانات التقرير: %v", fastErr)
+
+		vin := ticket.VIN
+		if onProgress != nil {
+			onProgress(vin, "extracting_data", fmt.Sprintf("4/4 جاري قراءة جداول التقرير للشاصي (%s)...", vin), "")
 		}
-		return &HarvestResult{
-			Success:          false,
-			ErrorCode:        "VIN_NOT_FOUND_ON_CARFAX",
-			ErrorMessage:     errMsg,
-			ScreenshotBase64: errScreenshot,
+
+		activeReportCtx := searchTabCtx
+		var cleanupReportTab context.CancelFunc
+
+		if ticket.OpenedNewTab && ticket.ReportTab != nil {
+			if rTabCtx, rCleanup, rErr := sh.attachExistingTab(parentCtx, cdpEndpoint, ticket.ReportTab.ID); rErr == nil {
+				activeReportCtx = rTabCtx
+				cleanupReportTab = rCleanup
+			}
 		}
-	}
 
-	// Deliver Stage 1 immediately (~6-8s) so the customer sees the full interactive report right away
-	// while Stage 2 (human reading + official Print PDF) completes naturally in the background!
-	if onFastData != nil {
-		onFastData(&HarvestResult{
-			Success:         true,
-			VehicleTitle:    fastTitle,
-			FastSummaryJson: fastSummaryJson,
-		})
-	}
+		fastSummaryJson, _, fastTitle, errCode, fastErrMsg, fastErr := sh.extractFastReportData(activeReportCtx, vin)
+		if cleanupReportTab != nil {
+			cleanupReportTab()
+		}
 
-	// =========================================================================
-	// 🧠 ADAPTIVE HUMAN READING SIMULATION (Pattern Breaking & Natural Dwell)
-	// =========================================================================
-	if onProgress != nil {
-		onProgress("human_reading", "محاكاة قراءة بشرية ذكية لمنع كشف السلوك الآلي...", "")
-	}
-	sh.simulateAdaptiveHumanReading(activeReportCtx)
+		if fastErr != nil || errCode != "" {
+			var errScreenshot string
+			if ticket.OpenedNewTab && ticket.ReportTab != nil {
+				if rTabCtx, rCleanup, rErr := sh.attachExistingTab(parentCtx, cdpEndpoint, ticket.ReportTab.ID); rErr == nil {
+					errScreenshot = sh.captureCompressedJPEG(rTabCtx)
+					rCleanup()
+				}
+				sh.CloseTabByID(cdpEndpoint, ticket.ReportTab.ID)
+				sh.unmarkTabActive(ticket.ReportTab.ID)
+			} else {
+				errScreenshot = sh.captureCompressedJPEG(searchTabCtx)
+			}
 
-	// =========================================================================
-	// 🖨️ OFFICIAL CARFAX PRINT MODAL (Select All Sections & Native PDF)
-	// =========================================================================
-	if onProgress != nil {
-		onProgress("generating_pdf", "جاري تجهيز تقرير الطباعة الرسمي من كارفاكس...", "")
-	}
-	finalReportCtx, cleanupPrintTab, printPopupTabID := sh.prepareOfficialPrintModal(parentCtx, cdpEndpoint, activeReportCtx)
-	if cleanupPrintTab != nil {
-		defer cleanupPrintTab()
-	}
+			if errCode == "" {
+				errCode = "REPORT_LOAD_TIMEOUT"
+			}
+			if fastErrMsg == "" && fastErr != nil {
+				fastErrMsg = fmt.Sprintf("تعذر قراءة بيانات التقرير: %v", fastErr)
+			}
+			ticket.FailedResult = &HarvestResult{
+				Success:          false,
+				ErrorCode:        errCode,
+				ErrorMessage:     fastErrMsg,
+				ScreenshotBase64: errScreenshot,
+			}
+			continue
+		}
 
-	officialPdfBase64 := sh.captureOfficialPrintPDF(finalReportCtx, vin)
+		ticket.FastTitle = fastTitle
+		ticket.FastSummary = fastSummaryJson
+		ticket.Stage1Success = true
 
-	// Clean up any extra print popup tab if Carfax opened one
-	if printPopupTabID != "" && (reportTab == nil || printPopupTabID != reportTab.ID) && printPopupTabID != searchTab.ID {
-		sh.CloseTabByID(cdpEndpoint, printPopupTabID)
-	}
-
-	// Clean up: close the report tab immediately and cleanly
-	if openedNewTab && reportTab != nil {
-		sh.CloseTabByID(cdpEndpoint, reportTab.ID)
-	} else {
-		var stillHasVinInput bool
-		_ = chromedp.Run(activeReportCtx, chromedp.Evaluate(fmt.Sprintf(`Boolean(document.querySelector(%q))`, state.VinInputSelector), &stillHasVinInput))
-		if !stillHasVinInput {
-			_ = chromedp.Run(activeReportCtx, chromedp.Evaluate(`window.history.back();`, nil))
+		// Deliver Stage 1 immediately so the waiting customer gets the full report UI right away!
+		if onFastData != nil {
+			onFastData(vin, &HarvestResult{
+				Success:         true,
+				VehicleTitle:    fastTitle,
+				FastSummaryJson: fastSummaryJson,
+			})
 		}
 	}
 
-	rawHtmlWithPdf := ""
-	if officialPdfBase64 != "" {
-		rawHtmlWithPdf = `<script id="carfix-official-pdf" type="application/pdf-base64">` + officialPdfBase64 + `</script>`
+	// =========================================================================
+	// 🖨️ PHASE 3: ZERO-SLEEP EVENT-DRIVEN 4-CHECKBOX OFFICIAL PDF & TAB CLEANUP
+	// =========================================================================
+	for _, ticket := range tickets {
+		vin := ticket.VIN
+		if ticket.FailedResult != nil {
+			if onComplete != nil {
+				onComplete(vin, ticket.FailedResult)
+			}
+			continue
+		}
+
+		activeReportCtx := searchTabCtx
+		var cleanupReportTab context.CancelFunc
+		if ticket.OpenedNewTab && ticket.ReportTab != nil {
+			if rTabCtx, rCleanup, rErr := sh.attachExistingTab(parentCtx, cdpEndpoint, ticket.ReportTab.ID); rErr == nil {
+				activeReportCtx = rTabCtx
+				cleanupReportTab = rCleanup
+			}
+		}
+
+		if onProgress != nil {
+			onProgress(vin, "generating_pdf", fmt.Sprintf("جاري تجهيز ملف الطباعة الرسمي الكامل (4 أقسام) للشاصي (%s)...", vin), "")
+		}
+
+		// Brief natural scroll before triggering Print Options modal
+		_ = chromedp.Run(activeReportCtx, chromedp.Evaluate(`window.scrollBy({ top: 260, behavior: 'smooth' });`, nil))
+		sh.randomDelay(350, 600)
+		_ = chromedp.Run(activeReportCtx, chromedp.Evaluate(`window.scrollTo({ top: 0, behavior: 'smooth' });`, nil))
+		sh.randomDelay(200, 350)
+
+		finalReportCtx, cleanupPrintTab, printPopupTabID := sh.prepareOfficialPrintModal(parentCtx, cdpEndpoint, activeReportCtx)
+		officialPdfBase64 := sh.captureOfficialPrintPDF(finalReportCtx, vin)
+
+		if cleanupPrintTab != nil {
+			cleanupPrintTab()
+		}
+		if cleanupReportTab != nil {
+			cleanupReportTab()
+		}
+
+		// Clean up any extra print popup tab if Carfax opened one
+		if printPopupTabID != "" && (ticket.ReportTab == nil || printPopupTabID != ticket.ReportTab.ID) && printPopupTabID != searchTab.ID {
+			sh.CloseTabByID(cdpEndpoint, printPopupTabID)
+			sh.unmarkTabActive(printPopupTabID)
+		}
+
+		// Close the report tab cleanly and unmark from activeTabs
+		if ticket.OpenedNewTab && ticket.ReportTab != nil {
+			sh.CloseTabByID(cdpEndpoint, ticket.ReportTab.ID)
+			sh.unmarkTabActive(ticket.ReportTab.ID)
+		} else {
+			var stillHasVinInput bool
+			_ = chromedp.Run(searchTabCtx, chromedp.Evaluate(fmt.Sprintf(`Boolean(document.querySelector(%q))`, state.VinInputSelector), &stillHasVinInput))
+			if !stillHasVinInput {
+				_ = chromedp.Run(searchTabCtx, chromedp.Evaluate(`window.history.back();`, nil))
+			}
+		}
+
+		rawHtmlWithPdf := ""
+		if officialPdfBase64 != "" {
+			rawHtmlWithPdf = `<script id="carfix-official-pdf" type="application/pdf-base64">` + officialPdfBase64 + `</script>`
+		}
+
+		if onComplete != nil {
+			onComplete(vin, &HarvestResult{
+				Success:          true,
+				VehicleTitle:     ticket.FastTitle,
+				RawHtmlEn:        rawHtmlWithPdf,
+				FastSummaryJson:  ticket.FastSummary,
+				ScreenshotBase64: "",
+			})
+		}
 	}
 
-	// On SUCCESS: Return structured JSON + Official Carfax PDF
-	return &HarvestResult{
-		Success:          true,
-		VehicleTitle:     fastTitle,
-		RawHtmlEn:        rawHtmlWithPdf,
-		FastSummaryJson:  fastSummaryJson,
-		ScreenshotBase64: "", // No screenshot in success state to save CPU and RAM
-	}
+	// =========================================================================
+	// 🔄 PHASE 4: PRE-WARM SEARCH TAB FOR ZERO-LATENCY NEXT REQUEST
+	// =========================================================================
+	_ = chromedp.Run(searchTabCtx, chromedp.Evaluate(fmt.Sprintf(`
+(() => {
+    const el = document.querySelector(%q) || document.querySelector('input[name="VIN"]') || document.querySelector('input[name="vin"]') || document.querySelector('input[placeholder*="VIN" i]');
+    if (el) {
+        const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
+        if (setter) setter.call(el, '');
+        else el.value = '';
+        el.dispatchEvent(new Event('input', { bubbles: true }));
+        el.focus();
+    }
+})();
+`, state.VinInputSelector), nil))
 }
 
-// extractFastReportData runs in <25ms on the newly opened Carfax report tab to extract all structured
-// vehicle specs, Carfax Value, highlights, ownership history, title guarantee, technical checks,
-// accident events, and chronological service records so the user sees the report immediately in our UI.
-func (sh *StealthHarvester) extractFastReportData(tabCtx context.Context, vin string) (string, string, string, bool, string, error) {
+// extractFastReportData waits up to 12 seconds (polling every 250ms) for the newly opened Carfax report tab
+// to render its tables, verifies the tab belongs to the requested VIN, distinguishes true "Invalid VIN"
+// from slow network loads ("REPORT_LOAD_TIMEOUT"), and extracts all structured report data in <25ms.
+func (sh *StealthHarvester) extractFastReportData(tabCtx context.Context, vin string) (string, string, string, string, string, error) {
+	cleanVin := strings.ToUpper(strings.TrimSpace(vin))
+
+	// Wait up to 12 seconds (48 * 250ms) for report DOM tables or explicit CARFAX error banner
+	for domWait := 0; domWait < 48; domWait++ {
+		var domReady bool
+		_ = chromedp.Run(tabCtx, chromedp.Evaluate(`
+			(() => {
+				const txt = (document.body ? document.body.innerText : '').toLowerCase();
+				const hasTables = document.querySelectorAll('table tbody tr').length >= 2;
+				return (
+					hasTables ||
+					txt.includes('ownership history') ||
+					txt.includes('detailed history') ||
+					txt.includes('history-based value') ||
+					txt.includes('additional history') ||
+					txt.includes('title history') ||
+					txt.includes('invalid vin') ||
+					txt.includes('not a valid vin') ||
+					txt.includes('no records found')
+				);
+			})()
+		`, &domReady))
+		if domReady {
+			break
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+
 	fastJS := fmt.Sprintf(`
 (() => {
     const reqVin = %q.toUpperCase().trim();
@@ -921,22 +1180,51 @@ func (sh *StealthHarvester) extractFastReportData(tabCtx context.Context, vin st
     const bodyText = (document.body ? document.body.innerText : '');
     const lowerText = bodyText.toLowerCase();
 
-    if (lowerText.includes('invalid vin') || lowerText.includes('not a valid vin') || lowerText.includes('no records found for this vin')) {
+    // 1. Check if session expired or login screen appeared inside the report tab
+    const passInput = document.querySelector('input[type="password"]');
+    if ((passInput && passInput.offsetParent !== null) || url.toLowerCase().includes('/login') || url.toLowerCase().includes('/signin')) {
         return {
             isError: true,
+            errorCode: 'SESSION_EXPIRED',
+            errorMsg: 'انتهت جلسة تسجيل الدخول في كارفاكس أثناء فتح التقرير.'
+        };
+    }
+
+    // 2. Check for genuine CARFAX invalid VIN / no records message
+    if (lowerText.includes('invalid vin') || lowerText.includes('not a valid vin') || lowerText.includes('no records found for this vin') || lowerText.includes('cannot find any records')) {
+        return {
+            isError: true,
+            errorCode: 'VIN_NOT_FOUND_ON_CARFAX',
             errorMsg: 'أفاد موقع كارفاكس أن رقم الشاصي هذا غير صحيح أو لا توجد له سجلات في قاعدة بيانات كارفاكس.'
         };
     }
 
-    // Check if we are still stuck on the search home page without a report
-    if (!url.toLowerCase().includes('/vhr/') && !lowerText.includes('vehicle history report') && !lowerText.includes('ownership history')) {
+    // 3. Check if the report DOM did not finish loading yet (transient timeout, NOT invalid VIN)
+    const hasReportContent = url.toLowerCase().includes('/vhr/') ||
+        lowerText.includes('vehicle history report') ||
+        lowerText.includes('ownership history') ||
+        lowerText.includes('detailed history') ||
+        document.querySelectorAll('table tbody tr').length >= 2;
+
+    if (!hasReportContent) {
         return {
             isError: true,
-            errorMsg: 'لم يفتح موقع كارفاكس صفحة تقرير لهذا الشاصي (يرجى التأكد من صحة الرقم أو عدم وجود تنبيه في صفحة البحث).'
+            errorCode: 'REPORT_LOAD_TIMEOUT',
+            errorMsg: 'استغرق تحميل صفحة التقرير وقتاً أطول من المعتاد، جاري إعادة المحاولة تلقائياً.'
         };
     }
 
-    // 1. Extract Title (Year Make Model)
+    // 4. Verify VIN match if a 17-character VIN is explicitly printed in the report body
+    const vinMatch = bodyText.match(/\b([A-HJ-NPR-Z0-9]{17})\b/);
+    if (vinMatch && vinMatch[1] && reqVin.length === 17 && vinMatch[1].toUpperCase() !== reqVin && !bodyText.toUpperCase().includes(reqVin)) {
+        return {
+            isError: true,
+            errorCode: 'REPORT_LOAD_TIMEOUT',
+            errorMsg: 'تعارض مؤقت في تبويب التقرير، جاري إعادة الجلب تلقائياً.'
+        };
+    }
+
+    // 5. Extract Title (Year Make Model)
     let title = '';
     const titleSelectors = [
         '.vehicle-information-year-make-model',
@@ -956,21 +1244,21 @@ func (sh *StealthHarvester) extractFastReportData(tabCtx context.Context, vin st
         title = (document.title || '').replace('CARFAX Vehicle History Report for this ', '').split(':')[0].trim() || ('CARFAX Report ' + reqVin);
     }
 
-    // 2. Odometer
+    // 6. Odometer
     let odometer = 'غير مسجل';
     const odoMatch = bodyText.match(/(\d{1,3}(?:,\d{3})+|\d+)\s*(?:mi|miles|km)\b/i);
     if (odoMatch) {
         odometer = odoMatch[0].trim();
     }
 
-    // 3. Carfax Value / Retail Value
+    // 7. Carfax Value / Retail Value
     let carfaxValue = '';
     const valMatch = bodyText.match(/(?:CARFAX\s*VALUE|Retail\s*Value|History-Based\s*Value)[^\$\n]{0,40}(\$[0-9,]+)/i) || bodyText.match(/(\$[0-9]{1,3}(?:,[0-9]{3})+)/);
     if (valMatch && valMatch[1]) {
         carfaxValue = valMatch[1].trim();
     }
 
-    // 4. Vehicle Specifications (Body, Engine, Fuel, Drivetrain)
+    // 8. Vehicle Specifications (Body, Engine, Fuel, Drivetrain)
     const specs = [];
     const specLines = bodyText.split('\n').map(s => s.trim()).filter(Boolean);
     for (const line of specLines) {
@@ -979,7 +1267,7 @@ func (sh *StealthHarvester) extractFastReportData(tabCtx context.Context, vin st
         }
     }
 
-    // 5. Owners Count
+    // 9. Owners Count
     let owners = 1;
     const ownerBanner = bodyText.match(/CARFAX\s+(\d+)-Owner/i);
     if (ownerBanner && ownerBanner[1]) {
@@ -992,7 +1280,7 @@ func (sh *StealthHarvester) extractFastReportData(tabCtx context.Context, vin st
         }
     }
 
-    // 6. Accident / Damage Status
+    // 10. Accident / Damage Status
     let accidentsReported = 0;
     let accidentSummary = 'No accidents or damage reported to CARFAX';
     let damageSeverity = 'None';
@@ -1020,7 +1308,7 @@ func (sh *StealthHarvester) extractFastReportData(tabCtx context.Context, vin st
         }
     }
 
-    // 7. Service Records, Vehicle Use, Last Location, Detailed Records Count
+    // 11. Service Records, Vehicle Use, Last Location, Detailed Records Count
     let serviceRecordsText = '';
     const srvMatch = bodyText.match(/(\d+\s+Service\s+History\s+Records?)/i);
     if (srvMatch) serviceRecordsText = srvMatch[1].trim();
@@ -1056,7 +1344,7 @@ func (sh *StealthHarvester) extractFastReportData(tabCtx context.Context, vin st
         return (c.innerText || c.textContent || '').replace(/\s+/g, ' ').trim();
     };
 
-    // 8. Extract Structured Tables (Ownership, Title, Additional History, and Detailed History Timeline)
+    // 12. Extract Structured Tables (Ownership, Title, Additional History, and Detailed History Timeline)
     const tables = [];
     const detailedRecords = [];
     const allTables = Array.from(document.querySelectorAll('table'));
@@ -1073,7 +1361,6 @@ func (sh *StealthHarvester) extractFastReportData(tabCtx context.Context, vin st
             const multiCells = rawCells.map(cell => cleanCellText(cell, true));
             if (cells.length === 0 || cells.every(c => !c)) continue;
 
-            // Check if this row is a chronological Detailed History row (Date | Mileage | Source | Icon | Comments)
             const firstCell = cells[0] || '';
             if (cells.length >= 3 && (/^\d{1,2}\/\d{1,2}\/\d{2,4}$/.test(firstCell) || /^Not Reported$/i.test(firstCell))) {
                 if (cells.length >= 5) {
@@ -1104,7 +1391,7 @@ func (sh *StealthHarvester) extractFastReportData(tabCtx context.Context, vin st
         }
     }
 
-    // 9. Extract Accident / Damage Events if present
+    // 13. Extract Accident / Damage Events if present
     const accidentEvents = [];
     const accSec = document.getElementById('accident-damage-section');
     if (accSec) {
@@ -1138,23 +1425,25 @@ func (sh *StealthHarvester) extractFastReportData(tabCtx context.Context, vin st
         tables: tables,
         detailed_records: detailedRecords,
         accident_events: accidentEvents,
-        background_pending: false,
-        background_ready: true,
+        background_pending: true,
+        background_ready: false,
         analyzed_at: new Date().toISOString()
     };
 
     return {
         isError: false,
+        errorCode: '',
         errorMsg: '',
         title: title,
         summaryJson: JSON.stringify(summaryObj),
         lightHtml: ''
     };
 })();
-`, vin)
+`, cleanVin)
 
 	var out struct {
 		IsError     bool   `json:"isError"`
+		ErrorCode   string `json:"errorCode"`
 		ErrorMsg    string `json:"errorMsg"`
 		Title       string `json:"title"`
 		SummaryJson string `json:"summaryJson"`
@@ -1162,25 +1451,34 @@ func (sh *StealthHarvester) extractFastReportData(tabCtx context.Context, vin st
 	}
 
 	if err := chromedp.Run(tabCtx, chromedp.Evaluate(fastJS, &out)); err != nil {
-		return "", "", "", false, "", err
+		return "", "", "", "REPORT_LOAD_TIMEOUT", "", err
 	}
 
 	if out.IsError {
-		return "", "", "", true, out.ErrorMsg, nil
+		code := out.ErrorCode
+		if code == "" {
+			code = "REPORT_LOAD_TIMEOUT"
+		}
+		return "", "", "", code, out.ErrorMsg, nil
 	}
 
-	return out.SummaryJson, out.LightHtml, out.Title, false, "", nil
+	return out.SummaryJson, out.LightHtml, out.Title, "", "", nil
 }
 
-// typeVinHumanly focuses the VIN input, clears it, types the 17 characters with human rhythm, and verifies the value
-func (sh *StealthHarvester) typeVinHumanly(tabCtx context.Context, selector, vin string) error {
-	sh.randomDelay(250, 500)
+// pasteVinInstantly mimics a dealer pressing Ctrl+V into the CARFAX VIN box (~0.15s instead of 3.5s)
+// using the native HTMLInputElement value setter + InputEvent('insertFromPaste') so React/Angular state updates immediately.
+func (sh *StealthHarvester) pasteVinInstantly(tabCtx context.Context, selector, vin string) error {
+	cleanVin := strings.ToUpper(strings.TrimSpace(vin))
+	sh.randomDelay(60, 130)
 
-	// Clear field and focus via JS first
-	clearJS := fmt.Sprintf(`
+	pasteJS := fmt.Sprintf(`
 (() => {
-    const el = document.querySelector(%q) || document.querySelector('input[name="VIN"]') || document.querySelector('input[name="vin"]') || document.querySelector('input[placeholder*="VIN" i]');
-    if (!el) return false;
+    const el = document.querySelector(%q) ||
+        document.querySelector('input[name="VIN"]') ||
+        document.querySelector('input[name="vin"]') ||
+        document.querySelector('input[placeholder*="VIN" i]') ||
+        document.querySelector('input[id*="vin" i]');
+    if (!el) return '';
     el.focus();
     const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
     if (setter) {
@@ -1189,137 +1487,110 @@ func (sh *StealthHarvester) typeVinHumanly(tabCtx context.Context, selector, vin
         el.value = '';
     }
     el.dispatchEvent(new Event('input', { bubbles: true }));
-    return true;
-})();
-`, selector)
-	var focused bool
-	if err := chromedp.Run(tabCtx, chromedp.Evaluate(clearJS, &focused)); err != nil || !focused {
-		return fmt.Errorf("لم يتم العثور على العنصر %s", selector)
-	}
 
-	for i, c := range []rune(vin) {
-		sh.randomDelay(75, 195)
-		_ = chromedp.Run(tabCtx, chromedp.KeyEvent(string(c)))
-		if (i+1)%5 == 0 {
-			sh.randomDelay(250, 480)
-		}
-	}
-
-	// Verify the input value matches the full 17-char VIN (even if the window wasn't focused in Windows OS)
-	verifyJS := fmt.Sprintf(`
-(() => {
-    const el = document.querySelector(%q) || document.querySelector('input[name="VIN"]') || document.querySelector('input[name="vin"]') || document.querySelector('input[placeholder*="VIN" i]');
-    if (!el) return '';
-    el.focus();
-    if ((el.value || '').trim().toUpperCase() !== %q) {
-        const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
-        if (setter) {
-            setter.call(el, %q);
-        } else {
-            el.value = %q;
-        }
-        el.dispatchEvent(new InputEvent('input', { bubbles: true, data: %q, inputType: 'insertText' }));
-        el.dispatchEvent(new Event('change', { bubbles: true }));
-        el.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true, key: '9' }));
+    if (setter) {
+        setter.call(el, %q);
+    } else {
+        el.value = %q;
     }
+    el.dispatchEvent(new InputEvent('input', { bubbles: true, cancelable: true, inputType: 'insertFromPaste', data: %q }));
+    el.dispatchEvent(new Event('change', { bubbles: true }));
+    el.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true, key: 'v', code: 'KeyV', ctrlKey: true }));
     return (el.value || '').trim().toUpperCase();
 })();
-`, selector, vin, vin, vin, vin)
+`, selector, cleanVin, cleanVin, cleanVin)
 
 	var finalVal string
-	if err := chromedp.Run(tabCtx, chromedp.Evaluate(verifyJS, &finalVal)); err != nil {
+	if err := chromedp.Run(tabCtx, chromedp.Evaluate(pasteJS, &finalVal)); err != nil {
 		return err
 	}
-	if finalVal != vin {
-		return fmt.Errorf("القيمة المكتوبة (%s) لا تطابق الشاصي المطلوب (%s)", finalVal, vin)
+	if finalVal != cleanVin {
+		return fmt.Errorf("القيمة الملصقة (%s) لا تطابق الشاصي المطلوب (%s)", finalVal, cleanVin)
 	}
 
-	sh.randomDelay(400, 750)
+	sh.randomDelay(80, 160)
 	return nil
 }
 
-// simulateAdaptiveHumanReading applies human reading dynamics with strict pattern breaking (4 diverse styles)
-// to ensure no identical browsing signature occurs sequentially or across multiple requests.
-func (sh *StealthHarvester) simulateAdaptiveHumanReading(tabCtx context.Context) {
-	sh.mu.Lock()
-	// Pick a mode that breaks the pattern and differs from the immediately preceding mode
-	candidates := []int{1, 2, 3, 4}
-	sh.rnd.Shuffle(len(candidates), func(i, j int) {
-		candidates[i], candidates[j] = candidates[j], candidates[i]
-	})
+// submitVinSearch clicks the specific Run Report / Search button associated with the VIN input box
+// (or falls back to submitting the form / pressing Enter).
+func (sh *StealthHarvester) submitVinSearch(tabCtx context.Context, selector string) {
+	submitJS := fmt.Sprintf(`
+(() => {
+    const input = document.querySelector(%q) ||
+        document.querySelector('input[name="VIN"]') ||
+        document.querySelector('input[name="vin"]') ||
+        document.querySelector('input[placeholder*="VIN" i]');
 
-	selectedMode := candidates[0]
-	if len(sh.recentModes) > 0 && selectedMode == sh.recentModes[len(sh.recentModes)-1] {
-		selectedMode = candidates[1]
+    // 1. Prefer a submit button inside the same form as the VIN input
+    if (input && input.form) {
+        const formBtn = input.form.querySelector('button[type="submit"], input[type="submit"], button:not([type="button"]):not([type="reset"])');
+        if (formBtn && formBtn.offsetParent !== null && !formBtn.disabled) {
+            formBtn.click();
+            return 'clicked_form_btn';
+        }
+    }
+
+    // 2. Match explicit CARFAX Run Report / Search buttons
+    const allBtns = Array.from(document.querySelectorAll('button, input[type="submit"], input[type="button"], a[role="button"]'));
+    for (const b of allBtns) {
+        if (b.offsetParent === null || b.disabled) continue;
+        const txt = (b.innerText || b.value || b.textContent || '').trim().toLowerCase();
+        const id = (b.id || '').toLowerCase();
+        const aria = (b.getAttribute('aria-label') || '').toLowerCase();
+        if (txt === 'run report' || txt === 'get report' || txt === 'search' || txt === 'submit' ||
+            txt.includes('run report') || id.includes('run') || id.includes('vhr') || aria.includes('run report')) {
+            b.click();
+            return 'clicked_named_btn';
+        }
+    }
+
+    // 3. Fallback to standard submit selectors
+    const btnSelectors = [
+        'button[type="submit"]',
+        'input[type="submit"]',
+        'button[id*="search" i]',
+        'button[class*="search" i]',
+        'button[class*="submit" i]'
+    ];
+    for (const sel of btnSelectors) {
+        const b = document.querySelector(sel);
+        if (b && b.offsetParent !== null && !b.disabled) {
+            b.click();
+            return 'clicked_selector_btn';
+        }
+    }
+
+    if (input) {
+        input.focus();
+        input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }));
+        input.dispatchEvent(new KeyboardEvent('keypress', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }));
+        input.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }));
+    }
+    if (input && input.form) {
+        input.form.submit();
+        return 'submitted_form';
+    }
+    return 'enter_fallback';
+})();
+`, selector)
+
+	var submitMethod string
+	_ = chromedp.Run(tabCtx, chromedp.Evaluate(submitJS, &submitMethod))
+	if submitMethod == "enter_fallback" {
+		_ = chromedp.Run(tabCtx, chromedp.KeyEvent("\r"))
 	}
-
-	sh.recentModes = append(sh.recentModes, selectedMode)
-	if len(sh.recentModes) > 5 {
-		sh.recentModes = sh.recentModes[1:]
-	}
-	sh.mu.Unlock()
-
-	switch selectedMode {
-	case 1:
-		// Style 1: Deep Reading with pause and backtrack (scroll down in 3 chunks, scroll back up 1 chunk)
-		steps := 2 + sh.rnd.Intn(2)
-		for s := 0; s < steps; s++ {
-			scrollPx := 320 + sh.rnd.Intn(240)
-			_ = chromedp.Run(tabCtx, chromedp.Evaluate(fmt.Sprintf(`window.scrollBy({ top: %d, behavior: 'smooth' });`, scrollPx), nil))
-			sh.randomDelay(900, 1600)
-		}
-		// Backtrack slightly
-		backPx := 120 + sh.rnd.Intn(100)
-		_ = chromedp.Run(tabCtx, chromedp.Evaluate(fmt.Sprintf(`window.scrollBy({ top: -%d, behavior: 'smooth' });`, backPx), nil))
-		sh.randomDelay(1100, 1800)
-
-	case 2:
-		// Style 2: Quick Scan (Single medium scroll down, dwell pause, gentle return)
-		downPx := 480 + sh.rnd.Intn(320)
-		_ = chromedp.Run(tabCtx, chromedp.Evaluate(fmt.Sprintf(`window.scrollBy({ top: %d, behavior: 'smooth' });`, downPx), nil))
-		sh.randomDelay(1400, 2400)
-		_ = chromedp.Run(tabCtx, chromedp.Evaluate(`window.scrollTo({ top: 0, behavior: 'smooth' });`, nil))
-		sh.randomDelay(600, 1000)
-
-	case 3:
-		// Style 3: Table Inspection (Step-by-step reading with mouse movement simulation)
-		steps := 3 + sh.rnd.Intn(2)
-		for s := 0; s < steps; s++ {
-			scrollPx := 180 + sh.rnd.Intn(160)
-			jitterX := 200 + sh.rnd.Intn(400)
-			jitterY := 150 + sh.rnd.Intn(300)
-			_ = chromedp.Run(tabCtx,
-				chromedp.Evaluate(fmt.Sprintf(`window.scrollBy({ top: %d, behavior: 'smooth' });`, scrollPx), nil),
-				chromedp.Evaluate(fmt.Sprintf(`
-					const evt = new MouseEvent('mousemove', { clientX: %d, clientY: %d, bubbles: true });
-					document.dispatchEvent(evt);
-				`, jitterX, jitterY), nil),
-			)
-			sh.randomDelay(700, 1300)
-		}
-
-	case 4:
-		// Style 4: Overview Focus (Light scroll, focused dwell time at top overview)
-		downPx := 220 + sh.rnd.Intn(140)
-		_ = chromedp.Run(tabCtx, chromedp.Evaluate(fmt.Sprintf(`window.scrollBy({ top: %d, behavior: 'smooth' });`, downPx), nil))
-		sh.randomDelay(1800, 2800)
-	}
-
-	// Always smooth scroll back towards top before closing
-	_ = chromedp.Run(tabCtx, chromedp.Evaluate(`window.scrollTo({ top: 0, behavior: 'smooth' });`, nil))
-	sh.randomDelay(400, 750)
 }
 
 // prepareOfficialPrintModal clicks the top "Print" button on the Carfax report page,
-// opens the "Printing Options" modal, ensures all section checkboxes are selected,
-// clicks the modal's "Print" button while intercepting window.print() so no native OS print dialog blocks Chrome,
-// and hides the modal overlay once the full sections render.
+// polls every 120ms for the "Printing Options" modal, checks all 4 checkboxes
+// (CARFAX Report, History-Based Value, Warranty Check, Buyback Guarantee) and clicks Print in the same tick,
+// then polls every 150ms until window.print() is triggered or all 4 sections render (~1.8s-2.5s total instead of ~8s).
 func (sh *StealthHarvester) prepareOfficialPrintModal(
 	parentCtx context.Context,
 	cdpEndpoint string,
 	activeReportCtx context.Context,
 ) (context.Context, context.CancelFunc, string) {
-	// Record tabs before clicking Print in case Carfax opens a separate print tab
 	tabsBeforePrint, _ := sh.ListOpenTabs(cdpEndpoint)
 	knownBeforePrint := make(map[string]bool)
 	for _, t := range tabsBeforePrint {
@@ -1365,11 +1636,9 @@ func (sh *StealthHarvester) prepareOfficialPrintModal(
 		return activeReportCtx, nil, ""
 	}
 
-	// Wait 1.3s to 1.9s like a human for the "Printing Options" modal to appear
-	sh.randomDelay(1300, 1900)
-
-	// 3. In "Printing Options" modal: click "Select All" AND ensure every checkbox is checked
-	selectAllOptionsJS := `
+	// 3. Event-Driven Modal Poll (every 120ms, up to 20 attempts = 2.4s):
+	// As soon as "Printing Options" modal is visible, select all 4 checkboxes and click the modal "Print" button immediately!
+	selectAndPrintModalJS := `
 (() => {
     const allContainers = Array.from(document.querySelectorAll('[role="dialog"], [class*="modal" i], [class*="dialog" i], div'));
     let modal = null;
@@ -1380,10 +1649,12 @@ func (sh *StealthHarvester) prepareOfficialPrintModal(
             modal = d;
         }
     }
-    const root = modal || document;
+    if (!modal) {
+        return { ready: false, checked: 0, printed: false };
+    }
 
     // Click "Select All" if present and visible
-    const links = Array.from(root.querySelectorAll('a, button, span, [role="button"]'));
+    const links = Array.from(modal.querySelectorAll('a, button, span, [role="button"]'));
     for (const l of links) {
         const txt = (l.innerText || l.textContent || '').trim().toLowerCase();
         if (txt === 'select all' && l.offsetParent !== null) {
@@ -1392,8 +1663,8 @@ func (sh *StealthHarvester) prepareOfficialPrintModal(
         }
     }
 
-    // Ensure all checkboxes inside the modal (CARFAX Report, History-Based Value, Warranty Check, Buyback Guarantee) are checked
-    const checkboxes = Array.from(root.querySelectorAll('input[type="checkbox"]'));
+    // Ensure all 4 report checkboxes (CARFAX Report, History-Based Value, Warranty Check, Buyback Guarantee) are checked
+    const checkboxes = Array.from(modal.querySelectorAll('input[type="checkbox"]'));
     let checkedCount = 0;
     for (const cb of checkboxes) {
         const labelText = ((cb.closest('label') ? cb.closest('label').innerText : '') || (cb.parentElement ? cb.parentElement.innerText : '') || '').toLowerCase();
@@ -1407,27 +1678,9 @@ func (sh *StealthHarvester) prepareOfficialPrintModal(
             checkedCount++;
         }
     }
-    return checkedCount;
-})();
-`
-	var checkedCount int
-	_ = chromedp.Run(activeReportCtx, chromedp.Evaluate(selectAllOptionsJS, &checkedCount))
-	sh.randomDelay(500, 850)
 
-	// 4. Click the blue "Print" button inside the "Printing Options" modal
-	clickModalPrintJS := `
-(() => {
-    const allContainers = Array.from(document.querySelectorAll('[role="dialog"], [class*="modal" i], [class*="dialog" i], div'));
-    let modal = null;
-    for (const d of allContainers) {
-        if (d.offsetParent === null) continue;
-        const t = (d.innerText || '');
-        if ((t.includes('Printing Options') || t.includes('Print Selected Reports')) && t.includes('Cancel')) {
-            modal = d;
-        }
-    }
-    const root = modal || document;
-    const buttons = Array.from(root.querySelectorAll('button, input[type="button"], input[type="submit"], a[role="button"]'));
+    // Click the modal's "Print" button
+    const buttons = Array.from(modal.querySelectorAll('button, input[type="button"], input[type="submit"], a[role="button"]'));
     let targetBtn = null;
     for (const b of buttons) {
         if (b.offsetParent === null) continue;
@@ -1438,31 +1691,73 @@ func (sh *StealthHarvester) prepareOfficialPrintModal(
     }
     if (targetBtn) {
         targetBtn.click();
-        return true;
+        return { ready: true, checked: checkedCount, printed: true };
     }
-    return false;
+    return { ready: true, checked: checkedCount, printed: false };
 })();
 `
-	var clickedModalPrint bool
-	_ = chromedp.Run(activeReportCtx, chromedp.Evaluate(clickModalPrintJS, &clickedModalPrint))
-
-	// Wait 2.6s to 3.6s for Carfax to assemble & render all 4 selected sections (or open a print tab)
-	sh.randomDelay(2600, 3600)
-
-	// 5. Check if clicking Print in the modal opened a brand-new print tab
-	tabsAfterPrint, _ := sh.ListOpenTabs(cdpEndpoint)
-	for i := range tabsAfterPrint {
-		t := tabsAfterPrint[i]
-		if !knownBeforePrint[t.ID] && t.URL != "about:blank" {
-			if pCtx, pCleanup, pErr := sh.attachExistingTab(parentCtx, cdpEndpoint, t.ID); pErr == nil {
-				_ = chromedp.Run(pCtx, chromedp.Evaluate(overridePrintJS, nil))
-				sh.randomDelay(1500, 2200)
-				return pCtx, pCleanup, t.ID
-			}
+	modalPrinted := false
+	for i := 0; i < 20; i++ {
+		time.Sleep(120 * time.Millisecond)
+		var mOut struct {
+			Ready   bool `json:"ready"`
+			Checked int  `json:"checked"`
+			Printed bool `json:"printed"`
+		}
+		if err := chromedp.Run(activeReportCtx, chromedp.Evaluate(selectAndPrintModalJS, &mOut)); err == nil && mOut.Printed {
+			modalPrinted = true
+			break
 		}
 	}
 
-	// 6. Hide any remaining "Printing Options" modal dialog / backdrop so the report & PDF are 100% unobstructed
+	// Fallback if modal class structure differed: run legacy document-wide checkbox + Print click once
+	if !modalPrinted {
+		_ = chromedp.Run(activeReportCtx, chromedp.Evaluate(`
+(() => {
+    const checkboxes = Array.from(document.querySelectorAll('input[type="checkbox"]'));
+    for (const cb of checkboxes) {
+        const labelText = ((cb.closest('label') ? cb.closest('label').innerText : '') || (cb.parentElement ? cb.parentElement.innerText : '') || '').toLowerCase();
+        if (labelText.includes('display carfax in online listings')) continue;
+        if (!cb.checked) cb.click();
+    }
+    const buttons = Array.from(document.querySelectorAll('button, input[type="button"], input[type="submit"], a[role="button"]'));
+    for (const b of buttons) {
+        if (b.offsetParent !== null && (b.innerText || b.value || '').trim() === 'Print') {
+            b.click();
+        }
+    }
+})();
+`, nil))
+	}
+
+	// 4. Event-Driven Print Readiness Poll (every 150ms, up to 24 attempts = 3.6s max):
+	// Return as soon as window.__carfaxPrintTriggered is true OR a new print popup tab opens!
+	for i := 0; i < 24; i++ {
+		time.Sleep(150 * time.Millisecond)
+
+		// Check if Carfax opened a separate print tab
+		tabsAfterPrint, _ := sh.ListOpenTabs(cdpEndpoint)
+		for idx := range tabsAfterPrint {
+			t := tabsAfterPrint[idx]
+			if !knownBeforePrint[t.ID] && t.URL != "about:blank" {
+				sh.markTabActive(t.ID)
+				if pCtx, pCleanup, pErr := sh.attachExistingTab(parentCtx, cdpEndpoint, t.ID); pErr == nil {
+					_ = chromedp.Run(pCtx, chromedp.Evaluate(overridePrintJS, nil))
+					sh.randomDelay(400, 650)
+					return pCtx, pCleanup, t.ID
+				}
+			}
+		}
+
+		// Check if window.print() was triggered in the current report tab
+		var printTriggered bool
+		_ = chromedp.Run(activeReportCtx, chromedp.Evaluate(`Boolean(window.__carfaxPrintTriggered)`, &printTriggered))
+		if printTriggered {
+			break
+		}
+	}
+
+	// 5. Hide any remaining "Printing Options" modal dialog / backdrop so the report & PDF are 100% unobstructed
 	hideModalJS := `
 (() => {
     const allContainers = Array.from(document.querySelectorAll('[role="dialog"], [class*="modal" i], [class*="dialog" i], [class*="backdrop" i], [class*="overlay" i]'));
@@ -1480,7 +1775,7 @@ func (sh *StealthHarvester) prepareOfficialPrintModal(
 })();
 `
 	_ = chromedp.Run(activeReportCtx, chromedp.Evaluate(hideModalJS, nil))
-	sh.randomDelay(300, 500)
+	sh.randomDelay(120, 220)
 
 	return activeReportCtx, nil, ""
 }

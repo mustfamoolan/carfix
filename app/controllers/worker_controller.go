@@ -1,6 +1,9 @@
 package controllers
 
 import (
+	"net/url"
+	"strings"
+
 	"carfix/app/services"
 	"github.com/gofiber/fiber/v2"
 )
@@ -23,20 +26,25 @@ func (ctrl *WorkerController) verifySecret(c *fiber.Ctx) bool {
 	return ctrl.guard.ValidateSecret(secret)
 }
 
-// extractNodeInfo extracts worker ID and Name from request headers
+// extractNodeInfo extracts worker ID and Name from request headers (with URL-unescaping for Arabic names)
 func extractNodeInfo(c *fiber.Ctx) (string, string) {
-	nodeID := c.Get("X-Worker-ID")
+	nodeID := strings.TrimSpace(c.Get("X-Worker-ID"))
 	if nodeID == "" {
-		nodeID = c.Query("node_id")
+		nodeID = strings.TrimSpace(c.Query("node_id"))
 	}
-	nodeName := c.Get("X-Worker-Name")
+	nodeName := strings.TrimSpace(c.Get("X-Worker-Name"))
 	if nodeName == "" {
-		nodeName = c.Query("node_name")
+		nodeName = strings.TrimSpace(c.Query("node_name"))
+	}
+	if strings.Contains(nodeName, "%") {
+		if unescaped, err := url.QueryUnescape(nodeName); err == nil && strings.TrimSpace(unescaped) != "" {
+			nodeName = strings.TrimSpace(unescaped)
+		}
 	}
 	return nodeID, nodeName
 }
 
-// Poll delivers the next queued VIN or an inspect request to the Canada node
+// Poll delivers 1 to 4 queued VINs (fairly load-balanced across online nodes) or an inspect request to the Canada node
 func (ctrl *WorkerController) Poll(c *fiber.Ctx) error {
 	if !ctrl.verifySecret(c) {
 		return c.Status(401).JSON(fiber.Map{
@@ -47,7 +55,15 @@ func (ctrl *WorkerController) Poll(c *fiber.Ctx) error {
 	nodeID, nodeName := extractNodeInfo(c)
 	inspectRequested := ctrl.guard.ConsumeInspectRequest(nodeID)
 
-	vin, cooldownRemaining, err := ctrl.guard.PollNextTask(nodeID, nodeName)
+	maxBatch := c.QueryInt("max_batch", 1)
+	if maxBatch < 1 {
+		maxBatch = 1
+	}
+	if maxBatch > 4 {
+		maxBatch = 4
+	}
+
+	vins, cooldownRemaining, err := ctrl.guard.PollBatchTasks(nodeID, nodeName, maxBatch)
 	if err != nil {
 		if err == services.ErrCooldownActive {
 			return c.JSON(fiber.Map{
@@ -88,7 +104,9 @@ func (ctrl *WorkerController) Poll(c *fiber.Ctx) error {
 		"has_task":          true,
 		"inspect_requested": inspectRequested,
 		"node_id":           nodeID,
-		"vin":               vin,
+		"vin":               vins[0],
+		"vins":              vins,
+		"batch_size":        len(vins),
 	})
 }
 
@@ -150,9 +168,12 @@ func (ctrl *WorkerController) Complete(c *fiber.Ctx) error {
 	}
 
 	// Stage 2 Silent Background Enrichment: Update existing ReportCache with full Carfax HTML + Official PDF
-	if payload.IsBackgroundEnrich && payload.ErrorCode == "" && payload.RawHtmlEn != "" {
-		UpsertReportCache(payload.VIN, payload.VehicleTitle, payload.RawHtmlEn, payload.FastSummaryJson, ctrl.translator)
-		ctrl.guard.TouchNodeCooldownWithJitter(payload.WorkerID)
+	// Always handle IsBackgroundEnrich here so it NEVER falls through to CompleteTask a second time!
+	if payload.IsBackgroundEnrich {
+		if payload.ErrorCode == "" && (payload.RawHtmlEn != "" || payload.FastSummaryJson != "") {
+			UpsertReportCache(payload.VIN, payload.VehicleTitle, payload.RawHtmlEn, payload.FastSummaryJson, ctrl.translator)
+		}
+		ctrl.guard.ClearNodeActiveVin(payload.WorkerID, payload.VIN)
 
 		return c.JSON(fiber.Map{
 			"status":  "enriched",
@@ -164,6 +185,7 @@ func (ctrl *WorkerController) Complete(c *fiber.Ctx) error {
 	// Stage 1 Immediate Worker-Side Persistence: Save completed report directly to PostgreSQL report_caches
 	if payload.ErrorCode == "" && (payload.RawHtmlEn != "" || payload.FastSummaryJson != "") {
 		UpsertReportCache(payload.VIN, payload.VehicleTitle, payload.RawHtmlEn, payload.FastSummaryJson, ctrl.translator)
+		RecordRecentLiveAttribution(payload.VIN, payload.WorkerID, payload.WorkerName)
 	}
 
 	if err := ctrl.guard.CompleteTask(&payload); err != nil {
@@ -293,9 +315,10 @@ func (ctrl *WorkerController) DeleteNode(c *fiber.Ctx) error {
 	})
 }
 
-// GetQueueDetails returns the active task and full list of pending tasks in queue
+// GetQueueDetails returns the active tasks across all nodes and full list of pending tasks in queue
 func (ctrl *WorkerController) GetQueueDetails(c *fiber.Ctx) error {
 	activeVin, activeProg, queueList := ctrl.guard.GetDetailedQueue()
+	activeTasks := ctrl.guard.GetAllActiveTasks()
 	cooldown := ctrl.guard.GetCooldownRemainingSec()
 	connected := ctrl.guard.IsConnected()
 
@@ -303,6 +326,7 @@ func (ctrl *WorkerController) GetQueueDetails(c *fiber.Ctx) error {
 		"connected":        connected,
 		"active_vin":       activeVin,
 		"active_progress":  activeProg,
+		"active_tasks":     activeTasks,
 		"queue":            queueList,
 		"queue_count":      len(queueList),
 		"cooldown_seconds": cooldown,

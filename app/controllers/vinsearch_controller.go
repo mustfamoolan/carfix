@@ -20,6 +20,37 @@ import (
 var fastMemoryCache sync.Map
 var ErrStillInQueue = errors.New("STILL_IN_QUEUE")
 
+// RecordRecentLiveAttribution temporarily stores which worker node just completed a live pull for a VIN
+// so that if a long-waiting client (>48s 202 Processing) retrieves the report via Cache Hit on its next poll,
+// we still credit the real Canada worker node in SearchLog!
+func RecordRecentLiveAttribution(vin, workerID, workerName string) {
+	if bootstrap.Redis == nil || vin == "" || workerID == "" {
+		return
+	}
+	cleanVin := strings.ToUpper(strings.TrimSpace(vin))
+	payload, _ := json.Marshal(map[string]string{
+		"worker_id":   workerID,
+		"worker_name": workerName,
+	})
+	bootstrap.Redis.Set(context.Background(), "canada:recent_attr:"+cleanVin, string(payload), 5*time.Minute)
+}
+
+func ConsumeRecentLiveAttribution(vin string) (string, string) {
+	if bootstrap.Redis == nil || vin == "" {
+		return "", ""
+	}
+	cleanVin := strings.ToUpper(strings.TrimSpace(vin))
+	val, err := bootstrap.Redis.GetDel(context.Background(), "canada:recent_attr:"+cleanVin).Result()
+	if err != nil || val == "" {
+		return "", ""
+	}
+	var attr map[string]string
+	if json.Unmarshal([]byte(val), &attr) == nil {
+		return attr["worker_id"], attr["worker_name"]
+	}
+	return "", ""
+}
+
 func InvalidateFastReportCache(vin string) {
 	cleanVin := strings.ToUpper(strings.TrimSpace(vin))
 	fastMemoryCache.Delete(cleanVin)
@@ -29,19 +60,39 @@ func InvalidateFastReportCache(vin string) {
 }
 
 // UpsertReportCache safely creates or updates a ReportCache record in PostgreSQL and updates Redis/RAM caches
-// without ever failing on duplicate VIN keys or overwriting rich HTML with empty Stage-1 HTML.
+// without ever failing on duplicate VIN keys or overwriting rich Stage-1 JSON with empty PDF-only Stage-2 HTML.
 func UpsertReportCache(cleanVin, vehicleTitle, rawHtmlEn, fastSummaryJson string, translator *services.CarfaxTranslatorService) (*models.ReportCache, fiber.Map) {
 	cleanVin = strings.ToUpper(strings.TrimSpace(cleanVin))
 
+	hasActualHtmlTables := strings.Contains(rawHtmlEn, "<table") || strings.Contains(rawHtmlEn, "ownership-history")
 	var translatedHtmlAr, extractedTitle, summaryJson string
-	if rawHtmlEn != "" && translator != nil {
+	if rawHtmlEn != "" && hasActualHtmlTables && translator != nil {
 		translatedHtmlAr, extractedTitle, summaryJson = translator.TranslateAndExtract(rawHtmlEn, cleanVin)
 		if extractedTitle != "" && !strings.HasPrefix(extractedTitle, "مركبة شاصي") && vehicleTitle == "" {
 			vehicleTitle = extractedTitle
 		}
 	}
-	if fastSummaryJson != "" && summaryJson == "" {
+
+	// Always prefer the rich DOM-extracted fastSummaryJson over regex fallback!
+	if fastSummaryJson != "" {
 		summaryJson = fastSummaryJson
+	}
+
+	var existingRow struct {
+		VIN          string `gorm:"column:vin"`
+		VehicleTitle string `gorm:"column:vehicle_title"`
+		SummaryJson  string `gorm:"column:summary_json"`
+	}
+	bootstrap.DB.Model(&models.ReportCache{}).
+		Select("vin, vehicle_title, summary_json").
+		Where("vin = ?", cleanVin).
+		Scan(&existingRow)
+
+	if summaryJson == "" && existingRow.SummaryJson != "" {
+		summaryJson = existingRow.SummaryJson
+	}
+	if vehicleTitle == "" && existingRow.VehicleTitle != "" {
+		vehicleTitle = existingRow.VehicleTitle
 	}
 	if vehicleTitle == "" {
 		vehicleTitle = "CARFAX Vehicle Report - " + cleanVin
@@ -50,7 +101,7 @@ func UpsertReportCache(cleanVin, vehicleTitle, rawHtmlEn, fastSummaryJson string
 	hasFullHtml := len(rawHtmlEn) > 500
 	hasOfficialPdf := strings.Contains(rawHtmlEn, "carfix-official-pdf") || strings.Contains(summaryJson, `"has_official_pdf":true`)
 
-	if hasFullHtml {
+	if hasFullHtml || hasOfficialPdf {
 		var summaryMap map[string]interface{}
 		if json.Unmarshal([]byte(summaryJson), &summaryMap) == nil && summaryMap != nil {
 			summaryMap["background_pending"] = false
@@ -74,10 +125,7 @@ func UpsertReportCache(cleanVin, vehicleTitle, rawHtmlEn, fastSummaryJson string
 		UpdatedAt:        now,
 	}
 
-	var existingVin string
-	bootstrap.DB.Model(&models.ReportCache{}).Select("vin").Where("vin = ?", cleanVin).Scan(&existingVin)
-
-	if existingVin == "" {
+	if existingRow.VIN == "" {
 		if err := bootstrap.DB.Create(reportRecord).Error; err != nil {
 			updates := map[string]interface{}{
 				"vehicle_title": vehicleTitle,
@@ -86,7 +134,9 @@ func UpsertReportCache(cleanVin, vehicleTitle, rawHtmlEn, fastSummaryJson string
 			}
 			if hasFullHtml {
 				updates["raw_html_en"] = rawHtmlEn
-				updates["translated_html_ar"] = translatedHtmlAr
+				if translatedHtmlAr != "" {
+					updates["translated_html_ar"] = translatedHtmlAr
+				}
 			}
 			bootstrap.DB.Model(&models.ReportCache{}).Where("vin = ?", cleanVin).Updates(updates)
 		}
@@ -98,7 +148,9 @@ func UpsertReportCache(cleanVin, vehicleTitle, rawHtmlEn, fastSummaryJson string
 		}
 		if hasFullHtml {
 			updates["raw_html_en"] = rawHtmlEn
-			updates["translated_html_ar"] = translatedHtmlAr
+			if translatedHtmlAr != "" {
+				updates["translated_html_ar"] = translatedHtmlAr
+			}
 		}
 		bootstrap.DB.Model(&models.ReportCache{}).Where("vin = ?", cleanVin).Updates(updates)
 	}
@@ -112,15 +164,13 @@ func UpsertReportCache(cleanVin, vehicleTitle, rawHtmlEn, fastSummaryJson string
 		"fetched_at":       now,
 	}
 
-	if !strings.Contains(summaryJson, `"background_pending":true`) {
-		fastMemoryCache.Store(cleanVin, fastPayload)
-		if bootstrap.Redis != nil {
-			if b, mErr := json.Marshal(fastPayload); mErr == nil {
-				bootstrap.Redis.Set(context.Background(), "report:fast:"+cleanVin, string(b), 24*time.Hour)
-			}
+	// Store in fast cache so subsequent requests (or 202 Processing follow-ups) get instant response,
+	// and overwrite when Stage 2 finishes with has_official_pdf = true!
+	fastMemoryCache.Store(cleanVin, fastPayload)
+	if bootstrap.Redis != nil {
+		if b, mErr := json.Marshal(fastPayload); mErr == nil {
+			bootstrap.Redis.Set(context.Background(), "report:fast:"+cleanVin, string(b), 24*time.Hour)
 		}
-	} else {
-		InvalidateFastReportCache(cleanVin)
 	}
 
 	return reportRecord, fastPayload
@@ -220,12 +270,21 @@ func (ctrl *VinSearchController) Search(c *fiber.Ctx) error {
 		duration := time.Since(startTime).Milliseconds()
 		vehicleTitle, _ := fastReport["vehicle_title"].(string)
 
+		// Check if this report was just harvested live by a Canada worker (e.g., after a 202 Processing cycle)
+		attrWorkerID, attrWorkerName := ConsumeRecentLiveAttribution(cleanVin)
+		fetchSource := "cache"
+		if attrWorkerID != "" {
+			fetchSource = "canada_node"
+		}
+
 		logEntry := models.SearchLog{
 			UserID:       userID,
 			VIN:          cleanVin,
 			VehicleTitle: vehicleTitle,
 			ResultStatus: "success",
-			FetchSource:  "cache",
+			FetchSource:  fetchSource,
+			WorkerID:     attrWorkerID,
+			WorkerName:   attrWorkerName,
 			DurationMs:   duration,
 			IPAddress:    ipAddress,
 			UserAgent:    userAgent,
@@ -234,13 +293,13 @@ func (ctrl *VinSearchController) Search(c *fiber.Ctx) error {
 		bootstrap.DB.Create(&logEntry)
 
 		fastReport["status"] = "success"
-		fastReport["fetch_source"] = "cache"
+		fastReport["fetch_source"] = fetchSource
 		fastReport["duration_ms"] = duration
 		return c.JSON(fastReport)
 	}
 
 	// ==================== CACHE MISS ====================
-	rawHtmlEn, vehicleTitle, fastSummaryJson, workerID, workerName, err := ctrl.fetchFromCanadaNode(cleanVin)
+	rawHtmlEn, vehicleTitle, fastSummaryJson, workerID, workerName, err := ctrl.fetchFromCanadaNode(c.UserContext(), cleanVin)
 	if err != nil {
 		// If the VIN is still waiting in queue or actively being harvested after a 48s HTTP window,
 		// return 202 Processing so the client seamlessly continues waiting without 504/502 timeout or false error logs!
@@ -540,7 +599,7 @@ func (ctrl *VinSearchController) GetReportHtml(c *fiber.Ctx) error {
 }
 
 // GetReportPdf streams the official 4-Section Chrome PrintToPDF directly as binary application/pdf.
-// If Stage 2 background PDF generation is still completing (within 30s of Stage 1), it waits up to 15s seamlessly!
+// If Stage 2 background PDF generation is still completing, it waits up to 24s seamlessly!
 func (ctrl *VinSearchController) GetReportPdf(c *fiber.Ctx) error {
 	vin := strings.ToUpper(strings.TrimSpace(c.Params("vin")))
 	const markerStart = `<script id="carfix-official-pdf" type="application/pdf-base64">`
@@ -548,7 +607,7 @@ func (ctrl *VinSearchController) GetReportPdf(c *fiber.Ctx) error {
 	var rawHtml string
 	var startIdx int = -1
 
-	for attempt := 0; attempt < 18; attempt++ {
+	for attempt := 0; attempt < 60; attempt++ {
 		rawHtml = ""
 		_ = bootstrap.DB.Model(&models.ReportCache{}).
 			Select("raw_html_en").
@@ -561,7 +620,7 @@ func (ctrl *VinSearchController) GetReportPdf(c *fiber.Ctx) error {
 				break
 			}
 		}
-		time.Sleep(800 * time.Millisecond)
+		time.Sleep(400 * time.Millisecond)
 	}
 
 	if rawHtml == "" || startIdx == -1 {
@@ -585,9 +644,9 @@ func (ctrl *VinSearchController) GetReportPdf(c *fiber.Ctx) error {
 	return c.Send(pdfBytes)
 }
 
-// fetchFromCanadaNode communicates with the remote worker or falls back to simulation if permitted
-func (ctrl *VinSearchController) fetchFromCanadaNode(vin string) (string, string, string, string, string, error) {
-	// 1. Always respect Circuit Breaker first
+// fetchFromCanadaNode communicates with the remote worker cluster with automatic failover & 48s boundary check
+func (ctrl *VinSearchController) fetchFromCanadaNode(reqCtx context.Context, vin string) (string, string, string, string, string, error) {
+	// 1. Always respect Global Circuit Breaker first
 	if active, _ := ctrl.workerGuard.IsCircuitBreakerActive(); active {
 		return "", "", "", "", "", fmt.Errorf("الخدمة مشغولة حالياً أو قيد التحديث اللحظي، يرجى المحاولة بعد قليل")
 	}
@@ -599,8 +658,18 @@ func (ctrl *VinSearchController) fetchFromCanadaNode(vin string) (string, string
 		}
 
 		// Wait up to 48s per HTTP cycle (safely below Nginx/Cloudflare 60s gateway timeout)
-		res, err := ctrl.workerGuard.WaitForReport(vin, 48*time.Second)
+		res, err := ctrl.workerGuard.WaitForReport(reqCtx, vin, 48*time.Second)
 		if err != nil {
+			// Check if the report actually finished right at the 48s boundary!
+			if fastReport, dbErr := ctrl.getOrBuildFastReport(vin); dbErr == nil && fastReport != nil {
+				vTitle, _ := fastReport["vehicle_title"].(string)
+				sJson, _ := fastReport["summary_json"].(string)
+				attrID, attrName := ConsumeRecentLiveAttribution(vin)
+				return "", vTitle, sJson, attrID, attrName, nil
+			}
+			if errors.Is(err, context.Canceled) {
+				return "", "", "", "", "", ErrStillInQueue
+			}
 			if ctrl.workerGuard.IsVinPendingOrActive(vin) {
 				return "", "", "", "", "", ErrStillInQueue
 			}
@@ -611,9 +680,9 @@ func (ctrl *VinSearchController) fetchFromCanadaNode(vin string) (string, string
 			if res.ErrorCode == "VIN_NOT_FOUND_ON_CARFAX" {
 				return "", "", "", res.WorkerID, res.WorkerName, fmt.Errorf("لم يتم العثور على سجلات لهذا الرقم، يرجى التأكد من صحة رقم الشاصي")
 			}
-			// If it was a transient browser focus/typing/tab hiccup on attempt 1, retry once silently
-			if attempt == 1 && (res.ErrorCode == "VIN_TYPE_ERROR" || res.ErrorCode == "TAB_LOST" || res.ErrorCode == "VIN_INPUT_NOT_FOUND") {
-				time.Sleep(1500 * time.Millisecond)
+			// If it was a transient browser focus/typing/tab/load hiccup on attempt 1, retry once silently
+			if attempt == 1 && (res.ErrorCode == "VIN_TYPE_ERROR" || res.ErrorCode == "TAB_LOST" || res.ErrorCode == "VIN_INPUT_NOT_FOUND" || res.ErrorCode == "REPORT_LOAD_TIMEOUT") {
+				time.Sleep(1000 * time.Millisecond)
 				continue
 			}
 			return "", "", "", res.WorkerID, res.WorkerName, fmt.Errorf("الخدمة مشغولة حالياً، يرجى المحاولة مرة أخرى بعد قليل")

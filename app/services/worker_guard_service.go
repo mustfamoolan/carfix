@@ -6,14 +6,15 @@ import (
 	"errors"
 	"fmt"
 	"math/rand"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"carfix/bootstrap"
-	"github.com/redis/go-redis/v9"
 )
 
 var (
@@ -42,6 +43,8 @@ type WorkerTelemetry struct {
 }
 
 type WorkerProgress struct {
+	WorkerID         string    `json:"worker_id,omitempty"`
+	WorkerName       string    `json:"worker_name,omitempty"`
 	VIN              string    `json:"vin"`
 	Step             string    `json:"step"`
 	StepAr           string    `json:"step_ar"`
@@ -80,6 +83,7 @@ type WorkerStatus struct {
 	InspectPending       bool             `json:"inspect_pending"`
 	Telemetry            *WorkerTelemetry `json:"telemetry,omitempty"`
 	ActiveProgress       *WorkerProgress  `json:"active_progress,omitempty"`
+	ActiveTasks          []WorkerProgress `json:"active_tasks,omitempty"`
 	LastScreenshotBase64 string           `json:"last_screenshot_base64,omitempty"`
 	LastScreenshotAt     time.Time        `json:"last_screenshot_at,omitempty"`
 	TotalNodes           int              `json:"total_nodes"`
@@ -189,21 +193,68 @@ func (s *WorkerGuardService) getNodeDailyKey(nodeID string) string {
 	return fmt.Sprintf("canada:worker:%s:daily_pulls:%s", nodeID, today)
 }
 
-// sanitizeNodeID ensures worker ID is clean and falls back to default if empty
+// isCorruptedNodeName detects HTTP header mojibake (e.g. "('D'-*J'7J) 2 '/F3'-") from unescaped legacy headers
+func isCorruptedNodeName(s string) bool {
+	if s == "" || !utf8.ValidString(s) {
+		return true
+	}
+	if strings.Contains(s, "('D") || strings.Contains(s, "'/F") || strings.Contains(s, "*J'") || strings.Contains(s, "3'-") {
+		return true
+	}
+	return false
+}
+
+// defaultArabicNodeName returns a clean Arabic display name for a node ID
+func defaultArabicNodeName(cleanID string) string {
+	switch cleanID {
+	case "canada-node-1":
+		return "حاسبة كندا 1 (الأساسية)"
+	case "canada-node-2":
+		return "حاسبة كندا 2 (الاحتياطية)"
+	case "canada-node-3":
+		return "حاسبة كندا 3"
+	case "canada-node-4":
+		return "حاسبة كندا 4"
+	default:
+		return "حاسبة كندا (" + cleanID + ")"
+	}
+}
+
+// sanitizeNodeID ensures worker ID and Arabic name are clean, URL-unescaped, and free of header mojibake
 func sanitizeNodeID(id, name string) (string, string) {
 	cleanID := strings.TrimSpace(strings.ToLower(id))
 	if cleanID == "" {
 		cleanID = "canada-node-1"
 	}
 	cleanName := strings.TrimSpace(name)
-	if cleanName == "" {
-		if cleanID == "canada-node-1" {
-			cleanName = "حاسبة كندا 1 (الأساسية)"
-		} else {
-			cleanName = "عقدة " + cleanID
+	if strings.Contains(cleanName, "%") {
+		if unescaped, err := url.QueryUnescape(cleanName); err == nil && strings.TrimSpace(unescaped) != "" {
+			cleanName = strings.TrimSpace(unescaped)
 		}
 	}
+	if cleanName == "" || isCorruptedNodeName(cleanName) {
+		cleanName = defaultArabicNodeName(cleanID)
+	}
 	return cleanID, cleanName
+}
+
+// TouchWaiterLease marks that a customer is actively waiting for this VIN right now (TTL 45s)
+func (s *WorkerGuardService) TouchWaiterLease(vin string) {
+	if bootstrap.Redis == nil || vin == "" {
+		return
+	}
+	cleanVin := strings.ToUpper(strings.TrimSpace(vin))
+	bootstrap.Redis.Set(context.Background(), "canada:waiter:"+cleanVin, "1", 45*time.Second)
+}
+
+// HasActiveWaiter returns true if a customer browser or active HTTP request is still waiting for this VIN
+func (s *WorkerGuardService) HasActiveWaiter(vin string) bool {
+	if bootstrap.Redis == nil || vin == "" {
+		return true
+	}
+	cleanVin := strings.ToUpper(strings.TrimSpace(vin))
+	val, err := bootstrap.Redis.Get(context.Background(), "canada:waiter:"+cleanVin).Result()
+	return err == nil && val == "1"
 }
 
 // RegisterNode records worker node in registry set and sets metadata
@@ -214,7 +265,14 @@ func (s *WorkerGuardService) RegisterNode(nodeID, nodeName string) {
 	ctx := context.Background()
 	cleanID, cleanName := sanitizeNodeID(nodeID, nodeName)
 	bootstrap.Redis.SAdd(ctx, "canada:workers:registry", cleanID)
-	bootstrap.Redis.Set(ctx, "canada:worker:"+cleanID+":name", cleanName, 30*24*time.Hour)
+	if nodeName != "" && !isCorruptedNodeName(nodeName) {
+		bootstrap.Redis.Set(ctx, "canada:worker:"+cleanID+":name", cleanName, 30*24*time.Hour)
+	} else {
+		existing, _ := bootstrap.Redis.Get(ctx, "canada:worker:"+cleanID+":name").Result()
+		if existing == "" || isCorruptedNodeName(existing) {
+			bootstrap.Redis.Set(ctx, "canada:worker:"+cleanID+":name", defaultArabicNodeName(cleanID), 30*24*time.Hour)
+		}
+	}
 }
 
 // RecordHeartbeat logs a ping from Canada Worker (legacy global + per-node)
@@ -342,7 +400,7 @@ func (s *WorkerGuardService) SaveTelemetry(t *WorkerTelemetry, nodeID, nodeName 
 	}
 }
 
-// SaveProgress updates live step progress for the active VIN pull (node-aware)
+// SaveProgress updates live step progress for the active VIN pull (node-aware and per-VIN inflight-aware)
 func (s *WorkerGuardService) SaveProgress(p *WorkerProgress, nodeID, nodeName string) {
 	cleanID, cleanName := sanitizeNodeID(nodeID, nodeName)
 	s.RecordHeartbeat(cleanID, cleanName)
@@ -351,10 +409,16 @@ func (s *WorkerGuardService) SaveProgress(p *WorkerProgress, nodeID, nodeName st
 	}
 	ctx := context.Background()
 	p.UpdatedAt = time.Now()
+	p.WorkerID = cleanID
+	p.WorkerName = cleanName
 
-	if p.VIN != "" {
-		bootstrap.Redis.Set(ctx, "canada:worker:"+cleanID+":active_vin", p.VIN, 90*time.Second)
-		bootstrap.Redis.Set(ctx, "canada:active_vin", p.VIN, 90*time.Second)
+	cleanVin := strings.ToUpper(strings.TrimSpace(p.VIN))
+	if cleanVin != "" {
+		p.VIN = cleanVin
+		bootstrap.Redis.Set(ctx, "canada:worker:"+cleanID+":active_vin", cleanVin, 90*time.Second)
+		bootstrap.Redis.Set(ctx, "canada:active_vin", cleanVin, 90*time.Second)
+		bootstrap.Redis.Set(ctx, "canada:task:state:"+cleanVin, "ACTIVE", 3*time.Minute)
+		bootstrap.Redis.SAdd(ctx, "canada:inflight:set", cleanVin)
 	}
 
 	if p.ScreenshotBase64 != "" {
@@ -366,8 +430,11 @@ func (s *WorkerGuardService) SaveProgress(p *WorkerProgress, nodeID, nodeName st
 	}
 
 	if b, err := json.Marshal(p); err == nil {
-		bootstrap.Redis.Set(ctx, "canada:worker:"+cleanID+":active_progress", b, 2*time.Minute)
-		bootstrap.Redis.Set(ctx, "canada:active_progress", b, 2*time.Minute)
+		bootstrap.Redis.Set(ctx, "canada:worker:"+cleanID+":active_progress", b, 90*time.Second)
+		bootstrap.Redis.Set(ctx, "canada:active_progress", b, 90*time.Second)
+		if cleanVin != "" {
+			bootstrap.Redis.Set(ctx, "canada:inflight:"+cleanVin, b, 90*time.Second)
+		}
 	}
 }
 
@@ -389,12 +456,39 @@ func (s *WorkerGuardService) GetNodeCooldownRemainingSec(nodeID string) int {
 	return 0
 }
 
-// GetCooldownRemainingSec returns seconds left in mandatory anti-ban rest (min of active nodes)
+// GetCooldownRemainingSec returns seconds left in mandatory anti-ban rest (minimum cooldown across online healthy nodes!)
 func (s *WorkerGuardService) GetCooldownRemainingSec() int {
 	if bootstrap.Redis == nil {
 		return 0
 	}
 	ctx := context.Background()
+
+	nodes, err := bootstrap.Redis.SMembers(ctx, "canada:workers:registry").Result()
+	if err == nil && len(nodes) > 0 {
+		now := time.Now().Unix()
+		minCooldown := -1
+		for _, n := range nodes {
+			cleanID := strings.TrimSpace(n)
+			if cleanID == "" {
+				continue
+			}
+			hb, hErr := bootstrap.Redis.Get(ctx, "canada:worker:"+cleanID+":last_heartbeat").Int64()
+			if hErr != nil || (now-hb) > 60 {
+				continue
+			}
+			if cb, _ := s.IsNodeCircuitBreakerActive(cleanID); cb {
+				continue
+			}
+			cd := s.GetNodeCooldownRemainingSec(cleanID)
+			if minCooldown == -1 || cd < minCooldown {
+				minCooldown = cd
+			}
+		}
+		if minCooldown >= 0 {
+			return minCooldown
+		}
+	}
+
 	lastEnd, err := bootstrap.Redis.Get(ctx, "canada:last_pull_ended_at").Int64()
 	if err != nil {
 		return 0
@@ -404,6 +498,36 @@ func (s *WorkerGuardService) GetCooldownRemainingSec() int {
 		return s.minCooldownSec - elapsed
 	}
 	return 0
+}
+
+// CountHealthyOnlineNodes returns the number of currently online nodes that do not have their circuit breaker tripped.
+// If excludeNodeID is provided, it counts other healthy online nodes (for failover decisions).
+func (s *WorkerGuardService) CountHealthyOnlineNodes(excludeNodeID string) int {
+	if bootstrap.Redis == nil {
+		return 0
+	}
+	ctx := context.Background()
+	nodes, err := bootstrap.Redis.SMembers(ctx, "canada:workers:registry").Result()
+	if err != nil || len(nodes) == 0 {
+		return 0
+	}
+	now := time.Now().Unix()
+	count := 0
+	for _, n := range nodes {
+		cleanID := strings.TrimSpace(n)
+		if cleanID == "" || (excludeNodeID != "" && cleanID == excludeNodeID) {
+			continue
+		}
+		hb, hErr := bootstrap.Redis.Get(ctx, "canada:worker:"+cleanID+":last_heartbeat").Int64()
+		if hErr != nil || (now-hb) > 60 {
+			continue
+		}
+		if cb, _ := s.IsNodeCircuitBreakerActive(cleanID); cb {
+			continue
+		}
+		count++
+	}
+	return count
 }
 
 // GetDailyPulls returns count of reports fetched today (globally)
@@ -448,18 +572,18 @@ func (s *WorkerGuardService) IsNodeCircuitBreakerActive(nodeID string) (bool, st
 	return true, reason
 }
 
-// IsCircuitBreakerActive checks if safety tripwire tripped (global or all nodes)
+// IsCircuitBreakerActive checks if safety tripwire tripped (global or if ALL online nodes are tripped)
 func (s *WorkerGuardService) IsCircuitBreakerActive() (bool, string) {
 	if bootstrap.Redis == nil {
 		return false, ""
 	}
 	ctx := context.Background()
 	active, err := bootstrap.Redis.Get(ctx, "canada:circuit_breaker_active").Bool()
-	if err != nil || !active {
-		return false, ""
+	if err == nil && active {
+		reason, _ := bootstrap.Redis.Get(ctx, "canada:circuit_breaker_reason").Result()
+		return true, reason
 	}
-	reason, _ := bootstrap.Redis.Get(ctx, "canada:circuit_breaker_reason").Result()
-	return true, reason
+	return false, ""
 }
 
 // TriggerNodeCircuitBreaker trips safety alarm for a specific node
@@ -485,7 +609,7 @@ func (s *WorkerGuardService) TriggerCircuitBreaker(errorCode, errorMsg string) {
 	bootstrap.Redis.Set(ctx, "canada:circuit_breaker_reason", reason, 0)
 }
 
-// ResetNodeCircuitBreaker clears alarm for a specific node
+// ResetNodeCircuitBreaker clears alarm for a specific node (and clears global breaker if it was blocking)
 func (s *WorkerGuardService) ResetNodeCircuitBreaker(nodeID string) error {
 	if bootstrap.Redis == nil {
 		return nil
@@ -496,6 +620,8 @@ func (s *WorkerGuardService) ResetNodeCircuitBreaker(nodeID string) error {
 	bootstrap.Redis.Del(ctx, "canada:worker:"+cleanID+":circuit_breaker_reason")
 	bootstrap.Redis.Del(ctx, "canada:worker:"+cleanID+":active_progress")
 	bootstrap.Redis.Del(ctx, "canada:worker:"+cleanID+":active_vin")
+	bootstrap.Redis.Del(ctx, "canada:circuit_breaker_active")
+	bootstrap.Redis.Del(ctx, "canada:circuit_breaker_reason")
 	return nil
 }
 
@@ -534,11 +660,12 @@ func (s *WorkerGuardService) EmergencyStop() error {
 	bootstrap.Redis.Del(ctx, "canada:tasks:queue")
 	bootstrap.Redis.Del(ctx, "canada:active_progress")
 	bootstrap.Redis.Del(ctx, "canada:active_vin")
+	bootstrap.Redis.Del(ctx, "canada:inflight:set")
 	s.TriggerCircuitBreaker("MANUAL_STOP", "تم إيقاف السحب الآلي يدوياً من غرفة العمليات")
 	return nil
 }
 
-// ResetCircuitBreaker clears alarm after manual intervention
+// ResetCircuitBreaker clears alarm after manual intervention across global AND all registered nodes
 func (s *WorkerGuardService) ResetCircuitBreaker() error {
 	if bootstrap.Redis == nil {
 		return nil
@@ -548,24 +675,85 @@ func (s *WorkerGuardService) ResetCircuitBreaker() error {
 	bootstrap.Redis.Del(ctx, "canada:circuit_breaker_reason")
 	bootstrap.Redis.Del(ctx, "canada:active_progress")
 	bootstrap.Redis.Del(ctx, "canada:active_vin")
+
+	if nodes, err := bootstrap.Redis.SMembers(ctx, "canada:workers:registry").Result(); err == nil {
+		for _, n := range nodes {
+			cleanID := strings.TrimSpace(n)
+			if cleanID != "" {
+				bootstrap.Redis.Del(ctx, "canada:worker:"+cleanID+":circuit_breaker_active")
+				bootstrap.Redis.Del(ctx, "canada:worker:"+cleanID+":circuit_breaker_reason")
+				bootstrap.Redis.Del(ctx, "canada:worker:"+cleanID+":active_progress")
+				bootstrap.Redis.Del(ctx, "canada:worker:"+cleanID+":active_vin")
+			}
+		}
+	}
 	return nil
 }
 
-// IsVinActive checks if the given VIN is currently being harvested right now by the worker node
+// GetAllActiveTasks returns all currently active VIN pulls across all worker nodes and multi-tab batches
+func (s *WorkerGuardService) GetAllActiveTasks() []WorkerProgress {
+	if bootstrap.Redis == nil {
+		return nil
+	}
+	ctx := context.Background()
+	var activeList []WorkerProgress
+	seen := make(map[string]bool)
+
+	if members, err := bootstrap.Redis.SMembers(ctx, "canada:inflight:set").Result(); err == nil {
+		for _, vin := range members {
+			cleanVin := strings.ToUpper(strings.TrimSpace(vin))
+			if cleanVin == "" {
+				continue
+			}
+			if pBytes, gErr := bootstrap.Redis.Get(ctx, "canada:inflight:"+cleanVin).Bytes(); gErr == nil && len(pBytes) > 0 {
+				var p WorkerProgress
+				if json.Unmarshal(pBytes, &p) == nil && time.Since(p.UpdatedAt) < 95*time.Second {
+					activeList = append(activeList, p)
+					seen[cleanVin] = true
+					continue
+				}
+			}
+			// Stale member cleanup
+			bootstrap.Redis.SRem(ctx, "canada:inflight:set", vin)
+		}
+	}
+
+	// Fallback check on global active_progress
+	if pBytes, err := bootstrap.Redis.Get(ctx, "canada:active_progress").Bytes(); err == nil && len(pBytes) > 0 {
+		var p WorkerProgress
+		if json.Unmarshal(pBytes, &p) == nil && p.VIN != "" && !seen[p.VIN] && time.Since(p.UpdatedAt) < 90*time.Second {
+			activeList = append(activeList, p)
+		}
+	}
+
+	return activeList
+}
+
+// IsVinActive checks if the given VIN is currently being harvested right now by ANY worker node
 func (s *WorkerGuardService) IsVinActive(vin string) (bool, *WorkerProgress) {
 	if bootstrap.Redis == nil || vin == "" {
 		return false, nil
 	}
 	ctx := context.Background()
+	cleanVin := strings.ToUpper(strings.TrimSpace(vin))
 
-	if pBytes, err := bootstrap.Redis.Get(ctx, "canada:active_progress").Bytes(); err == nil && len(pBytes) > 0 {
+	// 1. Check per-VIN inflight key first (immune to multi-node overwrites!)
+	if pBytes, err := bootstrap.Redis.Get(ctx, "canada:inflight:"+cleanVin).Bytes(); err == nil && len(pBytes) > 0 {
 		var p WorkerProgress
-		if json.Unmarshal(pBytes, &p) == nil && p.VIN == vin && time.Since(p.UpdatedAt) < 90*time.Second {
+		if json.Unmarshal(pBytes, &p) == nil && time.Since(p.UpdatedAt) < 95*time.Second {
 			return true, &p
 		}
 	}
 
-	if activeVin, err := bootstrap.Redis.Get(ctx, "canada:active_vin").Result(); err == nil && activeVin == vin {
+	// 2. Fallback global check
+	if pBytes, err := bootstrap.Redis.Get(ctx, "canada:active_progress").Bytes(); err == nil && len(pBytes) > 0 {
+		var p WorkerProgress
+		if json.Unmarshal(pBytes, &p) == nil && p.VIN == cleanVin && time.Since(p.UpdatedAt) < 90*time.Second {
+			return true, &p
+		}
+	}
+
+	if activeVin, err := bootstrap.Redis.Get(ctx, "canada:active_vin").Result(); err == nil && activeVin == cleanVin {
 		return true, nil
 	}
 
@@ -574,17 +762,26 @@ func (s *WorkerGuardService) IsVinActive(vin string) (bool, *WorkerProgress) {
 
 // IsVinPendingOrActive returns true if the VIN is either waiting in the FIFO queue or actively being harvested
 func (s *WorkerGuardService) IsVinPendingOrActive(vin string) bool {
-	if active, _ := s.IsVinActive(vin); active {
-		return true
-	}
-	if bootstrap.Redis == nil {
+	if bootstrap.Redis == nil || vin == "" {
 		return false
 	}
+	cleanVin := strings.ToUpper(strings.TrimSpace(vin))
+	if active, _ := s.IsVinActive(cleanVin); active {
+		return true
+	}
 	ctx := context.Background()
+
+	// Check atomic task state key (prevents 48s boundary race condition)
+	if state, err := bootstrap.Redis.Get(ctx, "canada:task:state:"+cleanVin).Result(); err == nil {
+		if state == "QUEUED" || state == "ACTIVE" {
+			return true
+		}
+	}
+
 	list, err := bootstrap.Redis.LRange(ctx, "canada:tasks:queue", 0, -1).Result()
 	if err == nil {
 		for _, v := range list {
-			if v == vin {
+			if v == cleanVin {
 				return true
 			}
 		}
@@ -599,6 +796,8 @@ func (s *WorkerGuardService) RemoveFromQueue(vin string) error {
 	}
 	ctx := context.Background()
 	cleanVin := strings.ToUpper(strings.TrimSpace(vin))
+	bootstrap.Redis.Del(ctx, "canada:task:state:"+cleanVin)
+	bootstrap.Redis.Del(ctx, "canada:waiter:"+cleanVin)
 	return bootstrap.Redis.LRem(ctx, "canada:tasks:queue", 0, cleanVin).Err()
 }
 
@@ -609,6 +808,7 @@ func (s *WorkerGuardService) PromoteInQueue(vin string) error {
 	}
 	ctx := context.Background()
 	cleanVin := strings.ToUpper(strings.TrimSpace(vin))
+	s.TouchWaiterLease(cleanVin)
 	// Remove from current position and LPUSH to the front
 	bootstrap.Redis.LRem(ctx, "canada:tasks:queue", 0, cleanVin)
 	return bootstrap.Redis.LPush(ctx, "canada:tasks:queue", cleanVin).Err()
@@ -620,37 +820,53 @@ func (s *WorkerGuardService) PurgeQueue() error {
 		return nil
 	}
 	ctx := context.Background()
+	if list, err := bootstrap.Redis.LRange(ctx, "canada:tasks:queue", 0, -1).Result(); err == nil {
+		for _, v := range list {
+			bootstrap.Redis.Del(ctx, "canada:task:state:"+v)
+		}
+	}
 	return bootstrap.Redis.Del(ctx, "canada:tasks:queue").Err()
 }
 
-// GetDetailedQueue returns the active VIN and the ordered list of VINs currently waiting in queue
+// GetDetailedQueue returns the active VIN, active progress, all active tasks across nodes, and the ordered waiting queue
 func (s *WorkerGuardService) GetDetailedQueue() (string, *WorkerProgress, []string) {
 	if bootstrap.Redis == nil {
 		return "", nil, nil
 	}
 	ctx := context.Background()
-	activeVin, _ := bootstrap.Redis.Get(ctx, "canada:active_vin").Result()
+	activeTasks := s.GetAllActiveTasks()
+	var activeVin string
 	var activeProg *WorkerProgress
-	if pBytes, err := bootstrap.Redis.Get(ctx, "canada:active_progress").Bytes(); err == nil && len(pBytes) > 0 {
-		var p WorkerProgress
-		if json.Unmarshal(pBytes, &p) == nil {
-			activeProg = &p
+	if len(activeTasks) > 0 {
+		activeVin = activeTasks[0].VIN
+		activeProg = &activeTasks[0]
+	} else {
+		activeVin, _ = bootstrap.Redis.Get(ctx, "canada:active_vin").Result()
+		if pBytes, err := bootstrap.Redis.Get(ctx, "canada:active_progress").Bytes(); err == nil && len(pBytes) > 0 {
+			var p WorkerProgress
+			if json.Unmarshal(pBytes, &p) == nil {
+				activeProg = &p
+			}
 		}
 	}
 	list, _ := bootstrap.Redis.LRange(ctx, "canada:tasks:queue", 0, -1).Result()
 	return activeVin, activeProg, list
 }
 
-// EnqueueSearchTask pushes VIN into the sequential FIFO queue with Singleflight In-Flight Deduplication
+// EnqueueSearchTask pushes VIN into the sequential FIFO queue with Singleflight In-Flight Deduplication & Customer Lease
 func (s *WorkerGuardService) EnqueueSearchTask(vin string) error {
 	if bootstrap.Redis == nil {
 		return nil
 	}
 	ctx := context.Background()
+	cleanVin := strings.ToUpper(strings.TrimSpace(vin))
 
-	// 1. In-Flight Singleflight Lock: if the worker is already harvesting this VIN right now,
+	// Always refresh customer waiter lease so worker knows a live user is waiting right now
+	s.TouchWaiterLease(cleanVin)
+
+	// 1. In-Flight Singleflight Lock: if ANY worker is already harvesting this VIN right now,
 	// do not push a duplicate task; both requests will receive the report simultaneously via Pub/Sub!
-	if active, _ := s.IsVinActive(vin); active {
+	if active, _ := s.IsVinActive(cleanVin); active {
 		return nil
 	}
 
@@ -658,45 +874,51 @@ func (s *WorkerGuardService) EnqueueSearchTask(vin string) error {
 	list, err := bootstrap.Redis.LRange(ctx, "canada:tasks:queue", 0, -1).Result()
 	if err == nil {
 		for _, v := range list {
-			if v == vin {
+			if v == cleanVin {
+				bootstrap.Redis.Set(ctx, "canada:task:state:"+cleanVin, "QUEUED", 10*time.Minute)
 				return nil
 			}
 		}
 	}
 
-	return bootstrap.Redis.RPush(ctx, "canada:tasks:queue", vin).Err()
+	bootstrap.Redis.Set(ctx, "canada:task:state:"+cleanVin, "QUEUED", 10*time.Minute)
+	return bootstrap.Redis.RPush(ctx, "canada:tasks:queue", cleanVin).Err()
 }
 
 // estimateStepRemainingSec maps a WorkerProgress Step to realistic remaining harvest seconds
 func estimateStepRemainingSec(p *WorkerProgress) int {
 	if p == nil {
-		return 18
+		return 12
 	}
 	switch p.Step {
-	case "DISPATCHED", "STARTING":
-		return 20
-	case "TYPING_VIN":
-		return 16
-	case "SUBMITTING":
-		return 12
-	case "WAIT_REPORT":
+	case "DISPATCHED", "STARTING", "pre_flight":
+		return 14
+	case "TYPING_VIN", "typing_vin", "pasting_vin":
+		return 10
+	case "SUBMITTING", "submitting_search":
 		return 8
-	case "HARVESTING":
-		return 4
+	case "WAIT_REPORT":
+		return 6
+	case "HARVESTING", "extracting_data":
+		return 3
 	default:
-		return 15
+		return 10
 	}
 }
 
-// GetQueuePosition returns the 1-based position of a VIN in the waiting/active pipeline and estimated wait seconds
+// GetQueuePosition returns the 1-based position of a VIN in the waiting/active pipeline and estimated wait seconds (multi-node aware)
 func (s *WorkerGuardService) GetQueuePosition(vin string) (int, int) {
 	if bootstrap.Redis == nil {
 		return 0, 0
 	}
 	ctx := context.Background()
+	cleanVin := strings.ToUpper(strings.TrimSpace(vin))
+
+	// Refresh waiter lease whenever customer's browser polls queue status
+	s.TouchWaiterLease(cleanVin)
 
 	// 1. Check if this VIN is actively being pulled right now (Position 1)
-	if active, prog := s.IsVinActive(vin); active {
+	if active, prog := s.IsVinActive(cleanVin); active {
 		return 1, estimateStepRemainingSec(prog)
 	}
 
@@ -708,7 +930,7 @@ func (s *WorkerGuardService) GetQueuePosition(vin string) (int, int) {
 
 	idxInQueue := -1
 	for idx, v := range list {
-		if v == vin {
+		if v == cleanVin {
 			idxInQueue = idx
 			break
 		}
@@ -718,32 +940,19 @@ func (s *WorkerGuardService) GetQueuePosition(vin string) (int, int) {
 		return 0, 0
 	}
 
-	// Check if another VIN is currently active in the worker
-	activeOffset := 0
-	activeRemainingSec := 0
-	if activeVin, err := bootstrap.Redis.Get(ctx, "canada:active_vin").Result(); err == nil && activeVin != "" && activeVin != vin {
-		activeOffset = 1
-		activeRemainingSec = 16
-		if pBytes, pErr := bootstrap.Redis.Get(ctx, "canada:active_progress").Bytes(); pErr == nil && len(pBytes) > 0 {
-			var p WorkerProgress
-			if json.Unmarshal(pBytes, &p) == nil {
-				activeRemainingSec = estimateStepRemainingSec(&p)
-			}
-		}
-	}
-
+	activeTasks := s.GetAllActiveTasks()
+	activeOffset := len(activeTasks)
 	pos := idxInQueue + 1 + activeOffset
-	cooldown := s.GetCooldownRemainingSec()
 
-	// Each full pull cycle takes ~20s harvest + minCooldownSec (15s) = ~35s
-	cycleSec := s.minCooldownSec + 20
-	var estimatedSec int
-	if activeOffset > 0 {
-		estimatedSec = activeRemainingSec + s.minCooldownSec + (idxInQueue * cycleSec) + 20
-	} else {
-		estimatedSec = cooldown + (idxInQueue * cycleSec) + 20
+	healthyNodes := s.CountHealthyOnlineNodes("")
+	if healthyNodes < 1 {
+		healthyNodes = 1
 	}
 
+	cooldown := s.GetCooldownRemainingSec()
+	// With Multi-Tab Rapid Paste & Multi-Node farm, each batch of up to 4 VINs per node completes Stage-1 in ~10s
+	effectiveWaveIdx := idxInQueue / (healthyNodes * 3)
+	estimatedSec := cooldown + 10 + (effectiveWaveIdx * 16) + ((idxInQueue % 3) * 3)
 	if estimatedSec < 5 {
 		estimatedSec = 5
 	}
@@ -751,70 +960,177 @@ func (s *WorkerGuardService) GetQueuePosition(vin string) (int, int) {
 	return pos, estimatedSec
 }
 
-// PollNextTask gives the remote Canada node the next VIN to fetch if safety gates pass (node-aware)
-func (s *WorkerGuardService) PollNextTask(nodeID, nodeName string) (string, int, error) {
+// recoverOrphanedNodeTasks checks if any disconnected node (>35s without heartbeat) left an in-flight VIN unfinished,
+// and immediately requeues that VIN to the front of the queue so a healthy online node can finish it.
+func (s *WorkerGuardService) recoverOrphanedNodeTasks(ctx context.Context) {
+	nodes, err := bootstrap.Redis.SMembers(ctx, "canada:workers:registry").Result()
+	if err != nil || len(nodes) == 0 {
+		return
+	}
+	now := time.Now().Unix()
+	for _, n := range nodes {
+		cleanID := strings.TrimSpace(n)
+		if cleanID == "" {
+			continue
+		}
+		hb, hErr := bootstrap.Redis.Get(ctx, "canada:worker:"+cleanID+":last_heartbeat").Int64()
+		if hErr == nil && (now-hb) <= 35 {
+			continue // Node is alive
+		}
+		// Node is silent for >35s: check if it was holding an active VIN
+		orphanVin, vErr := bootstrap.Redis.Get(ctx, "canada:worker:"+cleanID+":active_vin").Result()
+		if vErr == nil && orphanVin != "" {
+			bootstrap.Redis.Del(ctx, "canada:worker:"+cleanID+":active_vin")
+			bootstrap.Redis.Del(ctx, "canada:worker:"+cleanID+":active_progress")
+			for _, singleVin := range strings.Split(orphanVin, ",") {
+				v := strings.ToUpper(strings.TrimSpace(singleVin))
+				if v == "" {
+					continue
+				}
+				bootstrap.Redis.Del(ctx, "canada:inflight:"+v)
+				bootstrap.Redis.SRem(ctx, "canada:inflight:set", v)
+				if s.HasActiveWaiter(v) {
+					if ok, _ := bootstrap.Redis.SetNX(ctx, "canada:requeued:orphan:"+v, "1", 5*time.Minute).Result(); ok {
+						bootstrap.Redis.LRem(ctx, "canada:tasks:queue", 0, v)
+						bootstrap.Redis.LPush(ctx, "canada:tasks:queue", v)
+						bootstrap.Redis.Set(ctx, "canada:task:state:"+v, "QUEUED", 5*time.Minute)
+					}
+				}
+			}
+		}
+	}
+}
+
+// PollBatchTasks gives the remote Canada node 1 to 4 VINs at once (fairly divided across online nodes)
+// while automatically skipping any abandoned Zombie VINs whose customer closed the page!
+func (s *WorkerGuardService) PollBatchTasks(nodeID, nodeName string, maxBatch int) ([]string, int, error) {
 	cleanID, cleanName := sanitizeNodeID(nodeID, nodeName)
 	s.RecordHeartbeat(cleanID, cleanName)
 
 	if bootstrap.Redis == nil {
-		return "", 0, ErrQueueEmpty
+		return nil, 0, ErrQueueEmpty
 	}
 	ctx := context.Background()
 
+	// Recover any tasks stranded on a dead node before polling
+	s.recoverOrphanedNodeTasks(ctx)
+
 	// Gate 1: Check Global Circuit Breaker
 	if active, reason := s.IsCircuitBreakerActive(); active {
-		return "", 0, fmt.Errorf("%w: %s", ErrCircuitBreaker, reason)
+		return nil, 0, fmt.Errorf("%w: %s", ErrCircuitBreaker, reason)
 	}
 
 	// Gate 1.5: Check Node-Specific Circuit Breaker
 	if active, reason := s.IsNodeCircuitBreakerActive(cleanID); active {
-		return "", 0, fmt.Errorf("قاطع الحماية مفعل لهذه العقدة (%s): %s", cleanName, reason)
+		return nil, 0, fmt.Errorf("قاطع الحماية مفعل لهذه العقدة (%s): %s", cleanName, reason)
 	}
 
 	// Gate 2: Check Daily Limit (Global + Node)
 	dailyPulls := s.GetDailyPulls()
 	if dailyPulls >= s.maxDailyPulls*5 { // cluster max capacity
-		return "", 0, ErrDailyLimit
+		return nil, 0, ErrDailyLimit
 	}
 	nodeDailyPulls := s.GetNodeDailyPulls(cleanID)
 	if nodeDailyPulls >= s.maxDailyPulls {
-		return "", 0, fmt.Errorf("تم بلوغ الحد الأقصى للسحب اليومي لهذه العقدة (%d فحص)", s.maxDailyPulls)
+		return nil, 0, fmt.Errorf("تم بلوغ الحد الأقصى للسحب اليومي لهذه العقدة (%d فحص)", s.maxDailyPulls)
 	}
 
 	// Gate 3: Check Node-Specific Mandatory Cooldown
 	nodeCooldown := s.GetNodeCooldownRemainingSec(cleanID)
 	if nodeCooldown > 0 {
-		return "", nodeCooldown, ErrCooldownActive
+		return nil, nodeCooldown, ErrCooldownActive
 	}
 
-	// Gate 4: Pop next VIN from queue
-	vin, err := bootstrap.Redis.LPop(ctx, "canada:tasks:queue").Result()
-	if err != nil {
-		if errors.Is(err, redis.Nil) {
-			return "", 0, ErrQueueEmpty
+	// Calculate fair batch size across healthy online nodes so 2 PCs split 2 tasks (1 each),
+	// while 2 PCs facing 6 tasks take 3 each for Multi-Tab Rapid Paste!
+	if maxBatch < 1 {
+		maxBatch = 1
+	}
+	if maxBatch > 4 {
+		maxBatch = 4
+	}
+	qLen, _ := bootstrap.Redis.LLen(ctx, "canada:tasks:queue").Result()
+	if qLen == 0 {
+		return nil, 0, ErrQueueEmpty
+	}
+
+	healthyNodes := s.CountHealthyOnlineNodes("")
+	if healthyNodes < 1 {
+		healthyNodes = 1
+	}
+	fairBatch := int((int(qLen) + healthyNodes - 1) / healthyNodes)
+	if fairBatch < 1 {
+		fairBatch = 1
+	}
+	if fairBatch > maxBatch {
+		fairBatch = maxBatch
+	}
+	remainingQuota := s.maxDailyPulls - nodeDailyPulls
+	if fairBatch > remainingQuota && remainingQuota > 0 {
+		fairBatch = remainingQuota
+	}
+
+	// Gate 4: Pop valid VINs (skipping Zombie tasks where customer closed browser)
+	var batchVins []string
+	for len(batchVins) < fairBatch {
+		vin, err := bootstrap.Redis.LPop(ctx, "canada:tasks:queue").Result()
+		if err != nil {
+			break
 		}
-		return "", 0, err
+		cleanVin := strings.ToUpper(strings.TrimSpace(vin))
+		if cleanVin == "" {
+			continue
+		}
+		// Zombie Queue Protection: if no customer is waiting for this VIN anymore, discard it immediately!
+		if !s.HasActiveWaiter(cleanVin) {
+			bootstrap.Redis.Del(ctx, "canada:task:state:"+cleanVin)
+			continue
+		}
+		batchVins = append(batchVins, cleanVin)
 	}
 
-	// Immediately mark VIN as active globally and for this specific node
-	bootstrap.Redis.Set(ctx, "canada:active_vin", vin, 90*time.Second)
-	bootstrap.Redis.Set(ctx, "canada:worker:"+cleanID+":active_vin", vin, 90*time.Second)
-
-	// Record which node took which VIN for tracing
-	bootstrap.Redis.Set(ctx, "canada:vin_node_map:"+vin, cleanID, 30*time.Minute)
-
-	initProg := WorkerProgress{
-		VIN:       vin,
-		Step:      "DISPATCHED",
-		StepAr:    fmt.Sprintf("تم توجيه الطلب إلى %s لبدء الفحص", cleanName),
-		UpdatedAt: time.Now(),
-	}
-	if b, mErr := json.Marshal(&initProg); mErr == nil {
-		bootstrap.Redis.Set(ctx, "canada:active_progress", b, 90*time.Second)
-		bootstrap.Redis.Set(ctx, "canada:worker:"+cleanID+":active_progress", b, 90*time.Second)
+	if len(batchVins) == 0 {
+		return nil, 0, ErrQueueEmpty
 	}
 
-	return vin, 0, nil
+	primaryVin := batchVins[0]
+	joinedVins := strings.Join(batchVins, ",")
+	bootstrap.Redis.Set(ctx, "canada:active_vin", primaryVin, 90*time.Second)
+	bootstrap.Redis.Set(ctx, "canada:worker:"+cleanID+":active_vin", joinedVins, 90*time.Second)
+
+	now := time.Now()
+	for _, v := range batchVins {
+		bootstrap.Redis.Set(ctx, "canada:vin_node_map:"+v, cleanID, 30*time.Minute)
+		bootstrap.Redis.Set(ctx, "canada:task:state:"+v, "ACTIVE", 3*time.Minute)
+		bootstrap.Redis.SAdd(ctx, "canada:inflight:set", v)
+
+		initProg := WorkerProgress{
+			WorkerID:   cleanID,
+			WorkerName: cleanName,
+			VIN:        v,
+			Step:       "DISPATCHED",
+			StepAr:     fmt.Sprintf("تم توجيه الطلب إلى %s لبدء الفحص الفوري", cleanName),
+			UpdatedAt:  now,
+		}
+		if b, mErr := json.Marshal(&initProg); mErr == nil {
+			bootstrap.Redis.Set(ctx, "canada:inflight:"+v, b, 90*time.Second)
+			if v == primaryVin {
+				bootstrap.Redis.Set(ctx, "canada:active_progress", b, 90*time.Second)
+				bootstrap.Redis.Set(ctx, "canada:worker:"+cleanID+":active_progress", b, 90*time.Second)
+			}
+		}
+	}
+
+	return batchVins, 0, nil
+}
+
+// PollNextTask backward-compatible single-VIN wrapper around PollBatchTasks
+func (s *WorkerGuardService) PollNextTask(nodeID, nodeName string) (string, int, error) {
+	vins, cd, err := s.PollBatchTasks(nodeID, nodeName, 1)
+	if err != nil || len(vins) == 0 {
+		return "", cd, err
+	}
+	return vins[0], cd, nil
 }
 
 // TouchNodeCooldownWithJitter sets the anti-ban cooldown timestamp for a specific node with natural human jitter
@@ -840,11 +1156,31 @@ func (s *WorkerGuardService) TouchCooldownWithJitter() {
 	s.TouchNodeCooldownWithJitter("canada-node-1")
 }
 
-// CompleteTask handles response from Canada node (multi-node aware)
+// ClearNodeActiveVin clears only the finished VIN from the node's active tracking without resetting cooldown twice
+func (s *WorkerGuardService) ClearNodeActiveVin(nodeID, vin string) {
+	if bootstrap.Redis == nil {
+		return
+	}
+	ctx := context.Background()
+	cleanID, _ := sanitizeNodeID(nodeID, "")
+	cleanVin := strings.ToUpper(strings.TrimSpace(vin))
+	if cleanVin != "" {
+		bootstrap.Redis.Del(ctx, "canada:inflight:"+cleanVin)
+		bootstrap.Redis.SRem(ctx, "canada:inflight:set", cleanVin)
+		bootstrap.Redis.Set(ctx, "canada:task:state:"+cleanVin, "DONE", 10*time.Minute)
+	}
+	bootstrap.Redis.Del(ctx, "canada:worker:"+cleanID+":active_progress")
+	bootstrap.Redis.Del(ctx, "canada:worker:"+cleanID+":active_vin")
+	bootstrap.Redis.Del(ctx, "canada:active_progress")
+	bootstrap.Redis.Del(ctx, "canada:active_vin")
+}
+
+// CompleteTask handles Stage-1 or final response from Canada node (multi-node aware + automatic failover requeue!)
 func (s *WorkerGuardService) CompleteTask(res *WorkerTaskResult) error {
 	cleanID, cleanName := sanitizeNodeID(res.WorkerID, res.WorkerName)
 	res.WorkerID = cleanID
 	res.WorkerName = cleanName
+	res.VIN = strings.ToUpper(strings.TrimSpace(res.VIN))
 
 	s.RecordHeartbeat(cleanID, cleanName)
 
@@ -852,19 +1188,6 @@ func (s *WorkerGuardService) CompleteTask(res *WorkerTaskResult) error {
 		return nil
 	}
 	ctx := context.Background()
-
-	// If Stage 1 completed without RawHtmlEn, Stage 2 continues in background
-	if res.ErrorCode == "" && res.RawHtmlEn == "" {
-		bootstrap.Redis.Expire(ctx, "canada:active_vin", 15*time.Second)
-		bootstrap.Redis.Expire(ctx, "canada:active_progress", 15*time.Second)
-		bootstrap.Redis.Expire(ctx, "canada:worker:"+cleanID+":active_vin", 15*time.Second)
-		bootstrap.Redis.Expire(ctx, "canada:worker:"+cleanID+":active_progress", 15*time.Second)
-	} else {
-		bootstrap.Redis.Del(ctx, "canada:active_progress")
-		bootstrap.Redis.Del(ctx, "canada:active_vin")
-		bootstrap.Redis.Del(ctx, "canada:worker:"+cleanID+":active_progress")
-		bootstrap.Redis.Del(ctx, "canada:worker:"+cleanID+":active_vin")
-	}
 
 	// Save screenshot if sent with completion
 	if res.ScreenshotBase64 != "" {
@@ -874,31 +1197,84 @@ func (s *WorkerGuardService) CompleteTask(res *WorkerTaskResult) error {
 		bootstrap.Redis.Set(ctx, "canada:last_screenshot_at", time.Now().Unix(), 24*time.Hour)
 	}
 
-	// Trip safety alarms: if a specific node detected CAPTCHA or Session Expiration,
-	// trip ONLY that node's breaker so other nodes remain working!
+	// Handle Errors & Smart Multi-Node Failover Requeue
 	if res.ErrorCode != "" {
+		bootstrap.Redis.Del(ctx, "canada:inflight:"+res.VIN)
+		bootstrap.Redis.SRem(ctx, "canada:inflight:set", res.VIN)
+		bootstrap.Redis.Del(ctx, "canada:worker:"+cleanID+":active_progress")
+		bootstrap.Redis.Del(ctx, "canada:worker:"+cleanID+":active_vin")
+
+		// Trip ONLY this node's breaker if CAPTCHA or SESSION_EXPIRED
 		if res.ErrorCode == "CAPTCHA_DETECTED" || res.ErrorCode == "SESSION_EXPIRED" {
 			s.TriggerNodeCircuitBreaker(cleanID, res.ErrorCode, res.ErrorMessage)
 		}
+
+		// If the error is NOT an explicit Carfax "Invalid/No Records VIN", check if we can seamlessly requeue!
+		if res.ErrorCode != "VIN_NOT_FOUND_ON_CARFAX" && s.HasActiveWaiter(res.VIN) {
+			canFailover := false
+			if res.ErrorCode == "CAPTCHA_DETECTED" || res.ErrorCode == "SESSION_EXPIRED" || res.ErrorCode == "CHROME_NOT_CONNECTED" {
+				// Requeue if there is another healthy online node ready to take over
+				canFailover = s.CountHealthyOnlineNodes(cleanID) > 0
+			} else {
+				// Transient browser/tab/timeout hiccup: any healthy node (including this one) can retry once immediately
+				canFailover = s.CountHealthyOnlineNodes("") > 0
+			}
+
+			if canFailover {
+				if ok, _ := bootstrap.Redis.SetNX(ctx, "canada:requeued:"+res.VIN, cleanID, 4*time.Minute).Result(); ok {
+					// Clear cooldown on this node if it was just a transient DOM/tab hiccup so it can retry immediately
+					if res.ErrorCode != "CAPTCHA_DETECTED" && res.ErrorCode != "SESSION_EXPIRED" {
+						bootstrap.Redis.Del(ctx, "canada:worker:"+cleanID+":last_pull_ended_at")
+					}
+					bootstrap.Redis.LRem(ctx, "canada:tasks:queue", 0, res.VIN)
+					bootstrap.Redis.LPush(ctx, "canada:tasks:queue", res.VIN)
+					bootstrap.Redis.Set(ctx, "canada:task:state:"+res.VIN, "QUEUED", 5*time.Minute)
+					// Do NOT publish error to Pub/Sub — let WaitForReport seamlessly receive the retry result!
+					return nil
+				}
+			}
+		}
+
+		bootstrap.Redis.Set(ctx, "canada:task:state:"+res.VIN, "FAILED", 2*time.Minute)
 	} else {
-		// Successful report fetch: increment both node-specific and global counters
-		jitter := int64(rand.Intn(4))
-		pipe := bootstrap.Redis.Pipeline()
+		// SUCCESS!
+		// If Stage 1 completed without RawHtmlEn, Stage 2 continues in background for ~2-3s
+		if res.RawHtmlEn == "" {
+			bootstrap.Redis.Expire(ctx, "canada:inflight:"+res.VIN, 15*time.Second)
+			bootstrap.Redis.Expire(ctx, "canada:active_vin", 15*time.Second)
+			bootstrap.Redis.Expire(ctx, "canada:active_progress", 15*time.Second)
+			bootstrap.Redis.Expire(ctx, "canada:worker:"+cleanID+":active_vin", 15*time.Second)
+			bootstrap.Redis.Expire(ctx, "canada:worker:"+cleanID+":active_progress", 15*time.Second)
+		} else {
+			bootstrap.Redis.Del(ctx, "canada:inflight:"+res.VIN)
+			bootstrap.Redis.SRem(ctx, "canada:inflight:set", res.VIN)
+			bootstrap.Redis.Del(ctx, "canada:active_progress")
+			bootstrap.Redis.Del(ctx, "canada:active_vin")
+			bootstrap.Redis.Del(ctx, "canada:worker:"+cleanID+":active_progress")
+			bootstrap.Redis.Del(ctx, "canada:worker:"+cleanID+":active_vin")
+		}
+		bootstrap.Redis.Set(ctx, "canada:task:state:"+res.VIN, "DONE", 10*time.Minute)
 
-		globalDailyKey := s.getDailyKey()
-		pipe.Incr(ctx, globalDailyKey)
-		pipe.Expire(ctx, globalDailyKey, 24*time.Hour)
-		pipe.Set(ctx, "canada:last_pull_ended_at", time.Now().Unix()-jitter, 0)
+		// Increment daily counter & set cooldown ONLY ONCE per VIN (using SetNX lock per VIN per 2 minutes)
+		if counted, _ := bootstrap.Redis.SetNX(ctx, "canada:counted:"+res.VIN, cleanID, 2*time.Minute).Result(); counted {
+			jitter := int64(rand.Intn(4))
+			pipe := bootstrap.Redis.Pipeline()
 
-		nodeDailyKey := s.getNodeDailyKey(cleanID)
-		pipe.Incr(ctx, nodeDailyKey)
-		pipe.Expire(ctx, nodeDailyKey, 24*time.Hour)
-		pipe.Set(ctx, "canada:worker:"+cleanID+":last_pull_ended_at", time.Now().Unix()-jitter, 0)
+			globalDailyKey := s.getDailyKey()
+			pipe.Incr(ctx, globalDailyKey)
+			pipe.Expire(ctx, globalDailyKey, 24*time.Hour)
+			pipe.Set(ctx, "canada:last_pull_ended_at", time.Now().Unix()-jitter, 0)
 
-		_, _ = pipe.Exec(ctx)
+			nodeDailyKey := s.getNodeDailyKey(cleanID)
+			pipe.Incr(ctx, nodeDailyKey)
+			pipe.Expire(ctx, nodeDailyKey, 24*time.Hour)
+			pipe.Set(ctx, "canada:worker:"+cleanID+":last_pull_ended_at", time.Now().Unix()-jitter, 0)
+
+			_, _ = pipe.Exec(ctx)
+		}
 	}
 
-	// Store result in Redis only if successful
+	// Store result in Redis if successful
 	resForWaiter := *res
 	resForWaiter.ScreenshotBase64 = ""
 	resBytes, _ := json.Marshal(&resForWaiter)
@@ -915,20 +1291,25 @@ func (s *WorkerGuardService) CompleteTask(res *WorkerTaskResult) error {
 	return nil
 }
 
-// WaitForReport waits synchronously for Canada worker to deliver report or times out.
-// Subscribes to Pub/Sub BEFORE checking Redis key and also polls every 1s to guarantee zero missed completions.
-func (s *WorkerGuardService) WaitForReport(vin string, timeout time.Duration) (*WorkerTaskResult, error) {
+// WaitForReport waits synchronously for Canada worker to deliver report, respecting client context cancellation
+// and refreshing the customer waiter lease every second so the worker knows the customer is still waiting.
+func (s *WorkerGuardService) WaitForReport(reqCtx context.Context, vin string, timeout time.Duration) (*WorkerTaskResult, error) {
 	if bootstrap.Redis == nil {
 		return nil, errors.New("redis unavailable")
 	}
+	if reqCtx == nil {
+		reqCtx = context.Background()
+	}
 	ctx := context.Background()
+	cleanVin := strings.ToUpper(strings.TrimSpace(vin))
+	s.TouchWaiterLease(cleanVin)
 
-	channel := fmt.Sprintf("canada:pubsub:%s", vin)
+	channel := fmt.Sprintf("canada:pubsub:%s", cleanVin)
 	sub := bootstrap.Redis.Subscribe(ctx, channel)
 	defer sub.Close()
 	ch := sub.Channel()
 
-	resultKey := fmt.Sprintf("canada:result:%s", vin)
+	resultKey := fmt.Sprintf("canada:result:%s", cleanVin)
 	checkCachedResult := func() *WorkerTaskResult {
 		val, err := bootstrap.Redis.Get(ctx, resultKey).Result()
 		if err == nil && val != "" {
@@ -951,6 +1332,10 @@ func (s *WorkerGuardService) WaitForReport(vin string, timeout time.Duration) (*
 
 	for {
 		select {
+		case <-reqCtx.Done():
+			// Customer closed browser tab or cancelled request
+			return nil, reqCtx.Err()
+
 		case msg := <-ch:
 			if msg == nil {
 				return nil, ErrWorkerTimedOut
@@ -962,11 +1347,13 @@ func (s *WorkerGuardService) WaitForReport(vin string, timeout time.Duration) (*
 			return &res, nil
 
 		case <-ticker.C:
+			s.TouchWaiterLease(cleanVin)
 			if res := checkCachedResult(); res != nil {
 				return res, nil
 			}
 
 		case <-deadline:
+			s.TouchWaiterLease(cleanVin)
 			if res := checkCachedResult(); res != nil {
 				return res, nil
 			}
@@ -999,9 +1386,10 @@ func (s *WorkerGuardService) GetClusterNodes() []WorkerNodeInfo {
 			continue
 		}
 
-		name, _ := bootstrap.Redis.Get(ctx, "canada:worker:"+cleanID+":name").Result()
-		if name == "" {
-			name = "حاسبة " + cleanID
+		rawName, _ := bootstrap.Redis.Get(ctx, "canada:worker:"+cleanID+":name").Result()
+		_, name := sanitizeNodeID(cleanID, rawName)
+		if rawName != name {
+			bootstrap.Redis.Set(ctx, "canada:worker:"+cleanID+":name", name, 30*24*time.Hour)
 		}
 
 		var lastHb time.Time
@@ -1122,12 +1510,20 @@ func (s *WorkerGuardService) GetStatus() *WorkerStatus {
 
 	cbActive, cbReason := s.IsCircuitBreakerActive()
 	clusterNodes := s.GetClusterNodes()
+	activeTasks := s.GetAllActiveTasks()
+	if progress == nil && len(activeTasks) > 0 {
+		progress = &activeTasks[0]
+	}
 
 	totalNodes := len(clusterNodes)
 	onlineNodes := 0
 	for _, n := range clusterNodes {
 		if n.Connected {
 			onlineNodes++
+			// Prefer telemetry from a connected node so top bar is always accurate
+			if n.Telemetry != nil {
+				telemetry = n.Telemetry
+			}
 		}
 	}
 
@@ -1144,6 +1540,7 @@ func (s *WorkerGuardService) GetStatus() *WorkerStatus {
 		InspectPending:       inspectPending,
 		Telemetry:            telemetry,
 		ActiveProgress:       progress,
+		ActiveTasks:          activeTasks,
 		LastScreenshotBase64: lastScreenshot,
 		LastScreenshotAt:     lastScreenshotAt,
 		TotalNodes:           totalNodes,

@@ -194,7 +194,11 @@ export default function CanadaWorkerCard({ status, onRefresh }) {
           <div className="rounded-lg border border-border overflow-hidden bg-muted/30 flex items-center justify-center min-h-[260px]">
             {last_screenshot_base64 ? (
               <img
-                src={last_screenshot_base64}
+                src={
+                  last_screenshot_base64.startsWith('data:image')
+                    ? last_screenshot_base64
+                    : `data:image/jpeg;base64,${last_screenshot_base64.replace(/^[\s\r\n]+/, '')}`
+                }
                 alt="Canada Browser"
                 className="max-h-[460px] w-auto object-contain"
               />

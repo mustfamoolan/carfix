@@ -8,6 +8,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"strconv"
@@ -19,13 +20,14 @@ import (
 )
 
 type PollResponse struct {
-	HasTask           bool   `json:"has_task"`
-	VIN               string `json:"vin"`
-	InspectRequested  bool   `json:"inspect_requested,omitempty"`
-	CooldownRemaining int    `json:"cooldown_remaining,omitempty"`
-	CircuitBreaker    bool   `json:"circuit_breaker,omitempty"`
-	DailyLimitHit     bool   `json:"daily_limit_hit,omitempty"`
-	Message           string `json:"message"`
+	HasTask           bool     `json:"has_task"`
+	VIN               string   `json:"vin"`
+	VINs              []string `json:"vins,omitempty"`
+	InspectRequested  bool     `json:"inspect_requested,omitempty"`
+	CooldownRemaining int      `json:"cooldown_remaining,omitempty"`
+	CircuitBreaker    bool     `json:"circuit_breaker,omitempty"`
+	DailyLimitHit     bool     `json:"daily_limit_hit,omitempty"`
+	Message           string   `json:"message"`
 }
 
 type CompleteRequest struct {
@@ -145,7 +147,7 @@ func (w *CanadaWorker) sendHeartbeat() {
 	}
 	req.Header.Set("X-Worker-Secret", w.secretKey)
 	req.Header.Set("X-Worker-ID", w.nodeID)
-	req.Header.Set("X-Worker-Name", w.nodeName)
+	req.Header.Set("X-Worker-Name", url.QueryEscape(w.nodeName))
 	resp, err := w.client.Do(req)
 	if err == nil && resp != nil {
 		resp.Body.Close()
@@ -214,21 +216,30 @@ func (w *CanadaWorker) pollAndExecute(ctx context.Context) {
 	}
 
 	// 4. No pending task in queue
-	if !pollRes.HasTask || pollRes.VIN == "" {
+	if !pollRes.HasTask || (pollRes.VIN == "" && len(pollRes.VINs) == 0) {
 		return
 	}
 
-	// 5. Task received: Execute strict One-Shot Harvest with 2-Stage Split Delivery (Instant UI + Background Official PDF)
-	vin := pollRes.VIN
-	log.Printf("🚀 [TASK RECEIVED] Starting One-Shot Carfax pull for VIN: %s", vin)
+	vins := pollRes.VINs
+	if len(vins) == 0 && pollRes.VIN != "" {
+		vins = []string{pollRes.VIN}
+	}
 
-	stage1Delivered := false
-	harvestRes := w.stealth.HarvestReport(
+	// 5. Tasks received: Execute Instant Paste & Multi-Tab Harvest with 2-Stage Split Delivery (Instant UI + Event-Driven 4-Checkbox PDF)
+	if len(vins) > 1 {
+		log.Printf("🚀 [BATCH RECEIVED] Starting Multi-Tab Rapid Paste & Harvest for %d VINs: %v", len(vins), vins)
+	} else {
+		log.Printf("🚀 [TASK RECEIVED] Starting Instant Paste Carfax pull for VIN: %s", vins[0])
+	}
+
+	stage1Delivered := make(map[string]bool)
+
+	w.stealth.HarvestBatchReports(
 		ctx,
 		w.cdpWsURL,
-		vin,
-		func(step, stepAr, screenshot string) {
-			log.Printf("   -> [%s] %s", step, stepAr)
+		vins,
+		func(vin, step, stepAr, screenshot string) {
+			log.Printf("   -> [%s | %s] %s", vin, step, stepAr)
 			_ = w.sendProgress(&ProgressUpdate{
 				VIN:              vin,
 				Step:             step,
@@ -236,47 +247,53 @@ func (w *CanadaWorker) pollAndExecute(ctx context.Context) {
 				ScreenshotBase64: screenshot,
 			})
 		},
-		func(fastRes *HarvestResult) {
+		func(vin string, fastRes *HarvestResult) {
 			if fastRes != nil && fastRes.Success && fastRes.FastSummaryJson != "" {
 				stage1Req := CompleteRequest{
+					WorkerID:        w.nodeID,
+					WorkerName:      w.nodeName,
 					VIN:             vin,
 					VehicleTitle:    fastRes.VehicleTitle,
 					FastSummaryJson: fastRes.FastSummaryJson,
 					CompletedAt:     time.Now(),
 				}
 				if err := w.sendComplete(&stage1Req); err == nil {
-					stage1Delivered = true
-					log.Printf("⚡ [STAGE 1 DELIVERED] Instant structured report sent to customer for %s in ~7s! Finishing human reading & Official PDF in background...", vin)
+					stage1Delivered[vin] = true
+					log.Printf("⚡ [STAGE 1 DELIVERED] Instant structured report sent to customer for %s! Preparing 4-Checkbox Official PDF...", vin)
+				}
+			}
+		},
+		func(vin string, harvestRes *HarvestResult) {
+			if harvestRes == nil {
+				return
+			}
+			completeReq := CompleteRequest{
+				WorkerID:           w.nodeID,
+				WorkerName:         w.nodeName,
+				VIN:                vin,
+				VehicleTitle:       harvestRes.VehicleTitle,
+				RawHtmlEn:          harvestRes.RawHtmlEn,
+				FastSummaryJson:    harvestRes.FastSummaryJson,
+				IsBackgroundEnrich: stage1Delivered[vin] && harvestRes.Success,
+				ErrorCode:          harvestRes.ErrorCode,
+				ErrorMessage:       harvestRes.ErrorMessage,
+				ScreenshotBase64:   harvestRes.ScreenshotBase64,
+				CompletedAt:        time.Now(),
+			}
+
+			if err := w.sendComplete(&completeReq); err != nil {
+				log.Printf("❌ [COMPLETE FAILED] Error delivering result for %s to server: %v", vin, err)
+			} else {
+				if !harvestRes.Success {
+					log.Printf("🛑 [TASK FAILED] [%s] for %s: %s", harvestRes.ErrorCode, vin, harvestRes.ErrorMessage)
+				} else {
+					log.Printf("✅ [STAGE 2 COMPLETED] 4-Checkbox Official PDF for %s finalized and enriched!", vin)
 				}
 			}
 		},
 	)
 
-	completeReq := CompleteRequest{
-		WorkerID:           w.nodeID,
-		WorkerName:         w.nodeName,
-		VIN:                vin,
-		VehicleTitle:       harvestRes.VehicleTitle,
-		RawHtmlEn:          harvestRes.RawHtmlEn,
-		FastSummaryJson:    harvestRes.FastSummaryJson,
-		IsBackgroundEnrich: stage1Delivered && harvestRes.Success,
-		ErrorCode:          harvestRes.ErrorCode,
-		ErrorMessage:       harvestRes.ErrorMessage,
-		ScreenshotBase64:   harvestRes.ScreenshotBase64,
-		CompletedAt:        time.Now(),
-	}
-
-	if err := w.sendComplete(&completeReq); err != nil {
-		log.Printf("❌ [COMPLETE FAILED] Error delivering result to server: %v", err)
-	} else {
-		if !harvestRes.Success {
-			log.Printf("🛑 [ONE-SHOT FREEZE] Safety stop [%s]: %s", harvestRes.ErrorCode, harvestRes.ErrorMessage)
-		} else {
-			log.Printf("✅ [STAGE 2 COMPLETED] Human reading + Official PDF for %s finalized and enriched!", vin)
-		}
-	}
-
-	// Refresh telemetry state after task completion
+	// Refresh telemetry state after batch completion
 	w.reportTelemetry(ctx, false)
 }
 
@@ -294,7 +311,7 @@ func (w *CanadaWorker) reportTelemetry(ctx context.Context, withScreenshot bool)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Worker-Secret", w.secretKey)
 	req.Header.Set("X-Worker-ID", w.nodeID)
-	req.Header.Set("X-Worker-Name", w.nodeName)
+	req.Header.Set("X-Worker-Name", url.QueryEscape(w.nodeName))
 
 	resp, err := w.client.Do(req)
 	if err == nil && resp != nil {
@@ -315,7 +332,7 @@ func (w *CanadaWorker) sendProgress(prog *ProgressUpdate) error {
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Worker-Secret", w.secretKey)
 	req.Header.Set("X-Worker-ID", w.nodeID)
-	req.Header.Set("X-Worker-Name", w.nodeName)
+	req.Header.Set("X-Worker-Name", url.QueryEscape(w.nodeName))
 
 	resp, err := w.client.Do(req)
 	if err != nil {
@@ -326,13 +343,13 @@ func (w *CanadaWorker) sendProgress(prog *ProgressUpdate) error {
 }
 
 func (w *CanadaWorker) sendPoll() (*PollResponse, error) {
-	req, err := http.NewRequest("GET", w.serverURL+"/api/worker/poll", nil)
+	req, err := http.NewRequest("GET", w.serverURL+"/api/worker/poll?max_batch=4", nil)
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("X-Worker-Secret", w.secretKey)
 	req.Header.Set("X-Worker-ID", w.nodeID)
-	req.Header.Set("X-Worker-Name", w.nodeName)
+	req.Header.Set("X-Worker-Name", url.QueryEscape(w.nodeName))
 
 	resp, err := w.client.Do(req)
 	if err != nil {
@@ -373,7 +390,7 @@ func (w *CanadaWorker) sendComplete(res *CompleteRequest) error {
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Worker-Secret", w.secretKey)
 	req.Header.Set("X-Worker-ID", w.nodeID)
-	req.Header.Set("X-Worker-Name", w.nodeName)
+	req.Header.Set("X-Worker-Name", url.QueryEscape(w.nodeName))
 
 	resp, err := w.client.Do(req)
 	if err != nil {

@@ -3,7 +3,7 @@ import { useParams, useNavigate, useLocation } from 'react-router-dom'
 import AuthenticatedLayout from '@/components/layout/AuthenticatedLayout'
 import ReportToolbar from '@/components/report/ReportToolbar'
 import ReportNativeView from '@/components/report/ReportNativeView'
-import { getReport, getCachedData } from '@/lib/api'
+import { getReport, getCachedData, markVinViewed } from '@/lib/api'
 import { Loader2 } from 'lucide-react'
 import { toast } from 'sonner'
 
@@ -19,6 +19,7 @@ export default function ReportView() {
 
   useEffect(() => {
     if (vin) {
+      markVinViewed(vin)
       const cached = getCachedData(`report:${String(vin).toUpperCase()}`)
       if (cached && (!report || report.vin?.toUpperCase() !== vin.toUpperCase())) {
         setReport(cached)
