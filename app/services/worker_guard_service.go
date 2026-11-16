@@ -370,17 +370,30 @@ func (s *WorkerGuardService) IsNodeConnected(nodeID string) bool {
 	return (time.Now().Unix() - val) <= 60
 }
 
-// RequestImmediateInspect sets a flag telling Canada Worker to take a fresh JPEG screenshot on next poll
+// RequestImmediateInspect sets a flag telling Canada Worker to take a fresh JPEG screenshot on next poll.
+// When nodeID is specified, ONLY that specific node receives the inspect request (isolated per-node screenshot).
+// When nodeID is empty (from the general dashboard button), it triggers inspect on all registered nodes.
 func (s *WorkerGuardService) RequestImmediateInspect(nodeID string) {
 	if bootstrap.Redis == nil {
 		return
 	}
 	ctx := context.Background()
-	bootstrap.Redis.Set(ctx, "canada:inspect_requested", "1", 1*time.Minute)
-	if nodeID != "" {
+	if strings.TrimSpace(nodeID) != "" {
 		cleanID, _ := sanitizeNodeID(nodeID, "")
 		bootstrap.Redis.Set(ctx, "canada:worker:"+cleanID+":inspect_requested", "1", 1*time.Minute)
+		return
 	}
+
+	// Global request: notify all registered nodes so each updates its own screenshot
+	if nodes, err := bootstrap.Redis.SMembers(ctx, "canada:workers:registry").Result(); err == nil && len(nodes) > 0 {
+		for _, n := range nodes {
+			cleanID := strings.TrimSpace(n)
+			if cleanID != "" {
+				bootstrap.Redis.Set(ctx, "canada:worker:"+cleanID+":inspect_requested", "1", 1*time.Minute)
+			}
+		}
+	}
+	bootstrap.Redis.Set(ctx, "canada:inspect_requested", "1", 1*time.Minute)
 }
 
 // ConsumeInspectRequest checks and clears the inspect flag (checks node-specific or global)

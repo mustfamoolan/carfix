@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
@@ -63,8 +64,48 @@ type CanadaWorker struct {
 	pollCounter  int
 }
 
-func main() {
+// loadEnvFileRobust reads .env from both the executable directory and current working directory,
+// stripping any UTF-8 BOM (\xEF\xBB\xBF) added by Inno Setup's SaveStringsToUTF8File or Windows Notepad!
+func loadEnvFileRobust() {
+	var candidatePaths []string
+	if exePath, err := os.Executable(); err == nil {
+		candidatePaths = append(candidatePaths, filepath.Join(filepath.Dir(exePath), ".env"))
+	}
+	candidatePaths = append(candidatePaths, ".env", `C:\CarFixCanadaNode\.env`)
+
+	for _, p := range candidatePaths {
+		rawBytes, err := os.ReadFile(p)
+		if err != nil || len(rawBytes) == 0 {
+			continue
+		}
+		// Strip UTF-8 BOM if present at the start of the file
+		content := strings.TrimPrefix(string(rawBytes), "\xef\xbb\xbf")
+		loadedAny := false
+		// Line-by-line parser (100% immune to BOM, CRLF, or godotenv quirks)
+		for _, line := range strings.Split(content, "\n") {
+			line = strings.TrimSpace(strings.TrimPrefix(line, "\xef\xbb\xbf"))
+			if line == "" || strings.HasPrefix(line, "#") {
+				continue
+			}
+			if idx := strings.Index(line, "="); idx > 0 {
+				k := strings.TrimSpace(strings.TrimPrefix(line[:idx], "\xef\xbb\xbf"))
+				v := strings.TrimSpace(line[idx+1:])
+				v = strings.Trim(v, `"'`)
+				if k != "" && v != "" {
+					_ = os.Setenv(k, v)
+					loadedAny = true
+				}
+			}
+		}
+		if loadedAny {
+			return
+		}
+	}
 	_ = godotenv.Load()
+}
+
+func main() {
+	loadEnvFileRobust()
 
 	nodeID := strings.TrimSpace(os.Getenv("WORKER_ID"))
 	if nodeID == "" {

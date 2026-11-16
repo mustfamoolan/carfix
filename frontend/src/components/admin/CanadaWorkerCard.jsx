@@ -17,6 +17,7 @@ export default function CanadaWorkerCard({ status, userQuota, onRefresh }) {
   const [inspecting, setInspecting] = useState(false)
   const [resetting, setResetting] = useState(false)
   const [previewOpen, setPreviewOpen] = useState(false)
+  const [selectedNodeId, setSelectedNodeId] = useState('')
 
   if (!status) {
     return null
@@ -34,7 +35,20 @@ export default function CanadaWorkerCard({ status, userQuota, onRefresh }) {
     active_progress,
     last_screenshot_base64,
     last_screenshot_at,
+    nodes = [],
+    online_nodes = 0,
+    total_nodes = 0,
   } = status
+
+  const activeNode =
+    nodes.find((n) => n.worker_id === selectedNodeId) ||
+    nodes.find((n) => n.connected) ||
+    nodes[0] ||
+    null
+
+  const activePreviewSc = activeNode?.last_screenshot_base64 || last_screenshot_base64
+  const activePreviewAt = activeNode?.last_screenshot_at || last_screenshot_at
+  const activePreviewTelemetry = activeNode?.telemetry || telemetry
 
   const effectiveDailyLimit =
     userQuota?.daily_limit > 0
@@ -43,11 +57,15 @@ export default function CanadaWorkerCard({ status, userQuota, onRefresh }) {
       ? userQuota.total_limit
       : max_daily_pulls || 0
 
-  const handleRequestInspect = async () => {
+  const handleRequestInspect = async (targetNodeId = '') => {
+    const nodeToInspect = targetNodeId || activeNode?.worker_id || ''
+    if (nodeToInspect) {
+      setSelectedNodeId(nodeToInspect)
+    }
     setInspecting(true)
     setPreviewOpen(true)
     try {
-      await api.post('/admin/worker-inspect', {})
+      await api.post('/admin/worker-inspect', nodeToInspect ? { node_id: nodeToInspect } : {})
       setTimeout(() => {
         if (onRefresh) onRefresh()
       }, 2000)
@@ -91,7 +109,7 @@ export default function CanadaWorkerCard({ status, userQuota, onRefresh }) {
                 className="border-emerald-500/30 bg-emerald-500/10 text-emerald-700 dark:text-emerald-400 font-semibold gap-1.5 py-1 px-2.5"
               >
                 <CheckCircle2 className="h-3.5 w-3.5" />
-                حاسبة كندا متصلة
+                حواسيب كندا متصلة ({online_nodes || 1}/{total_nodes || 1})
               </Badge>
             ) : (
               <Badge variant="destructive" className="bg-rose-500 hover:bg-rose-600 text-white font-semibold py-1 px-2.5 animate-pulse gap-1">
@@ -138,7 +156,7 @@ export default function CanadaWorkerCard({ status, userQuota, onRefresh }) {
             <Button
               size="sm"
               variant="outline"
-              onClick={handleRequestInspect}
+              onClick={() => handleRequestInspect('')}
               disabled={inspecting || inspect_pending}
               className="h-8 text-xs gap-1.5"
             >
@@ -185,26 +203,48 @@ export default function CanadaWorkerCard({ status, userQuota, onRefresh }) {
         )}
       </Card>
 
-      {/* Clean Modal for Screenshot Preview (Only opens when requested) */}
+      {/* Clean Modal for Screenshot Preview (Only opens when requested, with per-PC selector) */}
       <Dialog open={previewOpen} onOpenChange={setPreviewOpen}>
         <DialogContent className="max-w-3xl" dir="rtl">
           <DialogHeader>
             <DialogTitle className="text-sm font-bold text-right">
-              معاينة متصفح حاسبة كندا
+              معاينة متصفح حواسيب كندا ({activeNode?.worker_name || activeNode?.worker_id || 'حاسبة كندا'})
             </DialogTitle>
             <DialogDescription className="text-xs text-right">
-              {telemetry?.status_message || 'لقطة شاشة حية لمتصفح كروم في كندا'}
-              {last_screenshot_at &&
-                ` — آخر تحديث: ${new Date(last_screenshot_at).toLocaleTimeString('ar-EG')}`}
+              {activePreviewTelemetry?.status_message || 'لقطة شاشة حية لمتصفح كروم في كندا'}
+              {activePreviewAt &&
+                ` — آخر تحديث: ${new Date(activePreviewAt).toLocaleTimeString('ar-EG')}`}
             </DialogDescription>
           </DialogHeader>
+
+          {nodes.length > 1 && (
+            <div className="flex flex-wrap items-center gap-2 pb-1">
+              {nodes.map((n) => {
+                const isSelected = (activeNode?.worker_id || '') === n.worker_id
+                return (
+                  <Button
+                    key={n.worker_id}
+                    type="button"
+                    size="sm"
+                    variant={isSelected ? 'default' : 'outline'}
+                    onClick={() => handleRequestInspect(n.worker_id)}
+                    className="h-8 text-xs gap-1.5 cursor-pointer"
+                  >
+                    <Camera className="h-3.5 w-3.5" />
+                    <span>{n.worker_name || n.worker_id}</span>
+                  </Button>
+                )
+              })}
+            </div>
+          )}
+
           <div className="rounded-lg border border-border overflow-hidden bg-muted/30 flex items-center justify-center min-h-[260px]">
-            {last_screenshot_base64 ? (
+            {activePreviewSc ? (
               <img
                 src={
-                  last_screenshot_base64.startsWith('data:image')
-                    ? last_screenshot_base64
-                    : `data:image/jpeg;base64,${last_screenshot_base64.replace(/^[\s\r\n]+/, '')}`
+                  activePreviewSc.startsWith('data:image')
+                    ? activePreviewSc
+                    : `data:image/jpeg;base64,${activePreviewSc.replace(/^[\s\r\n]+/, '')}`
                 }
                 alt="Canada Browser"
                 className="max-h-[460px] w-auto object-contain"

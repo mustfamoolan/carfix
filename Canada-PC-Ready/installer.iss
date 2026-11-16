@@ -96,14 +96,15 @@ begin
       end;
     end;
 
-    SetArrayLength(EnvLines, 6);
-    EnvLines[0] := 'WORKER_ID=' + WorkerID;
-    EnvLines[1] := 'WORKER_NAME=' + WorkerName;
-    EnvLines[2] := 'SERVER_BASE_URL=https://vinreport.tech';
-    EnvLines[3] := 'WORKER_SECRET_KEY=almoq3-canada-secret-2026';
-    EnvLines[4] := 'CDP_WS_URL=http://127.0.0.1:9222';
-    EnvLines[5] := 'POLL_INTERVAL_SEC=1';
+    SetArrayLength(EnvLines, 7);
+    EnvLines[0] := '# CarFix Canada Node Configuration';
+    EnvLines[1] := 'WORKER_ID=' + WorkerID;
+    EnvLines[2] := 'WORKER_NAME=' + WorkerName;
+    EnvLines[3] := 'SERVER_BASE_URL=https://vinreport.tech';
+    EnvLines[4] := 'WORKER_SECRET_KEY=almoq3-canada-secret-2026';
+    EnvLines[5] := 'CDP_WS_URL=http://127.0.0.1:9222';
+    EnvLines[6] := 'POLL_INTERVAL_SEC=1';
 
-    SaveStringsToUTF8File(ExpandConstant('{app}\.env'), EnvLines, False);
+    SaveStringsToUTF8FileWithoutBOM(ExpandConstant('{app}\.env'), EnvLines, False);
   end;
 end;

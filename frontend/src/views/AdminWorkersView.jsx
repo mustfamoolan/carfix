@@ -85,10 +85,11 @@ export default function AdminWorkersView() {
 
   const handleInspect = async (nodeId) => {
     setActionLoading(`inspect-${nodeId}`)
+    setExpandedScreenshot((prev) => ({ ...prev, [nodeId]: true }))
     try {
       await requestInspectNode(nodeId)
       toast.success(`تم إرسال أمر التقاط الشاشة المباشرة للعقدة (${nodeId})`)
-      setTimeout(() => fetchStatus(false), 2500)
+      setTimeout(() => fetchStatus(false), 2000)
     } catch (err) {
       toast.error(err.message || 'فشل إرسال أمر الفحص')
     } finally {
